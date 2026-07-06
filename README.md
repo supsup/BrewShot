@@ -66,6 +66,28 @@ page at a time, no selector engine, no auto-waiting, no cross-browser patches.
 poll conditions with the full power of page-side JS. ~700 lines total, and it
 intends to stay that size.
 
+## Metrics — jar vs native binary
+
+Measured on an Apple-silicon Mac (GraalVM CE for JDK 25, `./gradlew nativeImage`),
+same tiny page, identical PNG output from both:
+
+| | `brewshot-0.1.0.jar` | `build/brewshot` (native) |
+| --- | --- | --- |
+| artifact size | **17 KB** (+ a JVM on the machine) | 32 MB, fully self-contained |
+| CLI startup (`--help`, warm) | ~20 ms | **~3 ms** |
+| full shot (launch Chrome → render → PNG) | ~2.0 s | **~1.7 s** |
+| needs a JVM installed | yes | **no** |
+| GIF recording | **yes** | not on macOS yet (native-image AWT gap) |
+
+The honest read: **Chrome launch dominates a full shot** (~1.4 s), so the
+native win there is modest (~0.3 s of skipped JVM warm-up). Where the binary
+earns its keep is deployment — one file, no JVM, instant startup — which is
+exactly the shape a pipeline step or an agent tool wants. The jar earns its
+keep at 17 KB with full GIF support. Ship both, pick per context.
+
+First run of a fresh binary pays macOS code-signature verification (~0.3 s,
+once). PNG outputs are byte-identical across modes.
+
 ## Requirements
 
 - JDK 21+ (built with 25)
