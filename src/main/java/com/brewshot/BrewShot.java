@@ -282,6 +282,16 @@ public final class BrewShot implements AutoCloseable {
         GifWriter.write(shots, frameDelayMs, out);
     }
 
+    /**
+     * Assemble already-captured PNG frames (from {@link #screenshotClip}) into
+     * a looping GIF — for callers that need the frames in hand first (e.g.
+     * asserting animation liveness before committing the artifact).
+     */
+    public static void gif(java.util.List<byte[]> pngFrames, int frameDelayMs, Path out)
+            throws IOException {
+        GifWriter.write(pngFrames, frameDelayMs, out);
+    }
+
     /** Launch with a sensible default viewport (1280x900). */
     public static BrewShot launch() throws IOException {
         return launch(1280, 900);
