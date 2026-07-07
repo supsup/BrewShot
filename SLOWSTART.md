@@ -193,11 +193,20 @@ docker run --rm -v "$PWD:/work" brewshot /work/report.html -o /work/report.png
 ```
 
 Mount any host path you like (`-v /ci/artifacts:/work`); stdin (`-`) needs no
-mount for input, only for output. **One gotcha on Linux hosts:** the image
-runs as a non-root user (deliberately — see the Dockerfile), so the mounted
-directory must be writable by that user; if you hit `Permission denied` on
-the output, run with your own uid: `docker run --user "$(id -u)" ...` (macOS
-and Windows Docker Desktop handle this mapping automatically).
+mount for input, only for output.
+
+> [!WARNING]
+> **Linux hosts: `Permission denied` on the output is a real trap.** The
+> image deliberately runs as a **non-root user** (a security choice — see the
+> Dockerfile), so the mounted directory must be writable by that user. If
+> your shot dies with `Permission denied`, run with your own uid:
+>
+> ```
+> docker run --user "$(id -u)" --rm -v "$PWD:/work" brewshot … -o /work/page.png
+> ```
+>
+> macOS and Windows Docker Desktop map this automatically — which is exactly
+> why it works on your laptop and then bites in Linux CI.
 
 **What Ana should know:** container renders use the Linux font stack, so
 pixels differ subtly from Mac/Windows-Chrome renders — keep your reference

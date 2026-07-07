@@ -112,8 +112,14 @@ docker run --rm -v "$PWD:/work" brewshot https://example.com -o /work/page.png
 
 (The `-v "$PWD:/work"` mount is how the PNG reaches your directory — the
 container's own filesystem vanishes with `--rm`. Input files ride the same
-mount; Linux hosts may need `--user "$(id -u)"` since the image runs
-non-root. Details: SLOWSTART Scenario 5.)
+mount.)
+
+> [!WARNING]
+> On **Linux hosts**, add `--user "$(id -u)"` if the output dies with
+> `Permission denied` — the image runs non-root by design, and a bind-mounted
+> directory must be writable by that user. Works-on-my-Mac is not evidence
+> here: Docker Desktop maps permissions automatically, Linux CI does not.
+> Details: [SLOWSTART](SLOWSTART.md) Scenario 5.
 
 Rolling your own image: install `chromium` + fonts (`fonts-liberation`,
 `fonts-dejavu-core`), set `BREWSHOT_CHROME=/usr/bin/chromium` and
