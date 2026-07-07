@@ -32,7 +32,23 @@ public final class Main {
     }
 
     /** Testable entry: parse, shoot, return the exit code. Never calls System.exit. */
-    static int run(String[] args) throws Exception {
+    static int run(String[] rawArgs) throws Exception {
+        // Accept both `--out x.png` AND `--out=x.png` (the near-universal
+        // convention; agent-generated wrappers lean on it). Split a leading
+        // long-flag `--name=value` into two tokens up front so the loop below
+        // needs no `=` awareness. A bare `-` (stdin) and `=` inside a VALUE
+        // token are untouched.
+        java.util.List<String> norm = new java.util.ArrayList<>(rawArgs.length + 4);
+        for (String a : rawArgs) {
+            int eq = a.indexOf('=');
+            if (a.startsWith("--") && eq > 2) {
+                norm.add(a.substring(0, eq));
+                norm.add(a.substring(eq + 1));
+            } else {
+                norm.add(a);
+            }
+        }
+        String[] args = norm.toArray(new String[0]);
         String input = null;
         Path out = Path.of("brewshot.png");
         int width = 1280;
