@@ -570,6 +570,47 @@ public final class BrewShot implements AutoCloseable {
     }
 
     /**
+     * Screenshot a FRACTIONAL REGION of the document — "the top half" is
+     * {@code region(0, 0.5, scale)}, "the middle" {@code region(0.25, 0.75, ...)},
+     * "the bottom third" {@code region(2.0/3, 1, ...)}. Fractions of total
+     * document height; returns PNG bytes.
+     */
+    public byte[] screenshotRegion(double fromFraction, double toFraction, double scale) {
+        checkFractions(fromFraction, toFraction);
+        double w = ((Double) eval("document.documentElement.scrollWidth")).doubleValue();
+        double h = ((Double) eval("document.documentElement.scrollHeight")).doubleValue();
+        return screenshotClip(0, h * fromFraction, w, h * (toFraction - fromFraction), scale);
+    }
+
+    /**
+     * Record a FRACTIONAL REGION of the document as a looping GIF — the
+     * region-targeted sibling of {@link #recordGifFullPage}: e.g.
+     * {@code recordGifRegion(0.5, 1.0, 30, 120, 0.6, out)} films the bottom half.
+     */
+    public void recordGifRegion(double fromFraction, double toFraction,
+                                int frames, int frameDelayMs, double scale, Path out)
+            throws IOException {
+        checkFractions(fromFraction, toFraction);
+        double w = ((Double) eval("document.documentElement.scrollWidth")).doubleValue();
+        double h = ((Double) eval("document.documentElement.scrollHeight")).doubleValue();
+        double y = h * fromFraction;
+        double regionH = h * (toFraction - fromFraction);
+        List<byte[]> shots = new ArrayList<>(frames);
+        for (int i = 0; i < frames; i++) {
+            shots.add(screenshotClip(0, y, w, regionH, scale));
+            settle(frameDelayMs);
+        }
+        GifWriter.write(shots, frameDelayMs, out);
+    }
+
+    private static void checkFractions(double from, double to) {
+        if (!(from >= 0 && to <= 1 && from < to)) {
+            throw new IllegalArgumentException(
+                "region fractions want 0 <= from < to <= 1, got " + from + ".." + to);
+        }
+    }
+
+    /**
      * Assemble already-captured PNG frames (from {@link #screenshotClip}) into
      * a looping GIF — for callers that need the frames in hand first (e.g.
      * asserting animation liveness before committing the artifact).
