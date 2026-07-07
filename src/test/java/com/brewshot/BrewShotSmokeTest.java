@@ -61,6 +61,9 @@ class BrewShotSmokeTest {
             assertTrue(shot.screenshotElement("#box", 1.0).length > 100, "element png too small");
             shot.recordGifElement("#box", 3, 20, 1.0, out.resolve("el.gif"));
             assertTrue(Files.size(out.resolve("el.gif")) > 100, "element gif too small");
+            // firstFrameDelayMs: hold frame 0, then play the rest — a valid single GIF
+            shot.recordGifElement("#box", 4, 20, 60, 400, 1.0, out.resolve("hold.gif"));
+            assertTrue(Files.size(out.resolve("hold.gif")) > 100, "first-frame-hold gif too small");
         }
     }
 

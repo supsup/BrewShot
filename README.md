@@ -83,6 +83,12 @@ so a *bigger* delay is a *lower* fps is a *slower* GIF (a slower scroll, a slowe
 Chrome's shot time floors real capture cadence at ≈20-30 ms, so `captureDelayMs` below that just
 samples as fast as it can; `playbackDelayMs` has no floor — set it purely for the speed you want.
 
+**Hold the opening frame.** `recordGifElement`'s widest overload takes a `firstFrameDelayMs` — the
+first frame is held that long before the animation runs, so the viewer registers the *before* state
+(an intact equation, a button at rest) then watches it change:
+`recordGifElement(".fx", 60, 25, 75, 900, s, out)` holds frame 0 for 900 ms, then plays the rest at
+75 ms. (GIF stores a per-frame delay, so this is one file — no repeated frames.)
+
 First proven as the [LatteX](https://github.com/supsup/LatteX) fx-runtime test
 harness, where it pinned real rendering bugs (glyph placement, animation
 lifecycle leaks, hover-state wiring) that no stubbed DOM could catch.

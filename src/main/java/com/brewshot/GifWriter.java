@@ -24,17 +24,29 @@ final class GifWriter {
 
     /** Write {@code pngFrames} as a looping animated GIF at {@code out}. */
     static void write(List<byte[]> pngFrames, int frameDelayMs, Path out) throws IOException {
+        write(pngFrames, frameDelayMs, frameDelayMs, out);
+    }
+
+    /**
+     * Write a looping GIF where the FIRST frame is held for
+     * {@code firstFrameDelayMs} and every subsequent frame plays at
+     * {@code frameDelayMs} — so a viewer registers the opening state before the
+     * animation runs. Pass {@code firstFrameDelayMs == frameDelayMs} for a
+     * uniform GIF.
+     */
+    static void write(List<byte[]> pngFrames, int frameDelayMs, int firstFrameDelayMs, Path out)
+            throws IOException {
         if (pngFrames.isEmpty()) { throw new IllegalArgumentException("no frames"); }
         ImageWriter writer = ImageIO.getImageWritersByFormatName("gif").next();
         try (ImageOutputStream os = ImageIO.createImageOutputStream(out.toFile())) {
             writer.setOutput(os);
             writer.prepareWriteSequence(null);
-            for (byte[] png : pngFrames) {
-                BufferedImage img = ImageIO.read(new ByteArrayInputStream(png));
+            for (int i = 0; i < pngFrames.size(); i++) {
+                BufferedImage img = ImageIO.read(new ByteArrayInputStream(pngFrames.get(i)));
                 IIOMetadata meta = writer.getDefaultImageMetadata(
                     ImageTypeSpecifier.createFromRenderedImage(img),
                     writer.getDefaultWriteParam());
-                applyFrameMetadata(meta, frameDelayMs);
+                applyFrameMetadata(meta, i == 0 ? firstFrameDelayMs : frameDelayMs);
                 writer.writeToSequence(new IIOImage(img, null, meta), null);
             }
             writer.endWriteSequence();

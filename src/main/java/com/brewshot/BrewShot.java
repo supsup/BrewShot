@@ -621,13 +621,28 @@ public final class BrewShot implements AutoCloseable {
      */
     public void recordGifElement(String cssSelector, int frames, int captureDelayMs,
                                  int playbackDelayMs, double scale, Path out) throws IOException {
+        recordGifElement(cssSelector, frames, captureDelayMs, playbackDelayMs,
+                         playbackDelayMs, scale, out);
+    }
+
+    /**
+     * Record one element as a GIF that HOLDS its first frame for
+     * {@code firstFrameDelayMs} before the animation runs — so the viewer sees the
+     * opening state (an intact equation, a button at rest) for a beat, then it
+     * plays at {@code playbackDelayMs}. Capture the animation the same way as
+     * {@link #recordGifElement(String, int, int, int, double, Path)}. Set
+     * {@code firstFrameDelayMs == playbackDelayMs} for no hold.
+     */
+    public void recordGifElement(String cssSelector, int frames, int captureDelayMs,
+                                 int playbackDelayMs, int firstFrameDelayMs,
+                                 double scale, Path out) throws IOException {
         double[] b = elementBox(cssSelector);
         List<byte[]> shots = new ArrayList<>(frames);
         for (int i = 0; i < frames; i++) {
             shots.add(screenshotClip(b[0], b[1], b[2], b[3], scale));
             settle(captureDelayMs);
         }
-        GifWriter.write(shots, playbackDelayMs, out);
+        GifWriter.write(shots, playbackDelayMs, firstFrameDelayMs, out);
     }
 
     /**
