@@ -89,6 +89,25 @@ first frame is held that long before the animation runs, so the viewer registers
 `recordGifElement(".fx", 60, 25, 75, 900, s, out)` holds frame 0 for 900 ms, then plays the rest at
 75 ms. (GIF stores a per-frame delay, so this is one file — no repeated frames.)
 
+### Recording a triggered animation — recipe
+
+Capturing an effect that fires on hover/click has three gotchas, learned the hard way filming the
+LatteX fx catalogue:
+
+1. **Trigger *after* recording starts, not before.** If you dispatch the click then start recording,
+   you miss the opening (the frames fly by before the first shot). Schedule the trigger a beat into
+   the capture so the early frames catch the *before* state:
+   `eval("setTimeout(() => el.dispatchEvent(new MouseEvent('click',{bubbles:true})), 150)")`, then
+   `recordGifElement` immediately. Pair with `firstFrameDelayMs` to hold that intact opening.
+2. **Sample dense, play slow.** Use the `(captureDelayMs, playbackDelayMs)` overload: shoot as fast
+   as Chrome allows (~25 ms) and stamp a slower playback (75–110 ms). A fast effect stays smooth but
+   readable — no re-encoding afterward.
+3. **Watch for effects that leave the element's box.** `recordGifElement` films the box resolved
+   *once* at the start. An effect that scatters glyphs, spawns a body overlay, or drifts (an ink
+   diffusion, a page-wide flash) will clip or wander. Fixes: `scrollIntoView` + capture a padded
+   `recordGif(rect…)` region instead, or reach for the frame-stream path (see `Page.startScreencast`,
+   a planned `recordGifStream`) which follows what actually composites.
+
 First proven as the [LatteX](https://github.com/supsup/LatteX) fx-runtime test
 harness, where it pinned real rendering bugs (glyph placement, animation
 lifecycle leaks, hover-state wiring) that no stubbed DOM could catch.
