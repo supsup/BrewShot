@@ -117,6 +117,12 @@ Native binary (GraalVM JDK selected):
 build/brewshot https://docs.internal/page -o page.png     # instant startup, no JVM
 ```
 
+> [!NOTE]
+> The native binary is a **build artifact** — it won't have CLI flags added
+> since you last built it (`--cookie`, `--wait-js`, etc. arrived in 0.3.0).
+> After pulling or changing `Main.java`, re-run `./gradlew nativeImage`.
+> `brewshot --version` prints what you've got; the jar always tracks source.
+
 Or straight from a bake step that has the HTML in hand:
 
 ```

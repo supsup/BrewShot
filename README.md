@@ -75,7 +75,7 @@ intends to stay that size.
 Measured on an Apple-silicon Mac (GraalVM CE for JDK 25, `./gradlew nativeImage`),
 same tiny page, identical PNG output from both:
 
-| | `brewshot-0.1.0.jar` | `build/brewshot` (native) |
+| | `brewshot.jar` | `build/brewshot` (native) |
 | --- | --- | --- |
 | artifact size | **17 KB** (+ a JVM on the machine) | 32 MB, fully self-contained |
 | CLI startup (`--help`, warm) | ~20 ms | **~3 ms** |
