@@ -22,6 +22,7 @@ class BrewShotAuthTest {
         HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.createContext("/", ex -> {
             String body = "auth=[" + String.valueOf(ex.getRequestHeaders().getFirst("Authorization"))
+                + "] brew=[" + String.valueOf(ex.getRequestHeaders().getFirst("X-Brew"))
                 + "] cookie=[" + String.valueOf(ex.getRequestHeaders().getFirst("Cookie")) + "]";
             byte[] b = ("<body>" + body + "</body>").getBytes(StandardCharsets.UTF_8);
             ex.getResponseHeaders().set("Content-Type", "text/html");
@@ -32,9 +33,10 @@ class BrewShotAuthTest {
         server.start();
         try (BrewShot shot = BrewShot.launch(640, 480)) {
             shot.header("Authorization", "Basic dXNlcjpwYXNz");
+            shot.header("X-Brew", "hot");                    // accumulation: both must arrive
             shot.cookie("SESSION", "tok-123", "127.0.0.1");
             shot.open("http://127.0.0.1:" + server.getAddress().getPort() + "/");
-            assertEquals("auth=[Basic dXNlcjpwYXNz] cookie=[SESSION=tok-123]",
+            assertEquals("auth=[Basic dXNlcjpwYXNz] brew=[hot] cookie=[SESSION=tok-123]",
                 shot.eval("document.body.textContent.trim()"));
         } finally {
             server.stop(0);

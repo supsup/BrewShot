@@ -7,13 +7,19 @@ plugins {
 }
 
 group = "com.brewshot"
-version = "0.1.0"
+version = "0.2.0"
 
 java {
     toolchain {
         languageVersion = JavaLanguageVersion.of(25)
     }
     withSourcesJar()
+}
+
+// Build WITH 25, target 21 bytecode — the README's "JDK 21+" is a tested
+// promise, not an aspiration.
+tasks.withType<JavaCompile>().configureEach {
+    options.release = 21
 }
 
 repositories {

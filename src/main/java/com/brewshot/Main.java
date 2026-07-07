@@ -16,14 +16,22 @@ import java.nio.file.Path;
  *   brewshot URL -o page.png --size 1440x1000 --settle 1500 --eval "document.title"
  * </pre>
  *
+ * Exit codes: 0 ok · 2 bad arguments · 3 no Chrome found · 1 runtime failure.
  * Note: GIF recording is library-only for now (ImageIO/AWT is not yet
- * supported by native-image on macOS); the PNG path below is native-clean.
+ * supported by native-image on macOS); the PNG path is native-clean.
  */
 public final class Main {
 
     private Main() { }
 
     public static void main(String[] args) throws Exception {
+        // Exit code decided OUTSIDE any try-with-resources: a System.exit
+        // inside one would skip close() and orphan a running Chrome.
+        System.exit(run(args));
+    }
+
+    /** Testable entry: parse, shoot, return the exit code. Never calls System.exit. */
+    static int run(String[] args) throws Exception {
         String input = null;
         Path out = Path.of("brewshot.png");
         int width = 1280;
@@ -33,35 +41,46 @@ public final class Main {
 
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
-                case "-o", "--out" -> out = Path.of(args[++i]);
+                case "-o", "--out" -> out = Path.of(requireValue(args, ++i));
                 case "--size" -> {
-                    String[] wh = args[++i].split("x");
+                    String[] wh = requireValue(args, ++i).split("x");
+                    if (wh.length != 2) { return err("--size wants WxH, e.g. 1440x1000"); }
                     width = Integer.parseInt(wh[0]);
                     height = Integer.parseInt(wh[1]);
                 }
-                case "--settle" -> settleMs = Long.parseLong(args[++i]);
-                case "--eval" -> evalExpr = args[++i];
-                case "-h", "--help" -> { usage(); return; }
-                default -> input = args[i];
+                case "--settle" -> settleMs = Long.parseLong(requireValue(args, ++i));
+                case "--eval" -> evalExpr = requireValue(args, ++i);
+                case "-h", "--help" -> { usage(); return 0; }
+                case "--version" -> { System.out.println("brewshot " + BrewShot.VERSION); return 0; }
+                default -> {
+                    if (args[i].startsWith("-") && !args[i].equals("-")) {
+                        return err("unknown flag: " + args[i]);
+                    }
+                    input = args[i];
+                }
             }
         }
-        if (input == null) { usage(); System.exit(2); }
+        if (input == null) { usage(); return 2; }
+
+        // Resolve the input MODE before touching Chrome, so arg mistakes fail
+        // fast with a clear message.
+        String mode; // "stdin" | "url" | "file"
+        if (input.equals("-")) { mode = "stdin"; }
+        else if (input.matches("^[a-z][a-z0-9+.-]*://.*")) { mode = "url"; }
+        else if (Files.exists(Path.of(input))) { mode = "file"; }
+        else { return err("not a URL, an existing file, or '-': " + input); }
+
         if (!BrewShot.available()) {
             System.err.println("brewshot: no Chrome/Chromium found (set BREWSHOT_CHROME)");
-            System.exit(3);
+            return 3;
         }
 
         try (BrewShot shot = BrewShot.launch(width, height)) {
-            if (input.equals("-")) {
-                shot.html(new String(System.in.readAllBytes(), StandardCharsets.UTF_8));
-            } else if (input.matches("^[a-z][a-z0-9+.-]*://.*")) {
-                shot.open(input);
-            } else if (Files.exists(Path.of(input))) {
-                shot.open(Path.of(input).toAbsolutePath().toUri().toString());
-            } else {
-                System.err.println("brewshot: not a URL, file, or '-': " + input);
-                System.exit(2);
-                return;
+            switch (mode) {
+                case "stdin" -> shot.html(new String(
+                    System.in.readAllBytes(), StandardCharsets.UTF_8));
+                case "url" -> shot.open(input);
+                default -> shot.open(Path.of(input).toAbsolutePath().toUri().toString());
             }
             shot.settle(settleMs);
             if (evalExpr != null) {
@@ -70,6 +89,19 @@ public final class Main {
             shot.screenshot(out);
             System.err.println("brewshot: wrote " + out);
         }
+        return 0;
+    }
+
+    private static String requireValue(String[] args, int i) {
+        if (i >= args.length) {
+            throw new IllegalArgumentException("flag " + args[i - 1] + " wants a value");
+        }
+        return args[i];
+    }
+
+    private static int err(String msg) {
+        System.err.println("brewshot: " + msg);
+        return 2;
     }
 
     private static void usage() {
@@ -77,7 +109,7 @@ public final class Main {
             brewshot — Java brews screenshots (headless Chrome over CDP, zero deps)
 
             usage: brewshot <url | file.html | -> [-o out.png] [--size WxH]
-                            [--settle ms] [--eval js]
+                            [--settle ms] [--eval js] [--version]
 
               <url>        open an address (http/https/file)
               <file.html>  open a local file
@@ -86,6 +118,7 @@ public final class Main {
               --size       viewport, e.g. 1440x1000   (default 1280x900)
               --settle     ms to wait before shooting (default 800)
               --eval       print a JS expression's value before shooting
+              --version    print the version and exit
 
             requires a local Chrome/Chromium (or set BREWSHOT_CHROME).""");
     }

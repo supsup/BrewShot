@@ -1,6 +1,6 @@
 # BrewShot — QUICKSTART
 
-The whole API in two minutes. One class, seven methods, `AutoCloseable`.
+The whole API in two minutes. One class, a dozen small methods, `AutoCloseable`.
 
 ## Get in
 
@@ -44,10 +44,22 @@ byte[] png = shot.screenshotClip(x, y, w, h);  // one rectangle, page coordinate
 (`el.dispatchEvent(new MouseEvent('mouseenter',{bubbles:true}))`), read
 `getBoundingClientRect()`, scroll, poll a condition.
 
+## Listen to the page
+
+```java
+shot.waitFor("document.querySelector('.done')", 5000); // deterministic wait, fails loud
+List<String> logs = shot.console();   // "log: hello 42" — since last open()/html()
+List<String> errs = shot.errors();    // uncaught exceptions + console.error
+assertEquals(List.of(), shot.errors());  // the one-line page-health assertion
+shot.captureConsole(false);           // opt out if you want zero retention
+```
+
 ## Get past auth
 
 ```java
-shot.header("Authorization", "Basic dXNlcjpwYXNz");  // any header, every request
+shot.header("Authorization", "Basic dXNlcjpwYXNz");  // any header — NOTE: sent on EVERY
+                                                     // request incl. cross-origin subresources;
+                                                     // for host-scoped creds prefer cookie()
 shot.cookie("SESSION", token, "localhost");          // session-cookie auth
 shot.open("http://localhost:8080/private/page");     // set BEFORE open()
 ```

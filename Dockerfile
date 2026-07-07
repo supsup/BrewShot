@@ -11,7 +11,8 @@
 FROM eclipse-temurin:25-jdk AS build
 WORKDIR /src
 COPY . .
-RUN ./gradlew --no-daemon jar
+RUN ./gradlew --no-daemon jar \
+    && cp $(ls build/libs/brewshot-*.jar | grep -v sources) /brewshot.jar
 
 # ---- runtime: JRE + chromium + fonts ------------------------------------
 # Alpine, deliberately: Ubuntu/Debian-slim images ship a snap-stub `chromium`
@@ -24,7 +25,11 @@ RUN apk add --no-cache chromium font-liberation ttf-dejavu font-noto-emoji
 ENV BREWSHOT_CHROME=/usr/bin/chromium-browser \
     BREWSHOT_CHROME_ARGS="--no-sandbox --disable-dev-shm-usage"
 
-COPY --from=build /src/build/libs/brewshot-*.jar /opt/brewshot.jar
+COPY --from=build /brewshot.jar /opt/brewshot.jar
+# Non-root: chromium + --no-sandbox as root is the worst combination; a
+# dedicated user keeps renderer compromise contained to nothing.
+RUN adduser -D brewshot
+USER brewshot
 WORKDIR /work
 ENTRYPOINT ["java", "-jar", "/opt/brewshot.jar"]
 CMD ["--help"]

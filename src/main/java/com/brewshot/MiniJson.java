@@ -133,7 +133,12 @@ public final class MiniJson {
                 case 'r' -> b.append('\r');
                 case 't' -> b.append('\t');
                 case 'u' -> {
-                    b.append((char) Integer.parseInt(s.substring(i, i + 4), 16));
+                    if (i + 4 > s.length()) { throw err("truncated \\u escape"); }
+                    try {
+                        b.append((char) Integer.parseInt(s.substring(i, i + 4), 16));
+                    } catch (NumberFormatException nf) {
+                        throw err("bad \\u escape");
+                    }
                     i += 4;
                 }
                 default -> throw err("bad escape \\" + e);

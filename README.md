@@ -37,7 +37,8 @@ WebSocket client since 11. BrewShot is those messages, wrapped well:
 | --- | --- |
 | `Page.navigate` | `open(url)` |
 | `Page.setDocumentContent` | `html(source)` — scripts execute, load fires |
-| `Runtime.evaluate` | `eval(js)` → String/Double/Boolean/Map/List |
+| `Runtime.evaluate` | `eval(js)` → String/Double/Boolean/Map/List · `waitFor(predicate, ms)` |
+| `Runtime.consoleAPICalled` / `exceptionThrown` | `console()` / `errors()` — the page's voice, one-line health asserts |
 | `Page.captureScreenshot` | `screenshot(path)` / `screenshotClip(x,y,w,h)` |
 | + JDK ImageIO | `recordGif(x,y,w,h, frames, delayMs, path)` |
 
@@ -108,8 +109,10 @@ docker run --rm -v "$PWD:/work" brewshot https://example.com -o /work/page.png
 
 Rolling your own image: install `chromium` + fonts (`fonts-liberation`,
 `fonts-dejavu-core`), set `BREWSHOT_CHROME=/usr/bin/chromium` and
-`BREWSHOT_CHROME_ARGS="--no-sandbox --disable-dev-shm-usage"` (Chrome's
-sandbox doesn't fit default container privileges). Full walkthrough:
+`BREWSHOT_CHROME_ARGS="--no-sandbox --disable-dev-shm-usage"` — scope
+`--no-sandbox` to containers rendering YOUR OWN pages; it removes the layer
+that contains a malicious page, so don't point a sandboxless browser at
+untrusted URLs. (The provided image also runs as a non-root user.) Full walkthrough:
 [SLOWSTART.md](SLOWSTART.md) Scenario 5.
 
 ## Requirements

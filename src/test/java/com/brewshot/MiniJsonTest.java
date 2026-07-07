@@ -35,6 +35,22 @@ class MiniJsonTest {
     }
 
     @Test
+    void malformedInputsFailTheDocumentedWay() {
+        for (String bad : new String[] {
+            "{\"a\":",              // truncated object
+            "[1,2",                 // unclosed array
+            "\"\\u00\"",            // truncated unicode escape
+            "\"\\uZZZZ\"",          // non-hex unicode escape
+            "{\"a\":1} trailing",   // trailing garbage
+            "",                     // empty
+        }) {
+            org.junit.jupiter.api.Assertions.assertThrows(
+                IllegalArgumentException.class, () -> MiniJson.parse(bad),
+                "should throw IllegalArgumentException: " + bad);
+        }
+    }
+
+    @Test
     void dottedGetReturnsNullOnMissingHops() {
         Object m = MiniJson.parse("{\"a\":{\"b\":1}}");
         assertEquals(1.0, MiniJson.get(m, "a.b"));
