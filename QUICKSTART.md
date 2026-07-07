@@ -80,6 +80,15 @@ nothing animates, all frames match (assert that for trigger-liveness tests).
 brewshot https://example.com -o page.png
 brewshot ./report.html -o report.png --size 1440x1000 --settle 1500
 cat page.html | brewshot - -o page.png --eval "document.title"
+
+# CI/agent shape: deterministic wait, one panel, assertion, manifest sidecar
+brewshot http://localhost:8080/route -o shot.png \
+  --wait-js "document.readyState==='complete'" \
+  --clip-js "(()=>{const r=document.querySelector('main').getBoundingClientRect();
+              return {x:r.left+scrollX,y:r.top+scrollY,w:r.width,h:r.height}})()" \
+  --fail-js "!document.querySelector('.error-banner')" \
+  --cookie "SESSION=tok@localhost" --json shot.json
+# exit 4 when --fail-js is false — the PNG is still written (failures carry eyes)
 ```
 
 `java -jar brewshot.jar …` works everywhere, GIFs included. The native binary

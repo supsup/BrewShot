@@ -129,6 +129,44 @@ class BrewShotSmokeTest {
     }
 
     @Test
+    void cliEndToEndWaitClipFailJsAndManifest() throws Exception {
+        assumeTrue(BrewShot.available(), "no local Chrome; skipping");
+        Path dir = Files.createTempDirectory("brewshot-cli");
+        Path page = dir.resolve("p.html");
+        Files.writeString(page, """
+            <div id=box style='width:120px;height:60px;background:#4e79a7'></div>
+            <script>setTimeout(function(){document.body.className='ready';},200);</script>
+            """);
+        Path png = dir.resolve("shot.png");
+        Path json = dir.resolve("shot.json");
+        int code = Main.run(new String[] {
+            page.toString(), "-o", png.toString(),
+            "--wait-js", "document.body.className==='ready'",
+            "--clip-js", "(function(){var r=document.getElementById('box')"
+                + ".getBoundingClientRect();return {x:r.left+scrollX,y:r.top+scrollY,"
+                + "w:r.width,h:r.height};})()",
+            "--fail-js", "document.getElementById('box') !== null",
+            "--json", json.toString(),
+            "--settle", "50",
+        });
+        assertEquals(0, code);
+        assertTrue(Files.size(png) > 200, "clipped png written");
+        String manifest = Files.readString(json);
+        assertTrue(manifest.contains("\"failJsPassed\": true"), manifest);
+        assertTrue(manifest.contains("\"brewshot\": \"" + BrewShot.VERSION), manifest);
+
+        // fail-js false -> exit 4, PNG still written
+        Path png2 = dir.resolve("shot2.png");
+        int code2 = Main.run(new String[] {
+            page.toString(), "-o", png2.toString(),
+            "--fail-js", "document.querySelector('.does-not-exist') !== null",
+            "--settle", "50",
+        });
+        assertEquals(4, code2);
+        assertTrue(Files.size(png2) > 200, "failure still carries eyes");
+    }
+
+    @Test
     void opensAFileUrlAddress() throws Exception {
         assumeTrue(BrewShot.available(), "no local Chrome; skipping");
         Path page = Files.createTempFile("brewshot-open", ".html");

@@ -18,6 +18,12 @@ class MainCliTest {
     }
 
     @Test
+    void newFlagShapesValidate() throws Exception {
+        assertEquals(2, Main.run(new String[] {"--cookie", "malformed", "x.html"}));
+        assertEquals(2, Main.run(new String[] {"--header", "no-colon", "x.html"}));
+    }
+
+    @Test
     void trailingFlagWantsAValueNotAStackTrace() {
         org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class,
             () -> Main.run(new String[] {"page.html", "-o"}));

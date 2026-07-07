@@ -40,7 +40,7 @@ import java.util.regex.Pattern;
 public final class BrewShot implements AutoCloseable {
 
     /** Library version — also printed by the CLI's {@code --version}. */
-    public static final String VERSION = "0.2.0";
+    public static final String VERSION = "0.3.0";
 
     private static final Pattern WS_LINE = Pattern.compile("DevTools listening on (ws://\\S+)");
     private static final long DEFAULT_TIMEOUT_MS = 15_000;
