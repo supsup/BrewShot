@@ -40,7 +40,7 @@ WebSocket client since 11. BrewShot is those messages, wrapped well:
 | `Runtime.evaluate` | `eval(js)` → String/Double/Boolean/Map/List · `waitFor(predicate, ms)` |
 | `Runtime.consoleAPICalled` / `exceptionThrown` | `console()` / `errors()` — the page's voice, one-line health asserts |
 | `Page.captureScreenshot` | `screenshot(path)` / `screenshotClip(x,y,w,h)` · `screenshotElement("css")` |
-| + JDK ImageIO | `recordGif(rect…)` · `recordGifElement("css", …)` · `recordGifFullPage(…, scale, …)` · `recordGifRegion(0.5, 1.0, …)` |
+| + JDK ImageIO | `recordGif(rect…)` · `recordGifElement("css", …)` · `recordGifScroll(…)` · `recordGifFullPage(…, scale, …)` · `recordGifRegion(0.5, 1.0, …)` |
 
 **Target one element by CSS selector.** `elementBox("css")` resolves an element's
 page-coordinate box (scroll offset folded in), and `screenshotElement`/`recordGifElement`
@@ -48,6 +48,40 @@ capture *just that element* — no hand-computing `getBoundingClientRect()`. Tri
 animation first (`open`/`eval`), then film it: `recordGifElement` resolves the box once and
 films that fixed region, so motion *within* the element (glyph jitter, a spinner) is captured
 cleanly. Built for exactly this — recording one card's effect out of a page full of them.
+
+**Scroll-pan a tall page.** `recordGifScroll(panFrames, holdFrames, playbackDelayMs, scale, out)`
+glides the camera from the top of the document to the bottom — one viewport-height window per
+frame, smoothstep-eased so it accelerates and settles — turning a long static page (a docs page,
+a showcase, a changelog) into a smooth guided tour. `holdFrames` pauses at top and bottom so the
+loop reads. (Unlike `recordGifFullPage`, which re-shoots the *whole* page each frame; this pans a
+window *down* it.)
+
+```java
+try (BrewShot b = BrewShot.launch(1120, 800)) {   // launch height = the pan window
+    b.open("file:///…/showcase.html");
+    b.recordGifScroll(46, 8, 90, 0.55, Path.of("scroll.gif"));  // 46 pan + 8 hold each end
+}
+```
+
+### GIF playback speed (fps) — separate from capture
+
+The per-frame **playback** delay is the speed knob, independent of how densely you **sample**.
+Every recorder takes a single `frameDelayMs` (capture == playback, ≈ real time); the `recordGif`
+and `recordGifElement` overloads split it into `(captureDelayMs, playbackDelayMs)` so you can
+**sample a fast effect densely and replay it slowly**: `recordGifElement(".fx", 60, 25, 75, s, out)`
+shoots 60 frames ~25 ms apart, played back at 75 ms/frame. **FPS = `1000 / playbackDelayMs`** —
+so a *bigger* delay is a *lower* fps is a *slower* GIF (a slower scroll, a slower effect).
+
+| playbackDelayMs | ≈ fps | good for |
+|---|---|---|
+| 33 ms | ~30 | real-time smoothness — UI motion, a spinner, "does it feel right" |
+| 50 ms | ~20 | lively but legible — hover/click micro-interactions |
+| 75 ms | ~13 | **catalogue/showcase default** — an effect or a scroll you can actually read |
+| 100 ms | ~10 | study pace — walk someone through each step |
+| 150 ms | ~7 | slow-mo — a fast effect (glitch, a shatter) frame-by-frame; a leisurely scroll |
+
+Chrome's shot time floors real capture cadence at ≈20-30 ms, so `captureDelayMs` below that just
+samples as fast as it can; `playbackDelayMs` has no floor — set it purely for the speed you want.
 
 First proven as the [LatteX](https://github.com/supsup/LatteX) fx-runtime test
 harness, where it pinned real rendering bugs (glyph placement, animation

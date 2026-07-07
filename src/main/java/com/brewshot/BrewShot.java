@@ -538,18 +538,40 @@ public final class BrewShot implements AutoCloseable {
      * Record a page-coordinate rectangle as a looping GIF: {@code frames}
      * clipped shots at {@code frameDelayMs} cadence, assembled via the JDK's
      * ImageIO (no dependency). Trigger your animation first (eval/open), then
-     * call this while it runs. (Playback delay is stamped as frameDelayMs;
-     * actual capture cadence adds shot time, so fast animations play back
-     * slightly faster than real time.)
+     * call this while it runs. Capture cadence == playback cadence here (≈
+     * real time); to play back slower/faster than you sample, use the
+     * {@code captureDelayMs, playbackDelayMs} overload below.
      */
     public void recordGif(double x, double y, double width, double height,
                           int frames, int frameDelayMs, Path out) throws IOException {
+        recordGif(x, y, width, height, frames, frameDelayMs, frameDelayMs, out);
+    }
+
+    /**
+     * Record a rectangle as a looping GIF with SEPARATE capture and playback
+     * cadence — the two are independent knobs:
+     * <ul>
+     *   <li>{@code captureDelayMs} — how long to wait between shots. This is the
+     *       real-time SAMPLING rate: smaller = denser sampling of a fast
+     *       animation (more detail, but Chrome's shot time floors it ≈20-30ms).</li>
+     *   <li>{@code playbackDelayMs} — the per-frame display duration stamped into
+     *       the GIF: this is the SPEED. {@code playbackDelayMs > captureDelayMs}
+     *       plays it back in slow motion; {@code <} speeds it up; {@code ==} is
+     *       ≈ real time. FPS = {@code 1000 / playbackDelayMs}.</li>
+     * </ul>
+     * Sample a fast effect densely and replay it readably:
+     * {@code recordGif(..., 60, 25, 75, out)} — 60 shots ~25ms apart, played at
+     * 75ms/frame (≈13fps slow-mo). See the README "GIF playback speed" table.
+     */
+    public void recordGif(double x, double y, double width, double height,
+                          int frames, int captureDelayMs, int playbackDelayMs, Path out)
+            throws IOException {
         List<byte[]> shots = new ArrayList<>(frames);
         for (int i = 0; i < frames; i++) {
             shots.add(screenshotClip(x, y, width, height));
-            settle(frameDelayMs);
+            settle(captureDelayMs);
         }
-        GifWriter.write(shots, frameDelayMs, out);
+        GifWriter.write(shots, playbackDelayMs, out);
     }
 
     /**
@@ -588,13 +610,51 @@ public final class BrewShot implements AutoCloseable {
      */
     public void recordGifElement(String cssSelector, int frames, int frameDelayMs,
                                  double scale, Path out) throws IOException {
+        recordGifElement(cssSelector, frames, frameDelayMs, frameDelayMs, scale, out);
+    }
+
+    /**
+     * Record one element as a GIF with SEPARATE capture and playback cadence —
+     * see {@link #recordGif(double, double, double, double, int, int, int, Path)}
+     * for the two-knob model. Sample a fast effect densely, play it back
+     * readably: {@code recordGifElement(".fx", 60, 25, 75, 1.3, out)}.
+     */
+    public void recordGifElement(String cssSelector, int frames, int captureDelayMs,
+                                 int playbackDelayMs, double scale, Path out) throws IOException {
         double[] b = elementBox(cssSelector);
         List<byte[]> shots = new ArrayList<>(frames);
         for (int i = 0; i < frames; i++) {
             shots.add(screenshotClip(b[0], b[1], b[2], b[3], scale));
-            settle(frameDelayMs);
+            settle(captureDelayMs);
         }
-        GifWriter.write(shots, frameDelayMs, out);
+        GifWriter.write(shots, playbackDelayMs, out);
+    }
+
+    /**
+     * Record a SCROLL-PAN down a tall page as a looping GIF — the camera glides
+     * from the top of the document to the bottom, one viewport-height window per
+     * frame, with smoothstep ease-in/out so it accelerates and settles rather
+     * than lurching. Unlike {@link #recordGifFullPage} (which re-shoots the whole
+     * page each frame), this pans a fixed-height window DOWN the document, so a
+     * long static page becomes a smooth guided tour. {@code holdFrames} pauses at
+     * the top and bottom so the loop reads. {@code scale} downsizes for byte sanity.
+     * The launch viewport height is the window height.
+     */
+    public void recordGifScroll(int panFrames, int holdFrames, int playbackDelayMs,
+                                double scale, Path out) throws IOException {
+        double w = ((Number) eval("document.documentElement.scrollWidth")).doubleValue();
+        double h = ((Number) eval("document.documentElement.scrollHeight")).doubleValue();
+        double vh = ((Number) eval("window.innerHeight")).doubleValue();
+        double maxY = Math.max(0, h - vh);
+        List<byte[]> shots = new ArrayList<>(panFrames + 2 * holdFrames);
+        for (int i = 0; i < holdFrames; i++) shots.add(screenshotClip(0, 0, w, vh, scale));
+        for (int i = 0; i < panFrames; i++) {
+            double t = panFrames <= 1 ? 1 : i / (double) (panFrames - 1);
+            double eased = t * t * (3 - 2 * t);
+            shots.add(screenshotClip(0, eased * maxY, w, vh, scale));
+        }
+        for (int i = 0; i < holdFrames; i++) shots.add(screenshotClip(0, maxY, w, vh, scale));
+        GifWriter.write(shots, playbackDelayMs, out);
     }
 
     /**

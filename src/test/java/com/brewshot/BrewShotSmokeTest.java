@@ -65,6 +65,22 @@ class BrewShotSmokeTest {
     }
 
     @Test
+    void scrollPanAndDecoupledPlaybackProduceGifs() throws Exception {
+        assumeTrue(BrewShot.available(), "no local Chrome; skipping");
+        Path out = Files.createTempDirectory("brewshot-scroll");
+        try (BrewShot shot = BrewShot.launch(400, 300)) {
+            shot.html("<style>*{margin:0}#tall{height:1600px;"
+                + "background:linear-gradient(#fff,#111)}</style><div id=\"tall\"></div>");
+            // scroll-pan a tall page into a GIF
+            shot.recordGifScroll(6, 2, 80, 0.5, out.resolve("scroll.gif"));
+            assertTrue(Files.size(out.resolve("scroll.gif")) > 100, "scroll gif too small");
+            // decoupled capture (20ms) vs playback (80ms) speed
+            shot.recordGif(0, 0, 200, 200, 4, 20, 80, out.resolve("slow.gif"));
+            assertTrue(Files.size(out.resolve("slow.gif")) > 100, "decoupled gif too small");
+        }
+    }
+
+    @Test
     void staleLoadEventCannotSatisfyALaterNavigation() throws Exception {
         assumeTrue(BrewShot.available(), "no local Chrome; skipping");
         // The review's headline: html() fires a load event; if open() consumed
