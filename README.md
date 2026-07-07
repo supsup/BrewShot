@@ -133,8 +133,8 @@ lifecycle leaks, hover-state wiring) that no stubbed DOM could catch.
 Not a Playwright/Selenium replacement: one browser (local Chrome/Chromium), one
 page at a time, no selector engine, no auto-waiting, no cross-browser patches.
 `eval()` is the escape hatch for all of that — dispatch events, read layout,
-poll conditions with the full power of page-side JS. ~700 lines total, and it
-intends to stay that size.
+poll conditions with the full power of page-side JS. ~800 lines of core CDP
+client (≈1,300 with the CLI and JSON codec), and it intends to stay lean.
 
 ## Metrics — jar vs native binary
 

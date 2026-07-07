@@ -250,7 +250,8 @@ the macOS-native-binary caveat doesn't exist here.
 
 ## The design in one paragraph
 
-BrewShot is deliberately ~700 lines: launch local Chrome headless with a
+BrewShot's core is deliberately small — ~800 lines of CDP client (≈1,300 with
+the CLI and JSON codec): launch local Chrome headless with a
 DevTools port, speak six CDP messages over the JDK's own WebSocket, hand back
 bytes and JSON values. No selector engine (use `eval`), no auto-waiting (use
 `settle`/`eval` polling), no browser downloads (use the Chrome you have), no
