@@ -155,6 +155,32 @@ try (BrewShot shot = BrewShot.launch(1280, 2000)) {
 This use case is why the API stays boring: `open`/`html` → `eval` → `screenshot`
 covers everything an agent needs to *see*, and nothing it doesn't.
 
+**Marco's encore — the whole page, or just a slice of it.** Three capture
+shapes beyond one card:
+
+```java
+shot.recordGifFullPage(30, 130, 0.4, out);        // every viewport, downscaled
+shot.recordGifRegion(0.5, 1.0, 24, 130, 0.55, out); // "the bottom half"
+```
+
+And the screen-recording-style TOUR — viewport-sized frames while the page
+scrolls (full-size pixels, whole page over time, small file):
+
+```java
+double docH = (Double) shot.eval("document.documentElement.scrollHeight");
+List<byte[]> frames = new ArrayList<>();
+for (int i = 0; i < 48; i++) {
+    double y = Math.round((docH - vh) * Math.min(1.0, i / 42.0)); // dwell, then cruise
+    shot.eval("window.scrollTo(0, " + y + "); true");
+    shot.settle(90);
+    frames.add(shot.screenshotClip(0, y, vw, vh, 0.55));
+}
+BrewShot.gif(frames, 120, out);
+```
+
+The `scale` parameter on all of these is CDP's own `clip.scale` — the
+downscale happens inside Chrome (free, native-image-clean, no AWT).
+
 ---
 
 ## 5. Ana — "it has to run in a container"

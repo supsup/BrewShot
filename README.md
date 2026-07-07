@@ -40,7 +40,7 @@ WebSocket client since 11. BrewShot is those messages, wrapped well:
 | `Runtime.evaluate` | `eval(js)` → String/Double/Boolean/Map/List · `waitFor(predicate, ms)` |
 | `Runtime.consoleAPICalled` / `exceptionThrown` | `console()` / `errors()` — the page's voice, one-line health asserts |
 | `Page.captureScreenshot` | `screenshot(path)` / `screenshotClip(x,y,w,h)` |
-| + JDK ImageIO | `recordGif(x,y,w,h, frames, delayMs, path)` |
+| + JDK ImageIO | `recordGif(rect…)` · `recordGifFullPage(…, scale, …)` · `recordGifRegion(0.5, 1.0, …)` |
 
 First proven as the [LatteX](https://github.com/supsup/LatteX) fx-runtime test
 harness, where it pinned real rendering bugs (glyph placement, animation

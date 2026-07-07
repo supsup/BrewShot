@@ -67,12 +67,22 @@ shot.open("http://localhost:8080/private/page");     // set BEFORE open()
 ## Record it
 
 ```java
-// trigger your animation first (open/html/eval), then film a rectangle:
+// trigger your animation first (open/html/eval), then film it:
 shot.recordGif(x, y, w, h, /*frames*/ 14, /*delayMs*/ 110, Path.of("anim.gif"));
+
+shot.recordGifFullPage(30, 130, /*scale*/ 0.4, Path.of("whole-page.gif"));
+// every viewport of the document; scale keeps bytes sane (in-browser, free)
+
+shot.recordGifRegion(0.5, 1.0, 24, 130, 0.55, Path.of("bottom-half.gif"));
+// fractions of document height: (0, 0.5)=top half, (0.25, 0.75)=the middle
 ```
 
-Looping GIF, assembled by the JDK's ImageIO. Frames are real captures — if
+Looping GIFs, assembled by the JDK's ImageIO. Frames are real captures — if
 nothing animates, all frames match (assert that for trigger-liveness tests).
+Stills have the same region trick: `screenshotRegion(from, to, scale)`, and
+`screenshotClip` takes an optional `scale` for cheap downscaled captures.
+For a screen-recording-style TOUR (viewport frames while the page scrolls),
+compose it from the primitives — recipe in SLOWSTART.
 
 ## CLI
 
