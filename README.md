@@ -129,6 +129,16 @@ that contains a malicious page, so don't point a sandboxless browser at
 untrusted URLs. (The provided image also runs as a non-root user.) Full walkthrough:
 [SLOWSTART.md](SLOWSTART.md) Scenario 5.
 
+## Security
+
+BrewShot hands your input to Chromium and reads back bytes + JSON — it never
+interprets page content itself, so a hostile page is Chromium's threat model,
+not BrewShot's. The one Java-side ingestion point (`MiniJson`, for `eval`
+results) is depth-capped and fails closed. The real risks are the ordinary
+headless-browser ones (SSRF reach, `--no-sandbox` in containers, injecting
+untrusted data into your own `eval` string). Full threat model + the three
+things not to do: **[SECURITY.md](SECURITY.md)**.
+
 ## Requirements
 
 - JDK 21+ (built with 25)

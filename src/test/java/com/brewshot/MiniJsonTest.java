@@ -51,6 +51,15 @@ class MiniJsonTest {
     }
 
     @Test
+    void deeplyNestedInputFailsCleanlyNotWithStackOverflow() {
+        StringBuilder deep = new StringBuilder();
+        for (int k = 0; k < 5000; k++) { deep.append('['); }
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class,
+            () -> MiniJson.parse(deep.toString()),
+            "5000-deep array must fail with a clear error, not StackOverflowError");
+    }
+
+    @Test
     void dottedGetReturnsNullOnMissingHops() {
         Object m = MiniJson.parse("{\"a\":{\"b\":1}}");
         assertEquals(1.0, MiniJson.get(m, "a.b"));

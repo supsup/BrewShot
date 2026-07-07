@@ -18,8 +18,16 @@ import java.util.Map;
  */
 public final class MiniJson {
 
+    /**
+     * Recursion cap — defence in depth. CDP messages are shallow; a pathological
+     * page returning a deeply-nested eval value cannot StackOverflow the harness
+     * (it fails the one eval call with a clear error instead). See SECURITY.md.
+     */
+    private static final int MAX_DEPTH = 200;
+
     private final String s;
     private int i;
+    private int depth;
 
     private MiniJson(String s) { this.s = s; }
 
@@ -72,7 +80,10 @@ public final class MiniJson {
     private Object value() {
         ws();
         char c = peek();
-        return switch (c) {
+        if ((c == '{' || c == '[') && ++depth > MAX_DEPTH) {
+            throw err("JSON nested deeper than " + MAX_DEPTH);
+        }
+        Object v = switch (c) {
             case '{' -> object();
             case '[' -> array();
             case '"' -> string();
@@ -81,6 +92,8 @@ public final class MiniJson {
             case 'n' -> lit("null", null);
             default -> number();
         };
+        if (c == '{' || c == '[') { depth--; }
+        return v;
     }
 
     private Map<String, Object> object() {
