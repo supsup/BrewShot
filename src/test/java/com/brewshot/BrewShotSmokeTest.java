@@ -42,6 +42,29 @@ class BrewShotSmokeTest {
     }
 
     @Test
+    void elementTargetedCaptureResolvesBoxBySelector() throws Exception {
+        assumeTrue(BrewShot.available(), "no local Chrome; skipping");
+        Path out = Files.createTempDirectory("brewshot-element");
+        try (BrewShot shot = BrewShot.launch(640, 480)) {
+            shot.html("""
+                <style>*{margin:0;padding:0}
+                  #box{position:absolute;left:40px;top:30px;width:120px;height:80px;background:#333}</style>
+                <div id="box"></div>
+                """);
+            // elementBox folds scroll offset in and matches the CSS-declared geometry
+            double[] b = shot.elementBox("#box");
+            assertEquals(40.0, b[0], 1.0, "x");
+            assertEquals(30.0, b[1], 1.0, "y");
+            assertEquals(120.0, b[2], 1.0, "width");
+            assertEquals(80.0, b[3], 1.0, "height");
+            // selector-based capture delegates to the clip/gif primitives
+            assertTrue(shot.screenshotElement("#box", 1.0).length > 100, "element png too small");
+            shot.recordGifElement("#box", 3, 20, 1.0, out.resolve("el.gif"));
+            assertTrue(Files.size(out.resolve("el.gif")) > 100, "element gif too small");
+        }
+    }
+
+    @Test
     void staleLoadEventCannotSatisfyALaterNavigation() throws Exception {
         assumeTrue(BrewShot.available(), "no local Chrome; skipping");
         // The review's headline: html() fires a load event; if open() consumed

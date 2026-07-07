@@ -39,8 +39,15 @@ WebSocket client since 11. BrewShot is those messages, wrapped well:
 | `Page.setDocumentContent` | `html(source)` — scripts execute, load fires |
 | `Runtime.evaluate` | `eval(js)` → String/Double/Boolean/Map/List · `waitFor(predicate, ms)` |
 | `Runtime.consoleAPICalled` / `exceptionThrown` | `console()` / `errors()` — the page's voice, one-line health asserts |
-| `Page.captureScreenshot` | `screenshot(path)` / `screenshotClip(x,y,w,h)` |
-| + JDK ImageIO | `recordGif(rect…)` · `recordGifFullPage(…, scale, …)` · `recordGifRegion(0.5, 1.0, …)` |
+| `Page.captureScreenshot` | `screenshot(path)` / `screenshotClip(x,y,w,h)` · `screenshotElement("css")` |
+| + JDK ImageIO | `recordGif(rect…)` · `recordGifElement("css", …)` · `recordGifFullPage(…, scale, …)` · `recordGifRegion(0.5, 1.0, …)` |
+
+**Target one element by CSS selector.** `elementBox("css")` resolves an element's
+page-coordinate box (scroll offset folded in), and `screenshotElement`/`recordGifElement`
+capture *just that element* — no hand-computing `getBoundingClientRect()`. Trigger the
+animation first (`open`/`eval`), then film it: `recordGifElement` resolves the box once and
+films that fixed region, so motion *within* the element (glyph jitter, a spinner) is captured
+cleanly. Built for exactly this — recording one card's effect out of a page full of them.
 
 First proven as the [LatteX](https://github.com/supsup/LatteX) fx-runtime test
 harness, where it pinned real rendering bugs (glyph placement, animation

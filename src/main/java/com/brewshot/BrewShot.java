@@ -553,6 +553,51 @@ public final class BrewShot implements AutoCloseable {
     }
 
     /**
+     * Page-coordinate bounding box of the FIRST element matching
+     * {@code cssSelector}, as <code>{x, y, width, height}</code> in document
+     * coordinates (scroll offset already folded in, so it feeds
+     * {@link #screenshotClip}/{@link #recordGif} directly). Throws if nothing
+     * matches. The building block for element-targeted capture.
+     */
+    public double[] elementBox(String cssSelector) {
+        String sel = "'" + cssSelector.replace("\\", "\\\\").replace("'", "\\'") + "'";
+        Object v = eval("(function(){var e=document.querySelector(" + sel + ");"
+            + "if(!e)return 'none';var r=e.getBoundingClientRect();"
+            + "return [r.left+window.scrollX,r.top+window.scrollY,r.width,r.height].join(',');})()");
+        if (!(v instanceof String s) || s.equals("none")) {
+            throw new IllegalArgumentException("no element matches selector: " + cssSelector);
+        }
+        String[] p = s.split(",");
+        return new double[] {Double.parseDouble(p[0]), Double.parseDouble(p[1]),
+                             Double.parseDouble(p[2]), Double.parseDouble(p[3])};
+    }
+
+    /** Clipped PNG of the element matching {@code cssSelector} — the
+     *  selector-based {@link #screenshotClip}. */
+    public byte[] screenshotElement(String cssSelector, double scale) {
+        double[] b = elementBox(cssSelector);
+        return screenshotClip(b[0], b[1], b[2], b[3], scale);
+    }
+
+    /**
+     * Record the element matching {@code cssSelector} as a looping GIF — the
+     * selector-based {@link #recordGif}. Resolves the element's box ONCE, then
+     * films that fixed region so an animation moving <em>within</em> the element
+     * (glyph jitter, a spinner) is captured cleanly. Trigger your animation
+     * first (open/eval), then call this while it runs.
+     */
+    public void recordGifElement(String cssSelector, int frames, int frameDelayMs,
+                                 double scale, Path out) throws IOException {
+        double[] b = elementBox(cssSelector);
+        List<byte[]> shots = new ArrayList<>(frames);
+        for (int i = 0; i < frames; i++) {
+            shots.add(screenshotClip(b[0], b[1], b[2], b[3], scale));
+            settle(frameDelayMs);
+        }
+        GifWriter.write(shots, frameDelayMs, out);
+    }
+
+    /**
      * Record the WHOLE PAGE as a looping GIF — every viewport, not just the
      * first. {@code scale} keeps the file sane (0.35-0.5 is usually right:
      * a 6000px-tall page at 0.4 ≈ readable thumbnails, tolerable bytes).
