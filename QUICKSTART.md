@@ -62,9 +62,10 @@ brewshot ./report.html -o report.png --size 1440x1000 --settle 1500
 cat page.html | brewshot - -o page.png --eval "document.title"
 ```
 
-`java -jar brewshot.jar …` today; `./gradlew nativeImage` for the native
-binary (PNG/eval path only — GIF is library-mode until native-image AWT lands
-on macOS).
+`java -jar brewshot.jar …` works everywhere, GIFs included. The native binary
+(`./gradlew nativeImage`) does PNG + eval everywhere too — its ONE gap: no GIF
+assembly on macOS (native-image doesn't support AWT/ImageIO there yet; on a
+JVM, GIFs always work — that's how every example GIF was made).
 
 ## Test-gating pattern
 

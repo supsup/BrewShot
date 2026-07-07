@@ -53,10 +53,10 @@ lifecycle leaks, hover-state wiring) that no stubbed DOM could catch.
 - **Reference artifacts** — commit screenshots/GIFs beside the pages that
   produce them; every change carries its own visual receipt.
 - **Agent eyes** — a headless way for tooling to *see* a rendered page.
-- **One-off shots** — the CLI, eventually as a GraalVM native binary
-  (`./gradlew nativeImage`; the PNG/eval path is native-clean — GIF assembly
-  uses ImageIO/AWT, which native-image doesn't yet support on macOS, so GIFs
-  are library-mode for now).
+- **One-off shots** — the CLI: `java -jar` today, or the GraalVM native
+  binary (`./gradlew nativeImage`) for instant no-JVM startup. See the
+  metrics table below — including the one GIF caveat that applies *only* to
+  the native binary on macOS.
 
 ## What it deliberately is not
 
@@ -77,7 +77,7 @@ same tiny page, identical PNG output from both:
 | CLI startup (`--help`, warm) | ~20 ms | **~3 ms** |
 | full shot (launch Chrome → render → PNG) | ~2.0 s | **~1.7 s** |
 | needs a JVM installed | yes | **no** |
-| GIF recording | **yes** | not on macOS yet (native-image AWT gap) |
+| GIF recording | **yes** | not on macOS yet¹ |
 
 The honest read: **Chrome launch dominates a full shot** (~1.4 s), so the
 native win there is modest (~0.3 s of skipped JVM warm-up). Where the binary
@@ -87,6 +87,14 @@ keep at 17 KB with full GIF support. Ship both, pick per context.
 
 First run of a fresh binary pays macOS code-signature verification (~0.3 s,
 once). PNG outputs are byte-identical across modes.
+
+¹ To be clear about the GIF caveat: **GIFs work on every platform when you run
+on a JVM** — the library in your tests, `java -jar` from the shell — because
+the encoder is the JDK's own ImageIO. The limitation applies only to the
+**native-compiled executable**: GraalVM's native-image doesn't support AWT
+(which ImageIO rides on) on macOS yet, so `build/brewshot` can screenshot but
+not assemble GIFs on a Mac. Same code, two execution modes — the caveat lives
+entirely in the second one.
 
 ## Requirements
 
