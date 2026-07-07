@@ -510,16 +510,27 @@ public final class BrewShot implements AutoCloseable {
      * the frame primitive for animation capture (GIF assembly).
      */
     public byte[] screenshotClip(double x, double y, double width, double height) {
+        return screenshotClip(x, y, width, height, 1.0);
+    }
+
+    /**
+     * Clipped PNG with OUTPUT SCALING — Chrome renders the rect at
+     * {@code scale} (0.5 = quarter the pixels), which is what makes full-page
+     * animation capture practical: the downscale is free, in-browser, and
+     * native-image-clean (no AWT).
+     */
+    public byte[] screenshotClip(double x, double y, double width, double height, double scale) {
         if (!Double.isFinite(x) || !Double.isFinite(y)
-                || !Double.isFinite(width) || !Double.isFinite(height)) {
-            throw new IllegalArgumentException("non-finite clip: "
-                + x + "," + y + " " + width + "x" + height);
+                || !Double.isFinite(width) || !Double.isFinite(height)
+                || !Double.isFinite(scale) || scale <= 0) {
+            throw new IllegalArgumentException("non-finite/invalid clip: "
+                + x + "," + y + " " + width + "x" + height + " @" + scale);
         }
         Map<String, Object> r = command("Page.captureScreenshot",
             "{\"format\":\"png\",\"captureBeyondViewport\":true,\"clip\":{"
                 + "\"x\":" + x + ",\"y\":" + y
                 + ",\"width\":" + width + ",\"height\":" + height
-                + ",\"scale\":1}}");
+                + ",\"scale\":" + scale + "}}");
         return Base64.getDecoder().decode((String) r.get("data"));
     }
 
@@ -536,6 +547,23 @@ public final class BrewShot implements AutoCloseable {
         List<byte[]> shots = new ArrayList<>(frames);
         for (int i = 0; i < frames; i++) {
             shots.add(screenshotClip(x, y, width, height));
+            settle(frameDelayMs);
+        }
+        GifWriter.write(shots, frameDelayMs, out);
+    }
+
+    /**
+     * Record the WHOLE PAGE as a looping GIF — every viewport, not just the
+     * first. {@code scale} keeps the file sane (0.35-0.5 is usually right:
+     * a 6000px-tall page at 0.4 ≈ readable thumbnails, tolerable bytes).
+     */
+    public void recordGifFullPage(int frames, int frameDelayMs, double scale, Path out)
+            throws IOException {
+        double w = ((Double) eval("document.documentElement.scrollWidth")).doubleValue();
+        double h = ((Double) eval("document.documentElement.scrollHeight")).doubleValue();
+        List<byte[]> shots = new ArrayList<>(frames);
+        for (int i = 0; i < frames; i++) {
+            shots.add(screenshotClip(0, 0, w, h, scale));
             settle(frameDelayMs);
         }
         GifWriter.write(shots, frameDelayMs, out);
