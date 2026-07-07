@@ -145,3 +145,8 @@ untrusted URLs. (The provided image also runs as a non-root user.) Full walkthro
 
 Apache-2.0 · extracted from the LatteX test harness · design reviewed against
 playwright's chromium driver
+
+## Disclaimer
+
+This project is provided under the Apache License 2.0 on an "AS IS" basis,
+without warranties or conditions of any kind. See the LICENSE file for details.
