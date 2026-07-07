@@ -53,7 +53,10 @@ lifecycle leaks, hover-state wiring) that no stubbed DOM could catch.
   Chrome-less CI skips cleanly.
 - **Reference artifacts** — commit screenshots/GIFs beside the pages that
   produce them; every change carries its own visual receipt.
-- **Agent eyes** — a headless way for tooling to *see* a rendered page.
+- **Agent eyes** — a headless way for an AI to *see* a rendered page:
+  [AGENTS.md](AGENTS.md) has the CLI pattern, a drop-in skill example, and an
+  honest MCP-server recipe (the first two are how this project itself is
+  developed).
 - **One-off shots** — the CLI: `java -jar` today, or the GraalVM native
   binary (`./gradlew nativeImage`) for instant no-JVM startup. See the
   metrics table below — including the one GIF caveat that applies *only* to
@@ -125,6 +128,7 @@ untrusted URLs. (The provided image also runs as a non-root user.) Full walkthro
 - [QUICKSTART.md](QUICKSTART.md) — the whole API in two minutes
 - [SLOWSTART.md](SLOWSTART.md) — walkthroughs by scenario, including the LatteX
   case study
+- [AGENTS.md](AGENTS.md) — giving an AI eyes: CLI pattern, skill example, MCP recipe
 
 ## License
 
