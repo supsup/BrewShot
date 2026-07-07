@@ -37,8 +37,13 @@ class MainCliTest {
     }
 
     @Test
-    void trailingFlagWantsAValueNotAStackTrace() {
-        org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class,
-            () -> Main.run(new String[] {"page.html", "-o"}));
+    void badFlagValuesExitCleanlyNotWithAStackTrace() throws Exception {
+        // Lattice's four repros (brewshot/9): thrown parse/value exceptions must
+        // route through err() -> exit 2, never escape as a stack trace + exit 1.
+        assertEquals(2, Main.run(new String[] {"https://example.com", "-o"}));            // missing value
+        assertEquals(2, Main.run(new String[] {"--size", "axb", "https://example.com"})); // WxH but non-numeric
+        assertEquals(2, Main.run(new String[] {"https://example.com", "--settle", "nope"}));
+        assertEquals(2, Main.run(new String[] {"https://example.com", "--wait-timeout", "nope"}));
+        assertEquals(2, Main.run(new String[] {"--eval-file", "no-such-file.js", "https://example.com"}));
     }
 }

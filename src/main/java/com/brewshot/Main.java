@@ -63,20 +63,25 @@ public final class Main {
         java.util.List<String[]> cookies = new java.util.ArrayList<>();
         java.util.List<String[]> headers = new java.util.ArrayList<>();
 
+        // The ARGUMENT-PARSING phase only: a bad flag value (missing value,
+        // non-numeric --size/--settle/--wait-timeout, unreadable --eval-file)
+        // is a usage error → clean message + exit 2, never a stack trace. The
+        // launch/shoot phase below keeps its real errors (exit 1).
+        try {
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
                 case "-o", "--out" -> out = Path.of(requireValue(args, ++i));
                 case "--size" -> {
                     String[] wh = requireValue(args, ++i).split("x");
                     if (wh.length != 2) { return err("--size wants WxH, e.g. 1440x1000"); }
-                    width = Integer.parseInt(wh[0]);
-                    height = Integer.parseInt(wh[1]);
+                    width = posInt("--size width", wh[0]);
+                    height = posInt("--size height", wh[1]);
                 }
-                case "--settle" -> settleMs = Long.parseLong(requireValue(args, ++i));
+                case "--settle" -> settleMs = posLong("--settle", requireValue(args, ++i));
                 case "--eval" -> evalExpr = requireValue(args, ++i);
                 case "--eval-file" -> evalExpr = Files.readString(Path.of(requireValue(args, ++i)));
                 case "--wait-js" -> waitJs = requireValue(args, ++i);
-                case "--wait-timeout" -> waitTimeoutMs = Long.parseLong(requireValue(args, ++i));
+                case "--wait-timeout" -> waitTimeoutMs = posLong("--wait-timeout", requireValue(args, ++i));
                 case "--clip-js" -> clipJs = requireValue(args, ++i);
                 case "--fail-js" -> failJs = requireValue(args, ++i);
                 case "--json" -> jsonManifest = Path.of(requireValue(args, ++i));
@@ -102,6 +107,9 @@ public final class Main {
                     input = args[i];
                 }
             }
+        }
+        } catch (IllegalArgumentException | java.io.IOException e) {
+            return err(e.getMessage());
         }
         if (input == null) { usage(); return 2; }
 
@@ -193,6 +201,16 @@ public final class Main {
          .append("  \"brewshot\": \"").append(BrewShot.VERSION).append("\"\n")
          .append("}\n");
         Files.writeString(manifest, j.toString());
+    }
+
+    private static int posInt(String flag, String v) {
+        try { return Integer.parseInt(v); }
+        catch (NumberFormatException e) { throw new IllegalArgumentException(flag + " wants a number, got: " + v); }
+    }
+
+    private static long posLong(String flag, String v) {
+        try { return Long.parseLong(v); }
+        catch (NumberFormatException e) { throw new IllegalArgumentException(flag + " wants a number (ms), got: " + v); }
     }
 
     private static String requireValue(String[] args, int i) {
