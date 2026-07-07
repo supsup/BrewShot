@@ -151,6 +151,43 @@ covers everything an agent needs to *see*, and nothing it doesn't.
 
 ---
 
+## 5. Ana — "it has to run in a container"
+
+Ana's CI runners are containers; there is no Chrome on them and she can't
+install one per-job. She wants screenshots (and GIFs — which, on a JVM, work
+on every platform) as pipeline artifacts.
+
+**The easy path — the provided image.** The repo ships a `Dockerfile`
+(jar-on-JVM + Chromium + fonts, fully self-contained):
+
+```
+docker build -t brewshot .
+docker run --rm -v "$PWD:/work" brewshot https://ci.internal/report -o /work/report.png
+cat page.html | docker run --rm -i -v "$PWD:/work" brewshot - -o /work/page.png
+```
+
+**Rolling your own image instead?** Three things a container needs that a
+laptop already has:
+
+1. **A browser** — `chromium` from the distro (`apt-get install chromium`);
+   point `BREWSHOT_CHROME=/usr/bin/chromium`.
+2. **Fonts** — a bare container renders tofu boxes. `fonts-liberation
+   fonts-dejavu-core` covers text; add `fonts-noto-color-emoji` if your pages
+   use emoji.
+3. **Sandbox flags** — Chrome's sandbox needs privileges containers don't
+   grant by default, so it exits immediately. Set
+   `BREWSHOT_CHROME_ARGS="--no-sandbox --disable-dev-shm-usage"`
+   (BrewShot appends these to the launch; `--disable-dev-shm-usage` avoids
+   the tiny default `/dev/shm` crashing renders of large pages).
+
+**What Ana should know:** container renders use the Linux font stack, so
+pixels differ subtly from Mac/Windows-Chrome renders — keep your reference
+images consistently from one environment (CI is the good choice: it's the
+one everyone shares). And inside the container the *jar* runs GIFs happily —
+the macOS-native-binary caveat doesn't exist here.
+
+---
+
 ## The design in one paragraph
 
 BrewShot is deliberately ~700 lines: launch local Chrome headless with a

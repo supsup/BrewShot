@@ -87,7 +87,7 @@ public final class BrewShot implements AutoCloseable {
         String bin = findChrome();
         if (bin == null) { throw new IllegalStateException("no Chrome binary found"); }
         Path profile = Files.createTempDirectory("brewshot-");
-        Process p = new ProcessBuilder(
+        java.util.List<String> args = new java.util.ArrayList<>(java.util.List.of(
             bin,
             "--headless",
             "--disable-gpu",
@@ -97,9 +97,16 @@ public final class BrewShot implements AutoCloseable {
             "--remote-debugging-port=0",
             "--user-data-dir=" + profile,
             "--no-first-run",
-            "--no-default-browser-check",
-            "about:blank"
-        ).start();
+            "--no-default-browser-check"));
+        // Extra Chrome flags via env — the container hook (e.g. a Docker image
+        // sets BREWSHOT_CHROME_ARGS=--no-sandbox: Chrome's sandbox needs
+        // privileges containers don't grant by default). Space-separated.
+        String extra = System.getenv("BREWSHOT_CHROME_ARGS");
+        if (extra != null && !extra.isBlank()) {
+            args.addAll(java.util.List.of(extra.trim().split("\\s+")));
+        }
+        args.add("about:blank");
+        Process p = new ProcessBuilder(args).start();
 
         String wsUrl = awaitDevtoolsUrl(p);
         LinkedBlockingQueue<String> inbox = new LinkedBlockingQueue<>();
@@ -237,6 +244,44 @@ public final class BrewShot implements AutoCloseable {
             throw new IllegalStateException("page JS threw: " + (desc != null ? desc : ex));
         }
         return MiniJson.get(r, "result.value");
+    }
+
+    private final java.util.Map<String, String> extraHeaders = new java.util.LinkedHashMap<>();
+
+    /**
+     * Send an extra HTTP header on every request — e.g. basic/bearer auth:
+     * {@code shot.header("Authorization", "Basic dXNlcjpwYXNz")}. Call before
+     * {@link #open}; cumulative across calls (last value per name wins).
+     */
+    public void header(String name, String value) {
+        extraHeaders.put(name, value);
+        command("Network.enable", "{}");
+        StringBuilder json = new StringBuilder("{\"headers\":{");
+        boolean first = true;
+        for (var e : extraHeaders.entrySet()) {
+            if (!first) { json.append(','); }
+            first = false;
+            json.append('"').append(MiniJson.esc(e.getKey())).append("\":\"")
+                .append(MiniJson.esc(e.getValue())).append('"');
+        }
+        json.append("}}");
+        command("Network.setExtraHTTPHeaders", json.toString());
+    }
+
+    /**
+     * Set a cookie before {@link #open} — session-auth shape:
+     * {@code shot.cookie("SESSION", token, "localhost")}. Applies to every
+     * path on the domain.
+     */
+    public void cookie(String name, String value, String domain) {
+        Map<String, Object> r = command("Network.setCookie",
+            "{\"name\":\"" + MiniJson.esc(name)
+                + "\",\"value\":\"" + MiniJson.esc(value)
+                + "\",\"domain\":\"" + MiniJson.esc(domain)
+                + "\",\"path\":\"/\"}");
+        if (Boolean.FALSE.equals(r.get("success"))) {
+            throw new IllegalStateException("cookie rejected: " + name + " @ " + domain);
+        }
     }
 
     /** Sleep helper for settle waits between eval steps. */

@@ -96,6 +96,22 @@ the encoder is the JDK's own ImageIO. The limitation applies only to the
 not assemble GIFs on a Mac. Same code, two execution modes — the caveat lives
 entirely in the second one.
 
+## Running in a container
+
+The repo ships a `Dockerfile` (jar + Chromium + fonts, self-contained — GIFs
+included, since the container runs a JVM):
+
+```
+docker build -t brewshot .
+docker run --rm -v "$PWD:/work" brewshot https://example.com -o /work/page.png
+```
+
+Rolling your own image: install `chromium` + fonts (`fonts-liberation`,
+`fonts-dejavu-core`), set `BREWSHOT_CHROME=/usr/bin/chromium` and
+`BREWSHOT_CHROME_ARGS="--no-sandbox --disable-dev-shm-usage"` (Chrome's
+sandbox doesn't fit default container privileges). Full walkthrough:
+[SLOWSTART.md](SLOWSTART.md) Scenario 5.
+
 ## Requirements
 
 - JDK 21+ (built with 25)

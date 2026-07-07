@@ -44,6 +44,14 @@ byte[] png = shot.screenshotClip(x, y, w, h);  // one rectangle, page coordinate
 (`el.dispatchEvent(new MouseEvent('mouseenter',{bubbles:true}))`), read
 `getBoundingClientRect()`, scroll, poll a condition.
 
+## Get past auth
+
+```java
+shot.header("Authorization", "Basic dXNlcjpwYXNz");  // any header, every request
+shot.cookie("SESSION", token, "localhost");          // session-cookie auth
+shot.open("http://localhost:8080/private/page");     // set BEFORE open()
+```
+
 ## Record it
 
 ```java
