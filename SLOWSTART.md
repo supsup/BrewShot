@@ -180,6 +180,25 @@ laptop already has:
    (BrewShot appends these to the launch; `--disable-dev-shm-usage` avoids
    the tiny default `/dev/shm` crashing renders of large pages).
 
+**Mounts — how files get in and out.** The container's filesystem vanishes
+with `--rm`, so the `-v "$PWD:/work"` in every example is doing real work: it
+mounts your current directory INTO the container at `/work` (the image's
+default working directory). Forget it and the PNG is written inside the
+container and gone before you can look at it. The same mount moves files BOTH
+ways:
+
+```
+docker run --rm -v "$PWD:/work" brewshot /work/report.html -o /work/report.png
+#                 ^ input read from your dir      ^ output lands in your dir
+```
+
+Mount any host path you like (`-v /ci/artifacts:/work`); stdin (`-`) needs no
+mount for input, only for output. **One gotcha on Linux hosts:** the image
+runs as a non-root user (deliberately — see the Dockerfile), so the mounted
+directory must be writable by that user; if you hit `Permission denied` on
+the output, run with your own uid: `docker run --user "$(id -u)" ...` (macOS
+and Windows Docker Desktop handle this mapping automatically).
+
 **What Ana should know:** container renders use the Linux font stack, so
 pixels differ subtly from Mac/Windows-Chrome renders — keep your reference
 images consistently from one environment (CI is the good choice: it's the

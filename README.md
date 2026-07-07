@@ -110,6 +110,11 @@ docker build -t brewshot .
 docker run --rm -v "$PWD:/work" brewshot https://example.com -o /work/page.png
 ```
 
+(The `-v "$PWD:/work"` mount is how the PNG reaches your directory — the
+container's own filesystem vanishes with `--rm`. Input files ride the same
+mount; Linux hosts may need `--user "$(id -u)"` since the image runs
+non-root. Details: SLOWSTART Scenario 5.)
+
 Rolling your own image: install `chromium` + fonts (`fonts-liberation`,
 `fonts-dejavu-core`), set `BREWSHOT_CHROME=/usr/bin/chromium` and
 `BREWSHOT_CHROME_ARGS="--no-sandbox --disable-dev-shm-usage"` — scope
