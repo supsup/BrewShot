@@ -37,6 +37,23 @@ class MainCliTest {
     }
 
     @Test
+    void clipFlagShapesValidate() throws Exception {
+        // --clip-selector and --clip-js are exclusive clip sources
+        assertEquals(2, Main.run(new String[] {
+            "--clip-selector", "svg", "--clip-js", "({x:0,y:0,w:1,h:1})", "https://example.com"}));
+        // --scale must be a positive finite number
+        assertEquals(2, Main.run(new String[] {"--scale", "nope", "https://example.com"}));
+        assertEquals(2, Main.run(new String[] {"--scale", "0", "https://example.com"}));
+        assertEquals(2, Main.run(new String[] {"--scale", "-2", "https://example.com"}));
+        // --clip-padding must be non-negative
+        assertEquals(2, Main.run(new String[] {"--clip-padding", "-4", "https://example.com"}));
+        // = forms parse through to input resolution (exit 2 = "no such file", not unknown flag)
+        assertEquals(2, Main.run(new String[] {"--clip-selector=svg", "no-such-file.html"}));
+        assertEquals(2, Main.run(new String[] {"--scale=3", "no-such-file.html"}));
+        assertEquals(2, Main.run(new String[] {"--clip-padding=8", "no-such-file.html"}));
+    }
+
+    @Test
     void badFlagValuesExitCleanlyNotWithAStackTrace() throws Exception {
         // Lattice's four repros (brewshot/9): thrown parse/value exceptions must
         // route through err() -> exit 2, never escape as a stack trace + exit 1.

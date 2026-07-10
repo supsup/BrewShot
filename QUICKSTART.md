@@ -91,14 +91,17 @@ brewshot https://example.com -o page.png
 brewshot ./report.html -o report.png --size 1440x1000 --settle 1500
 cat page.html | brewshot - -o page.png --eval "document.title"
 
+# one element, crisp: selector clip + 3x re-raster (no hand-rolled rect JS)
+brewshot page.html -o card.png --clip-selector "#card" --scale 3 --clip-padding 8
+
 # CI/agent shape: deterministic wait, one panel, assertion, manifest sidecar
 brewshot http://localhost:8080/route -o shot.png \
   --wait-js "document.readyState==='complete'" \
-  --clip-js "(()=>{const r=document.querySelector('main').getBoundingClientRect();
-              return {x:r.left+scrollX,y:r.top+scrollY,w:r.width,h:r.height}})()" \
+  --clip-selector main \
   --fail-js "!document.querySelector('.error-banner')" \
   --cookie "SESSION=tok@localhost" --json shot.json
 # exit 4 when --fail-js is false — the PNG is still written (failures carry eyes)
+# (--clip-js still exists for computed rects; --clip-selector covers the common case)
 ```
 
 `java -jar brewshot.jar …` works everywhere, GIFs included. The native binary
