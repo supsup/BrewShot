@@ -49,6 +49,21 @@ animation first (`open`/`eval`), then film it: `recordGifElement` resolves the b
 films that fixed region, so motion *within* the element (glyph jitter, a spinner) is captured
 cleanly. Built for exactly this — recording one card's effect out of a page full of them.
 
+**Scale is a re-raster, not an upscale.** The `scale` on `screenshotClip`/`screenshotElement`
+makes Chrome **re-render** the clip region at that factor — `screenshotElement("svg", 3.0)`
+turns a 360×140 CSS-px box into a genuinely crisp 1080×420 bitmap (vector content, fonts and
+hairlines re-rasterized at 3× density), not a blurry blow-up. The arithmetic is pinned by
+test: the clip rect is CSS px, the output bitmap is exactly `rect × scale`. That's the whole
+"sharp element PNG" story in one call — no CSS-transform wrappers, no manual rect math.
+`screenshotElement("css", scale, paddingPx)` inflates the box with breathing room first
+(CSS px, pre-scale), so tight crops don't need a padding div. The same knobs ride the CLI:
+`--clip-selector`, `--scale`, `--clip-padding` — and `--scale` alone re-rasters the full
+page box:
+
+```bash
+brewshot page.html -o card.png --clip-selector "#card" --scale 3 --clip-padding 8
+```
+
 **Scroll-pan a tall page.** `recordGifScroll(panFrames, holdFrames, playbackDelayMs, scale, out)`
 glides the camera from the top of the document to the bottom — one viewport-height window per
 frame, smoothstep-eased so it accelerates and settles — turning a long static page (a docs page,

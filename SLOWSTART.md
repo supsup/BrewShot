@@ -179,7 +179,13 @@ BrewShot.gif(frames, 120, out);
 ```
 
 The `scale` parameter on all of these is CDP's own `clip.scale` — the
-downscale happens inside Chrome (free, native-image-clean, no AWT).
+resample happens inside Chrome (free, native-image-clean, no AWT). And it cuts
+both ways: below 1 it's a cheap downscale for GIF byte budgets, **above 1 it's
+a true re-raster** — Chrome re-renders the region at that density, so
+`screenshotElement("svg", 3.0)` yields crisp 3× pixels (fonts, hairlines,
+vectors), not an upscaled blur. Output bitmap = clip rect × scale, exactly;
+`screenshotElement("css", scale, paddingPx)` adds breathing room around the
+box first. On the CLI: `--clip-selector`, `--scale`, `--clip-padding`.
 
 ---
 

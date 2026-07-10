@@ -40,7 +40,10 @@ import java.util.regex.Pattern;
 public final class BrewShot implements AutoCloseable {
 
     /** Library version — also printed by the CLI's {@code --version}. */
-    public static final String VERSION = "0.3.0";
+    // Single source of truth for --version and the --json manifest. MUST move with every
+    // release cut — it sat at 0.3.0 through the 0.4.x/0.5.x releases, so --version lied
+    // about vendored-jar provenance (caught by Fixpoint, sirentide #121).
+    public static final String VERSION = "0.6.0";
 
     private static final Pattern WS_LINE = Pattern.compile("DevTools listening on (ws://\\S+)");
     private static final long DEFAULT_TIMEOUT_MS = 15_000;
@@ -597,8 +600,25 @@ public final class BrewShot implements AutoCloseable {
     /** Clipped PNG of the element matching {@code cssSelector} — the
      *  selector-based {@link #screenshotClip}. */
     public byte[] screenshotElement(String cssSelector, double scale) {
+        return screenshotElement(cssSelector, scale, 0);
+    }
+
+    /**
+     * Clipped PNG of the element matching {@code cssSelector} with
+     * {@code paddingPx} of breathing room inflated around its box (CSS px,
+     * pre-scale) — capture mechanics so consumers stop wrapping elements in
+     * padding divs just to avoid a tight crop. The rect is clamped at the
+     * page's top-left; padding past the right/bottom page edge renders as
+     * background (Chrome's clip semantics), which is the honest behavior for
+     * an element flush against the edge.
+     */
+    public byte[] screenshotElement(String cssSelector, double scale, double paddingPx) {
+        if (!Double.isFinite(paddingPx) || paddingPx < 0) {
+            throw new IllegalArgumentException("invalid paddingPx: " + paddingPx);
+        }
         double[] b = elementBox(cssSelector);
-        return screenshotClip(b[0], b[1], b[2], b[3], scale);
+        return screenshotClip(Math.max(0, b[0] - paddingPx), Math.max(0, b[1] - paddingPx),
+            b[2] + 2 * paddingPx, b[3] + 2 * paddingPx, scale);
     }
 
     /**

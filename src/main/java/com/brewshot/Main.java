@@ -58,6 +58,9 @@ public final class Main {
         String waitJs = null;
         long waitTimeoutMs = 10_000;
         String clipJs = null;
+        String clipSelector = null;
+        double scale = 1.0;
+        double clipPadding = 0;
         String failJs = null;
         Path jsonManifest = null;
         java.util.List<String[]> cookies = new java.util.ArrayList<>();
@@ -83,6 +86,9 @@ public final class Main {
                 case "--wait-js" -> waitJs = requireValue(args, ++i);
                 case "--wait-timeout" -> waitTimeoutMs = posLong("--wait-timeout", requireValue(args, ++i));
                 case "--clip-js" -> clipJs = requireValue(args, ++i);
+                case "--clip-selector" -> clipSelector = requireValue(args, ++i);
+                case "--scale" -> scale = posDouble("--scale", requireValue(args, ++i));
+                case "--clip-padding" -> clipPadding = nonNegDouble("--clip-padding", requireValue(args, ++i));
                 case "--fail-js" -> failJs = requireValue(args, ++i);
                 case "--json" -> jsonManifest = Path.of(requireValue(args, ++i));
                 case "--cookie" -> {
@@ -112,6 +118,9 @@ public final class Main {
             return err(e.getMessage());
         }
         if (input == null) { usage(); return 2; }
+        if (clipSelector != null && clipJs != null) {
+            return err("--clip-selector and --clip-js are mutually exclusive (pick one clip source)");
+        }
 
         // Resolve the input MODE before touching Chrome, so arg mistakes fail
         // fast with a clear message.
@@ -144,7 +153,20 @@ public final class Main {
                 evalResult = shot.eval(evalExpr);
                 System.out.println(evalResult);
             }
-            if (clipJs != null) {
+            if (clipSelector != null) {
+                // Selector-driven clip: elementBox throws on no-match — that's a page-content
+                // failure (the page didn't have the element), not a usage error: exit 1, loud.
+                double[] b;
+                try {
+                    b = shot.elementBox(clipSelector);
+                } catch (IllegalArgumentException e) {
+                    System.err.println("brewshot: " + e.getMessage());
+                    return 1;
+                }
+                Files.write(out, shot.screenshotClip(
+                    Math.max(0, b[0] - clipPadding), Math.max(0, b[1] - clipPadding),
+                    b[2] + 2 * clipPadding, b[3] + 2 * clipPadding, scale));
+            } else if (clipJs != null) {
                 Object r = shot.eval(clipJs);
                 Object x = MiniJson.get(r, "x"), y = MiniJson.get(r, "y");
                 Object w = MiniJson.get(r, "w"), h = MiniJson.get(r, "h");
@@ -153,7 +175,17 @@ public final class Main {
                     return err("--clip-js must return {x,y,w,h} (page coordinates), got: " + r);
                 }
                 Files.write(out, shot.screenshotClip(
-                    (Double) x, (Double) y, (Double) w, (Double) h));
+                    Math.max(0, (Double) x - clipPadding), Math.max(0, (Double) y - clipPadding),
+                    (Double) w + 2 * clipPadding, (Double) h + 2 * clipPadding, scale));
+            } else if (scale != 1.0) {
+                // Standalone --scale: clip the full PAGE box (scroll dimensions, not just the
+                // viewport) at scale — crisp full-page stills with zero extra flags. Chrome's
+                // clip.scale RE-RENDERS the region (a true re-raster), it does not upscale.
+                Object dims = shot.eval("[document.documentElement.scrollWidth,"
+                    + "document.documentElement.scrollHeight].join(',')");
+                String[] wh = String.valueOf(dims).split(",");
+                Files.write(out, shot.screenshotClip(0, 0,
+                    Double.parseDouble(wh[0]), Double.parseDouble(wh[1]), scale));
             } else {
                 shot.screenshot(out);
             }
@@ -213,6 +245,26 @@ public final class Main {
         catch (NumberFormatException e) { throw new IllegalArgumentException(flag + " wants a number (ms), got: " + v); }
     }
 
+    private static double posDouble(String flag, String v) {
+        double d;
+        try { d = Double.parseDouble(v); }
+        catch (NumberFormatException e) { throw new IllegalArgumentException(flag + " wants a number, got: " + v); }
+        if (!Double.isFinite(d) || d <= 0) {
+            throw new IllegalArgumentException(flag + " wants a positive number, got: " + v);
+        }
+        return d;
+    }
+
+    private static double nonNegDouble(String flag, String v) {
+        double d;
+        try { d = Double.parseDouble(v); }
+        catch (NumberFormatException e) { throw new IllegalArgumentException(flag + " wants a number, got: " + v); }
+        if (!Double.isFinite(d) || d < 0) {
+            throw new IllegalArgumentException(flag + " wants a non-negative number, got: " + v);
+        }
+        return d;
+    }
+
     private static String requireValue(String[] args, int i) {
         if (i >= args.length) {
             throw new IllegalArgumentException("flag " + args[i - 1] + " wants a value");
@@ -243,6 +295,12 @@ public final class Main {
               --wait-js    JS predicate to poll before shooting (deterministic ready)
               --wait-timeout  ms budget for --wait-js       (default 10000)
               --clip-js    JS returning {x,y,w,h} page-coords: shoot just that rect
+              --clip-selector  CSS selector: shoot just the first matching element's
+                           box (exit 1 if nothing matches; exclusive with --clip-js)
+              --scale      re-render the clip at this factor (e.g. 3 = 3x the pixels,
+                           a TRUE re-raster, not an upscale); alone (no clip flag) it
+                           shoots the full page box at that scale     (default 1)
+              --clip-padding   CSS px of breathing room inflated around the clip rect
               --cookie     name=value[@domain] session auth  (repeatable)
               --header     'Name: value' on every request    (repeatable)
               --fail-js    JS assertion; false -> exit 4 (PNG still written)

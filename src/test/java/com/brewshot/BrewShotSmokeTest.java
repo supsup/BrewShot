@@ -208,6 +208,80 @@ class BrewShotSmokeTest {
         assertTrue(Files.size(png2) > 200, "failure still carries eyes");
     }
 
+    /** IHDR width/height straight from the PNG bytes — no AWT decode needed. */
+    private static int[] pngDims(byte[] png) {
+        return new int[] {
+            ((png[16] & 0xFF) << 24) | ((png[17] & 0xFF) << 16) | ((png[18] & 0xFF) << 8) | (png[19] & 0xFF),
+            ((png[20] & 0xFF) << 24) | ((png[21] & 0xFF) << 16) | ((png[22] & 0xFF) << 8) | (png[23] & 0xFF)};
+    }
+
+    @Test
+    void scaleSemanticsArePinned_outputPixelsEqualRectTimesScale() throws Exception {
+        // The durable form of the sirentide #121 spike: the clip rect is CSS px, the output
+        // bitmap is EXACTLY rect x scale (Chrome re-renders the region — a true re-raster,
+        // not an upscale). If this ever drifts, every vendored consumer's crispness story
+        // breaks silently, so pin the arithmetic.
+        assumeTrue(BrewShot.available(), "no local Chrome; skipping");
+        try (BrewShot shot = BrewShot.launch(640, 480)) {
+            shot.html("""
+                <style>*{margin:0;padding:0}</style>
+                <svg id=v width="360" height="140" xmlns="http://www.w3.org/2000/svg">
+                  <rect width="360" height="140" fill="#fff"/>
+                  <text x="20" y="80" font-family="Georgia" font-size="40">S = Σ sₖ</text>
+                  <line x1="0" y1="0" x2="360" y2="140" stroke="#333" stroke-width="1"/>
+                </svg>
+                """);
+            int[] at1 = pngDims(shot.screenshotElement("#v", 1.0));
+            int[] at3 = pngDims(shot.screenshotElement("#v", 3.0));
+            assertEquals(360, at1[0], "1x width == CSS px");
+            assertEquals(140, at1[1], "1x height == CSS px");
+            assertEquals(1080, at3[0], "3x width == rect x scale, exactly");
+            assertEquals(420, at3[1], "3x height == rect x scale, exactly");
+
+            // paddingPx inflates the rect BEFORE scale: (360+2*10) x (140+2*10), then x2.
+            int[] padded = pngDims(shot.screenshotElement("#v", 2.0, 10));
+            assertEquals(760, padded[0], "padded width = (360+20) x 2");
+            assertEquals(320, padded[1], "padded height = (140+20) x 2");
+        }
+    }
+
+    @Test
+    void cliClipSelectorAndScaleShootTheElementCrisp() throws Exception {
+        assumeTrue(BrewShot.available(), "no local Chrome; skipping");
+        Path dir = Files.createTempDirectory("brewshot-clip-selector");
+        Path page = dir.resolve("p.html");
+        Files.writeString(page, """
+            <style>*{margin:0;padding:0}
+              #card{position:absolute;left:10px;top:20px;width:200px;height:100px;background:#4e79a7}</style>
+            <div id=card></div>
+            """);
+        Path png = dir.resolve("card.png");
+        int code = Main.run(new String[] {
+            page.toString(), "-o", png.toString(),
+            "--clip-selector", "#card", "--scale", "3", "--settle", "50",
+        });
+        assertEquals(0, code);
+        int[] dims = pngDims(Files.readAllBytes(png));
+        assertEquals(600, dims[0], "CLI: width = 200 x 3");
+        assertEquals(300, dims[1], "CLI: height = 100 x 3");
+
+        // --clip-padding inflates the rect (200+2*5) x (100+2*5) at scale 1
+        Path padded = dir.resolve("padded.png");
+        assertEquals(0, Main.run(new String[] {
+            page.toString(), "-o", padded.toString(),
+            "--clip-selector", "#card", "--clip-padding", "5", "--settle", "50",
+        }));
+        int[] pd = pngDims(Files.readAllBytes(padded));
+        assertEquals(210, pd[0], "CLI: padded width");
+        assertEquals(110, pd[1], "CLI: padded height");
+
+        // no matching element -> page-content failure: exit 1, loud, no PNG pretending
+        assertEquals(1, Main.run(new String[] {
+            page.toString(), "-o", dir.resolve("none.png").toString(),
+            "--clip-selector", "#does-not-exist", "--settle", "50",
+        }));
+    }
+
     @Test
     void opensAFileUrlAddress() throws Exception {
         assumeTrue(BrewShot.available(), "no local Chrome; skipping");
