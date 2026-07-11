@@ -172,6 +172,24 @@ class BrewShotDiffTest {
         assertTrue(corner != 0x000000 && corner != 0xFF00FF, "base is dimmed, not raw or magenta");
     }
 
+    @Test
+    void maskedPixelsLeaveTheDenominatorSoMasksNeverDiluteTheGate() {
+        // F2 (consumer review brewshot #45): the SAME 100-px change must read the SAME pct
+        // whether or not an unrelated region is masked — pct is changed/COMPARABLE.
+        BufferedImage a = solid(100, 100, Color.WHITE);
+        BufferedImage b = solid(100, 100, Color.WHITE);
+        fill(b, 0, 0, 10, 10, Color.RED);
+        BrewShotDiff.Verdict unmasked = BrewShotDiff.diff(a, b, BrewShotDiff.Options.defaults());
+        BrewShotDiff.Verdict masked = BrewShotDiff.diff(a, b,
+            new BrewShotDiff.Options(BrewShotDiff.DEFAULT_TOLERANCE, true,
+                List.of(new int[] {50, 50, 50, 50})));  // 2500 px masked, disjoint from the change
+        assertTrue(masked.pctChanged() > unmasked.pctChanged(),
+            "removing 2500 comparable px must RAISE the pct of the same change, not dilute it");
+        assertEquals(masked.changedPixels(), unmasked.changedPixels());
+        assertEquals(100.0 * masked.changedPixels() / (10_000 - 2_500), masked.pctChanged(), 1e-9);
+        assertTrue(masked.prose().contains("of 7500"), "prose N-of-M uses comparable pixels: " + masked.prose());
+    }
+
     // ---- CLI: `brewshot diff` (Main.run dispatch, gate contract, sidecars) ----
 
     private static Path write(Path dir, String name, BufferedImage img) throws IOException {
@@ -251,6 +269,23 @@ class BrewShotDiffTest {
         assertEquals(2, Main.run(new String[] {"diff", a.toString(), a.toString(), "--mask", "1,2,3"}));
         assertEquals(2, Main.run(new String[] {"diff", a.toString(), a.toString(), "--bogus"}));
         assertEquals(0, Main.run(new String[] {"diff", "--help"}));
+    }
+
+    @Test
+    void heatmapIoFailureCannotSuppressTheJsonSidecar(@TempDir Path tmp) throws Exception {
+        // F1 (consumer review brewshot #45): --diff-out pointing into a nonexistent directory
+        // must not eat the --json sidecar — the machine artifact writes first, independently.
+        BufferedImage changed = solid(40, 40, Color.WHITE);
+        fill(changed, 0, 0, 8, 8, Color.RED);
+        Path a = write(tmp, "a.png", solid(40, 40, Color.WHITE));
+        Path b = write(tmp, "b.png", changed);
+        Path json = tmp.resolve("verdict.json");
+        Path badHeat = tmp.resolve("no-such-dir/heat.png");
+        int code = Main.run(new String[] {"diff", a.toString(), b.toString(),
+            "--json", json.toString(), "--diff-out", badHeat.toString(), "--fail-pixels", "0"});
+        assertTrue(Files.exists(json), "json sidecar must survive the heatmap IO failure");
+        assertTrue(Files.readString(json).contains("\"exceeded\": true"));
+        assertEquals(4, code, "gate exit outranks the artifact-IO exit");
     }
 
     @Test

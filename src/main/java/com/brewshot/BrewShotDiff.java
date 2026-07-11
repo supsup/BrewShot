@@ -122,7 +122,11 @@ public final class BrewShotDiff {
         }
 
         long total = (long) w * h;
-        double pct = total == 0 ? 0 : 100.0 * changedCount / total;
+        // F2 (consumer review brewshot #45): the pct denominator is the COMPARABLE pixels —
+        // total minus masked. Masking a dynamic region must not DILUTE the gate: a 100-px
+        // change is the same 100-px change whether or not a clock was masked elsewhere.
+        long comparable = total - maskedCount;
+        double pct = comparable == 0 ? 0 : 100.0 * changedCount / comparable;
         int[] bounds = changedCount == 0 ? null
             : new int[] {minX, minY, maxX - minX + 1, maxY - minY + 1};
         Cluster largest = changedCount == 0 ? null : largestCluster(changed, w, h, changedCount);
@@ -243,7 +247,8 @@ public final class BrewShotDiff {
         return "body";
     }
 
-    /** The citable one-liner. Every count that shaped the numbers is disclosed. */
+    /** The citable one-liner. Every count that shaped the numbers is disclosed. The
+     *  percentage is changed/COMPARABLE (total minus masked) — see the F2 note in diff(). */
     private static String prose(int w, int h, long total, long changed, double pct,
                                 long aaIgnored, long masked, Cluster largest) {
         StringBuilder sb = new StringBuilder(160);
@@ -252,7 +257,7 @@ public final class BrewShotDiff {
               .append(", ").append(total).append(" px");
         } else {
             sb.append(String.format(java.util.Locale.ROOT, "%.2f%%", pct))
-              .append(" of pixels changed (").append(changed).append(" of ").append(total);
+              .append(" of comparable pixels changed (").append(changed).append(" of ").append(total - masked);
         }
         if (aaIgnored > 0) {
             sb.append("; ").append(aaIgnored).append(" anti-aliasing px ignored");

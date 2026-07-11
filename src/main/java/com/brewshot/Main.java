@@ -308,20 +308,28 @@ public final class Main {
                 || (job.failPixels() != null && !verdict.sizeMismatch()
                     && verdict.changedPixels() > job.failPixels());
             System.out.println(verdict.prose());
-            try {
-                if (job.diffOut() != null && !verdict.sizeMismatch()) {
-                    javax.imageio.ImageIO.write(
-                        BrewShotDiff.heatmap(a, b, job.options()), "png", job.diffOut().toFile());
-                    System.err.println("brewshot: wrote " + job.diffOut());
-                }
-                if (job.jsonOut() != null) {
+            // F1 (consumer review brewshot #45): the JSON sidecar is the MACHINE artifact —
+            // write it FIRST, and in its own try, so a heatmap IO failure can never suppress
+            // it (each artifact fails independently; the verdict line above always printed).
+            if (job.jsonOut() != null) {
+                try {
                     Files.writeString(job.jsonOut(),
                         BrewShotDiff.toJson(verdict, job.failOverPct(), job.failPixels(), exceeded));
                     System.err.println("brewshot: wrote " + job.jsonOut());
+                } catch (java.io.IOException e) {
+                    System.err.println("brewshot: failed writing json sidecar: " + e.getMessage());
+                    worst = Math.max(worst, 1);
                 }
-            } catch (java.io.IOException e) {
-                System.err.println("brewshot: failed writing diff artifacts: " + e.getMessage());
-                worst = Math.max(worst, 1);
+            }
+            if (job.diffOut() != null && !verdict.sizeMismatch()) {
+                try {
+                    javax.imageio.ImageIO.write(
+                        BrewShotDiff.heatmap(a, b, job.options()), "png", job.diffOut().toFile());
+                    System.err.println("brewshot: wrote " + job.diffOut());
+                } catch (java.io.IOException e) {
+                    System.err.println("brewshot: failed writing diff heatmap: " + e.getMessage());
+                    worst = Math.max(worst, 1);
+                }
             }
             if (exceeded) {
                 System.err.println("brewshot: diff gate FAILED (verdict still written above)"
