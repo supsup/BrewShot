@@ -17,9 +17,10 @@ import java.nio.file.Path;
  * </pre>
  *
  * Exit codes: 0 ok · 2 bad arguments · 3 no Chrome found · 4 --fail-js
- * assertion failed (screenshot still written) · 1 runtime failure.
- * Note: GIF recording is library-only for now (ImageIO/AWT is not yet
- * supported by native-image on macOS); the PNG path is native-clean.
+ * assertion failed (screenshot still written) or a `diff` gate exceeded
+ * (verdict still written) · 1 runtime failure.
+ * Note: GIF recording and `diff` are library/jar-path (ImageIO/AWT is not yet
+ * supported by native-image on macOS); the PNG shoot path is native-clean.
  */
 public final class Main {
 
@@ -49,6 +50,12 @@ public final class Main {
             }
         }
         String[] args = norm.toArray(new String[0]);
+        // `brewshot diff` — the compare lane (plan 84f468d0). Dispatched AFTER the
+        // --name=value normalization so diff flags accept both spellings, BEFORE the
+        // shoot-lane parsing (diff shares none of its flags and never touches Chrome).
+        if (args.length > 0 && args[0].equals("diff")) {
+            return runDiff(java.util.Arrays.copyOfRange(args, 1, args.length));
+        }
         String input = null;
         Path out = Path.of("brewshot.png");
         int width = 1280;
@@ -209,6 +216,159 @@ public final class Main {
         return 0;
     }
 
+    // ---- brewshot diff (plan 84f468d0) --------------------------------------------
+
+    /**
+     * One diff comparison: the unit of the LIST-OF-JOBS seam. The CLI builds exactly
+     * one; a future JSON multi-shot manifest slots a whole list into
+     * {@link #runDiffJobs} without reshaping (the diff gate will hammer shots —
+     * amortizing setup across a 30-shot verify run is the seam's whole point).
+     */
+    record DiffJob(Path a, Path b, BrewShotDiff.Options options,
+                   Double failOverPct, Long failPixels, Path diffOut, Path jsonOut) { }
+
+    /** Parse `brewshot diff a.png b.png [flags]` into one job and run it. */
+    private static int runDiff(String[] args) {
+        java.util.List<Path> images = new java.util.ArrayList<>(2);
+        int tolerance = BrewShotDiff.DEFAULT_TOLERANCE;
+        boolean ignoreAntialiasing = true;   // Fix's call (brewshot #25): AA-ignore ON by default
+        java.util.List<int[]> masks = new java.util.ArrayList<>();
+        Double failOverPct = null;
+        Long failPixels = null;
+        Path diffOut = null;
+        Path jsonOut = null;
+        try {
+            for (int i = 0; i < args.length; i++) {
+                switch (args[i]) {
+                    case "--tolerance" -> tolerance = posInt("--tolerance", requireValue(args, ++i));
+                    // AA forgiveness is ON by default; --pixel-exact is the opt-OUT for
+                    // byte-faithful comparisons (every ignored pixel is counted either way).
+                    case "--pixel-exact" -> ignoreAntialiasing = false;
+                    case "--mask" -> {
+                        String[] p = requireValue(args, ++i).split(",");
+                        if (p.length != 4) { return err("--mask wants x,y,w,h"); }
+                        masks.add(new int[] {posInt("--mask x", p[0].trim()), posInt("--mask y", p[1].trim()),
+                            posInt("--mask w", p[2].trim()), posInt("--mask h", p[3].trim())});
+                    }
+                    case "--fail-over" -> failOverPct = nonNegDouble("--fail-over", requireValue(args, ++i));
+                    case "--fail-pixels" -> failPixels = posLong("--fail-pixels", requireValue(args, ++i));
+                    case "--diff-out" -> diffOut = Path.of(requireValue(args, ++i));
+                    case "--json" -> jsonOut = Path.of(requireValue(args, ++i));
+                    case "-h", "--help" -> { diffUsage(); return 0; }
+                    default -> {
+                        if (args[i].startsWith("-")) {
+                            return err("unknown diff flag: " + args[i]);
+                        }
+                        images.add(Path.of(args[i]));
+                    }
+                }
+            }
+        } catch (IllegalArgumentException e) {
+            return err(e.getMessage());
+        }
+        if (images.size() != 2) {
+            diffUsage();
+            return 2;
+        }
+        DiffJob job = new DiffJob(images.get(0), images.get(1),
+            new BrewShotDiff.Options(tolerance, ignoreAntialiasing, java.util.List.copyOf(masks)),
+            failOverPct, failPixels, diffOut, jsonOut);
+        return runDiffJobs(java.util.List.of(job));
+    }
+
+    /**
+     * Run diff jobs in order; the worst exit code wins. The verdict is ALWAYS printed
+     * and the sidecars always written before the gate decides the exit — the exact
+     * contract {@code --fail-js} honors (evidence first, verdict-as-exit second).
+     * Exit: 0 clean · 4 a gate tripped (or size mismatch under any gate) · 1 an
+     * image could not be read.
+     */
+    static int runDiffJobs(java.util.List<DiffJob> jobs) {
+        int worst = 0;
+        for (DiffJob job : jobs) {
+            java.awt.image.BufferedImage a;
+            java.awt.image.BufferedImage b;
+            try {
+                a = readImage(job.a());
+                b = readImage(job.b());
+            } catch (java.io.IOException e) {
+                System.err.println("brewshot: " + e.getMessage());
+                worst = Math.max(worst, 1);
+                continue;
+            }
+            BrewShotDiff.Verdict verdict = BrewShotDiff.diff(a, b, job.options());
+            boolean gated = job.failOverPct() != null || job.failPixels() != null;
+            // A size mismatch IS a change: any gate treats it as exceeded. Ungated it
+            // stays informational (verdict printed, exit 0) — diff is a primitive, the
+            // caller decides what blocks.
+            boolean exceeded =
+                (verdict.sizeMismatch() && gated)
+                || (job.failOverPct() != null && !verdict.sizeMismatch()
+                    && verdict.pctChanged() > job.failOverPct())
+                || (job.failPixels() != null && !verdict.sizeMismatch()
+                    && verdict.changedPixels() > job.failPixels());
+            System.out.println(verdict.prose());
+            try {
+                if (job.diffOut() != null && !verdict.sizeMismatch()) {
+                    javax.imageio.ImageIO.write(
+                        BrewShotDiff.heatmap(a, b, job.options()), "png", job.diffOut().toFile());
+                    System.err.println("brewshot: wrote " + job.diffOut());
+                }
+                if (job.jsonOut() != null) {
+                    Files.writeString(job.jsonOut(),
+                        BrewShotDiff.toJson(verdict, job.failOverPct(), job.failPixels(), exceeded));
+                    System.err.println("brewshot: wrote " + job.jsonOut());
+                }
+            } catch (java.io.IOException e) {
+                System.err.println("brewshot: failed writing diff artifacts: " + e.getMessage());
+                worst = Math.max(worst, 1);
+            }
+            if (exceeded) {
+                System.err.println("brewshot: diff gate FAILED (verdict still written above)"
+                    + (verdict.sizeMismatch() ? " — size mismatch" : ""));
+                worst = Math.max(worst, 4);
+            }
+        }
+        return worst;
+    }
+
+    private static java.awt.image.BufferedImage readImage(Path p) throws java.io.IOException {
+        java.awt.image.BufferedImage img;
+        try {
+            img = javax.imageio.ImageIO.read(p.toFile());
+        } catch (java.io.IOException e) {
+            throw new java.io.IOException("cannot read image " + p + ": " + e.getMessage(), e);
+        }
+        if (img == null) {
+            throw new java.io.IOException("not a decodable image: " + p);
+        }
+        return img;
+    }
+
+    private static void diffUsage() {
+        System.err.println("""
+            brewshot diff — compare two PNGs into a citable textual verdict
+
+            usage: brewshot diff a.png b.png [--tolerance N] [--pixel-exact]
+                                 [--mask x,y,w,h]... [--fail-over PCT] [--fail-pixels N]
+                                 [--diff-out diff.png] [--json verdict.json]
+
+              --tolerance    per-channel delta floor; at/below never counts   (default 16)
+              --pixel-exact  DISABLE the default anti-aliasing forgiveness (a 3x3
+                             shifted-edge heuristic; whatever it ignores is counted
+                             and printed in the verdict — nothing is silently eaten)
+              --mask         exclude a region on both images (dynamic content —
+                             clocks, spinners); repeatable
+              --fail-over    exit 4 when changed%% exceeds PCT (verdict still written)
+              --fail-pixels  exit 4 when changed pixels exceed N (verdict still written)
+              --diff-out     write a heatmap PNG (base dimmed, changes magenta)
+              --json         write the machine-readable verdict sidecar
+
+            A size mismatch renders an explicit sizeMismatch verdict (never a crash);
+            under any --fail-* gate it exits 4. Uses ImageIO (JVM/jar path — the same
+            caveat as GIF recording; not the macOS native binary).""");
+    }
+
     /** The machine-readable sidecar CI/agent wrappers want beside the PNG. */
     private static void writeManifest(Path manifest, String input, String mode,
             int width, int height, long settleMs, String waitJs, Path out,
@@ -306,6 +466,10 @@ public final class Main {
               --fail-js    JS assertion; false -> exit 4 (PNG still written)
               --json       write a machine-readable manifest beside the PNG
               --version    print the version and exit
+
+            subcommands:
+              diff a.png b.png   pixel diff -> citable verdict + threshold gate
+                                 (see 'brewshot diff --help'; no Chrome needed)
 
             requires a local Chrome/Chromium (or set BREWSHOT_CHROME).""");
     }

@@ -104,6 +104,24 @@ brewshot http://localhost:8080/route -o shot.png \
 # (--clip-js still exists for computed rects; --clip-selector covers the common case)
 ```
 
+## Did it change? — diff two shots
+
+```
+# citable verdict + machine sidecar + heatmap; no Chrome needed
+brewshot diff before.png after.png --json verdict.json --diff-out heat.png
+# -> 0.55% of pixels changed (1365 of 250400; 771 anti-aliasing px ignored);
+#    largest cluster at 173,203 (43x17, 20% of the change) — in the body.
+
+# CI gate: exit 4 over-threshold, verdict still written (evidence first)
+brewshot diff golden.png actual.png --fail-over 0.5
+
+# mask a clock/spinner so dynamic pixels never count
+brewshot diff a.png b.png --mask 20,8,140,24 --fail-pixels 0
+```
+
+Anti-aliasing forgiveness is ON by default (every forgiven pixel is counted in
+the verdict — nothing silently eaten); `--pixel-exact` opts out.
+
 `java -jar brewshot.jar …` works everywhere, GIFs included. The native binary
 (`./gradlew nativeImage`) does PNG + eval everywhere too — its ONE gap: no GIF
 assembly on macOS (native-image doesn't support AWT/ImageIO there yet; on a

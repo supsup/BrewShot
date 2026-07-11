@@ -135,6 +135,21 @@ which GraalVM native-image doesn't yet support on macOS — so GIFs are
 JVM/library-mode for now. If you need native GIFs, that's a planned
 hand-rolled encoder away (GIF89a is a famously simple format).
 
+**Sam's drift review, upgraded.** "Before/after images in PRs" used to mean
+eyeballing pairs. Now the bake diffs each page against the previous artifact
+and posts the *sentence*:
+
+```
+brewshot diff previous/page.png current/page.png --fail-over 0.5 --json page-diff.json
+# 0.55% of pixels changed (…; 771 anti-aliasing px ignored); largest cluster
+# at 173,203 (43x17, 20% of the change) — in the body.        exit 4 if over
+```
+
+Font-hinting noise is forgiven (and counted) by default, a timestamp footer is
+`--mask`-ed out, and the exit-4 gate makes "the docs changed visually" a
+build-failing fact instead of a review-time surprise. The diff itself needs no
+Chrome — it's pure JDK image work, so it runs in the leanest CI job.
+
 ---
 
 ## 4. An agent — "I need eyes"
