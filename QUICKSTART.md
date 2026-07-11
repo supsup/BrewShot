@@ -40,9 +40,18 @@ shot.screenshot(Path.of("page.png"));          // full page, beyond the viewport
 byte[] png = shot.screenshotClip(x, y, w, h);  // one rectangle, page coordinates
 ```
 
-`eval` is the escape hatch for everything: dispatch events
-(`el.dispatchEvent(new MouseEvent('mouseenter',{bubbles:true}))`), read
-`getBoundingClientRect()`, scroll, poll a condition.
+`eval` is the escape hatch for everything: read `getBoundingClientRect()`,
+scroll, poll a condition. For mouse interaction, don't fake events from page
+JS — send real ones:
+
+```java
+shot.click("#submit");       // element center; trusted mousedown/mouseup/click
+shot.hover(".card");         // mouse moves there and STAYS — :hover engages
+shot.click(x, y);            // document coordinates (elementBox's space)
+```
+
+These are trusted browser input (`event.isTrusted === true`), which a page-side
+`dispatchEvent` can never produce — and `:hover` styles only engage this way.
 
 ## Listen to the page
 
@@ -75,6 +84,11 @@ shot.recordGifFullPage(30, 130, /*scale*/ 0.4, Path.of("whole-page.gif"));
 
 shot.recordGifRegion(0.5, 1.0, 24, 130, 0.55, Path.of("bottom-half.gif"));
 // fractions of document height: (0, 0.5)=top half, (0.25, 0.75)=the middle
+
+// or drive the page BETWEEN frames — trigger/advance/perturb mid-recording:
+shot.recordGifElement(".fx", 30, 25, 75, 1.0,
+    i -> { if (i == 2) shot.click(".fx"); },   // nudge on frame 2, filmed live
+    Path.of("nudged.gif"));
 ```
 
 Looping GIFs, assembled by the JDK's ImageIO. Frames are real captures — if
