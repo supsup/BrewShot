@@ -19,6 +19,7 @@ import java.util.concurrent.CompletionStage;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.function.IntConsumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -569,8 +570,27 @@ public final class BrewShot implements AutoCloseable {
     public void recordGif(double x, double y, double width, double height,
                           int frames, int captureDelayMs, int playbackDelayMs, Path out)
             throws IOException {
+        recordGif(x, y, width, height, frames, captureDelayMs, playbackDelayMs, NO_HOOK, out);
+    }
+
+    /** The no-op frame hook the hookless recorders ride — one shared loop. */
+    private static final IntConsumer NO_HOOK = i -> { };
+
+    /**
+     * Record a rectangle as a looping GIF, driving the page BETWEEN frames:
+     * {@code beforeFrame} is invoked with the frame index (0-based) immediately
+     * before that frame is captured — trigger the animation at {@code i == 0},
+     * advance deterministic state ({@code shot.eval("step()")}), or perturb
+     * mid-recording ({@code shot.click(...)}, {@code shot.hover(...)}). The hook
+     * runs on the recording thread against this instance (single-threaded
+     * protocol — interact freely); an exception it throws aborts the recording.
+     */
+    public void recordGif(double x, double y, double width, double height,
+                          int frames, int captureDelayMs, int playbackDelayMs,
+                          IntConsumer beforeFrame, Path out) throws IOException {
         List<byte[]> shots = new ArrayList<>(frames);
         for (int i = 0; i < frames; i++) {
+            beforeFrame.accept(i);
             shots.add(screenshotClip(x, y, width, height));
             settle(captureDelayMs);
         }
@@ -595,6 +615,70 @@ public final class BrewShot implements AutoCloseable {
         String[] p = s.split(",");
         return new double[] {Double.parseDouble(p[0]), Double.parseDouble(p[1]),
                              Double.parseDouble(p[2]), Double.parseDouble(p[3])};
+    }
+
+    // ---- input dispatch ----------------------------------------------------
+
+    /**
+     * Move the mouse to a DOCUMENT coordinate — the same coordinate space as
+     * {@link #elementBox}/{@link #screenshotClip}, so the capture and input
+     * surfaces compose ({@code mouse(box[0]+box[2]/2, box[1]+box[3]/2)}). The
+     * scroll offset is subtracted internally because CDP dispatches input in
+     * viewport coordinates. This is a REAL trusted browser event: mousemove/
+     * mouseover handlers fire and {@code :hover} styles engage — nothing a
+     * page-side synthetic event can fake.
+     */
+    public void mouse(double x, double y) {
+        double[] v = viewportPoint(x, y);
+        dispatchMouse("mouseMoved", v[0], v[1], "none", 0);
+    }
+
+    /**
+     * Click (left button, single) at a DOCUMENT coordinate: move, press,
+     * release — the sequence real users produce, so hover-then-click handlers
+     * and {@code event.isTrusted} checks behave as in a real session.
+     */
+    public void click(double x, double y) {
+        double[] v = viewportPoint(x, y);
+        dispatchMouse("mouseMoved", v[0], v[1], "none", 0);
+        dispatchMouse("mousePressed", v[0], v[1], "left", 1);
+        dispatchMouse("mouseReleased", v[0], v[1], "left", 1);
+    }
+
+    /** Click the center of the FIRST element matching {@code cssSelector} —
+     *  the selector-based {@link #click(double, double)}. Throws if nothing
+     *  matches (via {@link #elementBox}). */
+    public void click(String cssSelector) {
+        double[] b = elementBox(cssSelector);
+        click(b[0] + b[2] / 2, b[1] + b[3] / 2);
+    }
+
+    /**
+     * Hover the center of the FIRST element matching {@code cssSelector}: the
+     * mouse MOVES there and STAYS — subsequent captures see the hovered state
+     * ({@code :hover} styles, tooltips, JS mouseenter effects). Pair with the
+     * per-frame recording hook to film hover-triggered animations.
+     */
+    public void hover(String cssSelector) {
+        double[] b = elementBox(cssSelector);
+        mouse(b[0] + b[2] / 2, b[1] + b[3] / 2);
+    }
+
+    /** Document → viewport coordinates (CDP input wants viewport CSS px). */
+    private double[] viewportPoint(double x, double y) {
+        if (!Double.isFinite(x) || !Double.isFinite(y)) {
+            throw new IllegalArgumentException("non-finite input point: " + x + "," + y);
+        }
+        double sx = ((Number) eval("window.scrollX")).doubleValue();
+        double sy = ((Number) eval("window.scrollY")).doubleValue();
+        return new double[] {x - sx, y - sy};
+    }
+
+    /** One CDP Input.dispatchMouseEvent — the single seam all input rides. */
+    private void dispatchMouse(String type, double vx, double vy, String button, int clickCount) {
+        command("Input.dispatchMouseEvent",
+            "{\"type\":\"" + type + "\",\"x\":" + vx + ",\"y\":" + vy
+                + ",\"button\":\"" + button + "\",\"clickCount\":" + clickCount + "}");
     }
 
     /** Clipped PNG of the element matching {@code cssSelector} — the
@@ -656,9 +740,39 @@ public final class BrewShot implements AutoCloseable {
     public void recordGifElement(String cssSelector, int frames, int captureDelayMs,
                                  int playbackDelayMs, int firstFrameDelayMs,
                                  double scale, Path out) throws IOException {
+        recordGifElement(cssSelector, frames, captureDelayMs, playbackDelayMs,
+                         firstFrameDelayMs, scale, NO_HOOK, out);
+    }
+
+    /**
+     * Record one element as a GIF, driving the page BETWEEN frames — the
+     * element-targeted sibling of the
+     * {@link #recordGif(double, double, double, double, int, int, int, IntConsumer, Path)}
+     * hook overload (same hook contract: 0-based index, invoked before each
+     * capture, exceptions abort). The element's box is resolved ONCE, before
+     * the first hook call, so a hook that moves things around cannot shift the
+     * filmed region mid-recording.
+     */
+    public void recordGifElement(String cssSelector, int frames, int captureDelayMs,
+                                 int playbackDelayMs, double scale,
+                                 IntConsumer beforeFrame, Path out) throws IOException {
+        recordGifElement(cssSelector, frames, captureDelayMs, playbackDelayMs,
+                         playbackDelayMs, scale, beforeFrame, out);
+    }
+
+    /**
+     * The full-knob element recorder: per-frame hook AND a first-frame hold
+     * (film the intact opening state for a beat, then let the hook drive) —
+     * see {@link #recordGifElement(String, int, int, int, int, double, Path)}
+     * for the hold semantics and the hook overloads above for the hook contract.
+     */
+    public void recordGifElement(String cssSelector, int frames, int captureDelayMs,
+                                 int playbackDelayMs, int firstFrameDelayMs, double scale,
+                                 IntConsumer beforeFrame, Path out) throws IOException {
         double[] b = elementBox(cssSelector);
         List<byte[]> shots = new ArrayList<>(frames);
         for (int i = 0; i < frames; i++) {
+            beforeFrame.accept(i);
             shots.add(screenshotClip(b[0], b[1], b[2], b[3], scale));
             settle(captureDelayMs);
         }
