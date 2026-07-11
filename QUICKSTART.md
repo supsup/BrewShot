@@ -31,7 +31,8 @@ shot.html("<h1>hi</h1><script>…</script>");           // 2. DIRECT HTML SOURCE
 ## Look at it
 
 ```java
-shot.settle(800);                              // let animations/layout settle
+shot.settle(800);                              // fixed pause — simple, but a guess
+shot.waitReady();                              // deterministic: network-idle + fonts-ready
 
 Object v = shot.eval("document.title");        // any JS expression; promises awaited.
 // returns String / Double / Boolean / Map / List / null (JSON-serializable values)
