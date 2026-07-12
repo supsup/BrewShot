@@ -2,7 +2,6 @@ package com.brewshot;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -17,7 +16,7 @@ class BrewShotSmokeTest {
 
     @Test
     void directHtmlSourceRendersExecutesScriptsAndScreenshots() throws Exception {
-        assumeTrue(BrewShot.available(), "no local Chrome; skipping");
+        TestChrome.requireChromeOrLoudSkip("BrewShotSmokeTest");
         Path out = Files.createTempDirectory("brewshot-test");
         try (BrewShot shot = BrewShot.launch(640, 480)) {
             shot.html("""
@@ -43,7 +42,7 @@ class BrewShotSmokeTest {
 
     @Test
     void elementTargetedCaptureResolvesBoxBySelector() throws Exception {
-        assumeTrue(BrewShot.available(), "no local Chrome; skipping");
+        TestChrome.requireChromeOrLoudSkip("BrewShotSmokeTest");
         Path out = Files.createTempDirectory("brewshot-element");
         try (BrewShot shot = BrewShot.launch(640, 480)) {
             shot.html("""
@@ -69,7 +68,7 @@ class BrewShotSmokeTest {
 
     @Test
     void scrollPanAndDecoupledPlaybackProduceGifs() throws Exception {
-        assumeTrue(BrewShot.available(), "no local Chrome; skipping");
+        TestChrome.requireChromeOrLoudSkip("BrewShotSmokeTest");
         Path out = Files.createTempDirectory("brewshot-scroll");
         try (BrewShot shot = BrewShot.launch(400, 300)) {
             shot.html("<style>*{margin:0}#tall{height:1600px;"
@@ -85,7 +84,7 @@ class BrewShotSmokeTest {
 
     @Test
     void staleLoadEventCannotSatisfyALaterNavigation() throws Exception {
-        assumeTrue(BrewShot.available(), "no local Chrome; skipping");
+        TestChrome.requireChromeOrLoudSkip("BrewShotSmokeTest");
         // The review's headline: html() fires a load event; if open() consumed
         // that stale event it would return before ITS page loads and shoot the
         // wrong document. Sequence both on ONE instance and prove open() saw
@@ -101,7 +100,7 @@ class BrewShotSmokeTest {
 
     @Test
     void openFailsFastWithChromesErrorNotATimeout() throws Exception {
-        assumeTrue(BrewShot.available(), "no local Chrome; skipping");
+        TestChrome.requireChromeOrLoudSkip("BrewShotSmokeTest");
         try (BrewShot shot = BrewShot.launch(640, 480)) {
             long t0 = System.currentTimeMillis();
             IllegalStateException e = org.junit.jupiter.api.Assertions.assertThrows(
@@ -115,7 +114,7 @@ class BrewShotSmokeTest {
 
     @Test
     void consoleAndErrorsCaptureThePagesVoice() throws Exception {
-        assumeTrue(BrewShot.available(), "no local Chrome; skipping");
+        TestChrome.requireChromeOrLoudSkip("BrewShotSmokeTest");
         try (BrewShot shot = BrewShot.launch(640, 480)) {
             shot.html("""
                 <p>noisy</p>
@@ -141,7 +140,7 @@ class BrewShotSmokeTest {
 
     @Test
     void waitForPollsToTruthAndFailsLoud() throws Exception {
-        assumeTrue(BrewShot.available(), "no local Chrome; skipping");
+        TestChrome.requireChromeOrLoudSkip("BrewShotSmokeTest");
         try (BrewShot shot = BrewShot.launch(640, 480)) {
             shot.html("<div id=d></div><script>setTimeout(function(){"
                 + "document.getElementById('d').className='done';}, 300);</script>");
@@ -155,7 +154,7 @@ class BrewShotSmokeTest {
 
     @Test
     void recordedGifIsAValidAnimationWithTheRightFrameCount() throws Exception {
-        assumeTrue(BrewShot.available(), "no local Chrome; skipping");
+        TestChrome.requireChromeOrLoudSkip("BrewShotSmokeTest");
         Path out = Files.createTempDirectory("brewshot-gif");
         try (BrewShot shot = BrewShot.launch(640, 480)) {
             shot.html("<div style='width:80px;height:40px;background:#4e79a7'></div>");
@@ -172,7 +171,7 @@ class BrewShotSmokeTest {
 
     @Test
     void cliEndToEndWaitClipFailJsAndManifest() throws Exception {
-        assumeTrue(BrewShot.available(), "no local Chrome; skipping");
+        TestChrome.requireChromeOrLoudSkip("BrewShotSmokeTest");
         Path dir = Files.createTempDirectory("brewshot-cli");
         Path page = dir.resolve("p.html");
         Files.writeString(page, """
@@ -221,7 +220,7 @@ class BrewShotSmokeTest {
         // bitmap is EXACTLY rect x scale (Chrome re-renders the region — a true re-raster,
         // not an upscale). If this ever drifts, every vendored consumer's crispness story
         // breaks silently, so pin the arithmetic.
-        assumeTrue(BrewShot.available(), "no local Chrome; skipping");
+        TestChrome.requireChromeOrLoudSkip("BrewShotSmokeTest");
         try (BrewShot shot = BrewShot.launch(640, 480)) {
             shot.html("""
                 <style>*{margin:0;padding:0}</style>
@@ -247,7 +246,7 @@ class BrewShotSmokeTest {
 
     @Test
     void cliClipSelectorAndScaleShootTheElementCrisp() throws Exception {
-        assumeTrue(BrewShot.available(), "no local Chrome; skipping");
+        TestChrome.requireChromeOrLoudSkip("BrewShotSmokeTest");
         Path dir = Files.createTempDirectory("brewshot-clip-selector");
         Path page = dir.resolve("p.html");
         Files.writeString(page, """
@@ -284,7 +283,7 @@ class BrewShotSmokeTest {
 
     @Test
     void opensAFileUrlAddress() throws Exception {
-        assumeTrue(BrewShot.available(), "no local Chrome; skipping");
+        TestChrome.requireChromeOrLoudSkip("BrewShotSmokeTest");
         Path page = Files.createTempFile("brewshot-open", ".html");
         Files.writeString(page, "<title>opened-by-address</title><p>hi</p>");
         try (BrewShot shot = BrewShot.launch(640, 480)) {

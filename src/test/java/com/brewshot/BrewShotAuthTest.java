@@ -1,7 +1,6 @@
 package com.brewshot;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import com.sun.net.httpserver.HttpServer;
 import java.net.InetSocketAddress;
@@ -17,7 +16,7 @@ class BrewShotAuthTest {
 
     @Test
     void headerAndCookieReachTheServer() throws Exception {
-        assumeTrue(BrewShot.available(), "no local Chrome; skipping");
+        TestChrome.requireChromeOrLoudSkip("BrewShotAuthTest");
 
         HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.createContext("/", ex -> {
