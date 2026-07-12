@@ -98,6 +98,17 @@ so a *bigger* delay is a *lower* fps is a *slower* GIF (a slower scroll, a slowe
 Chrome's shot time floors real capture cadence at ≈20-30 ms, so `captureDelayMs` below that just
 samples as fast as it can; `playbackDelayMs` has no floor — set it purely for the speed you want.
 
+**Stream instead of polling — `recordGifStream`.** The poll recorders shoot, wait, shoot; Chrome's
+per-shot cost floors that cadence at ≈20-30 ms. `recordGifStream(durationMs, playbackDelayMs, out)`
+opens a CDP screencast instead: Chrome *pushes* a frame every time the compositor produces one, so
+you capture what actually rendered, at the pace it rendered — measured ~9× denser than the poll
+path (112 frames vs 12 over the same 1.2 s window on an rAF spinner). The widest overload adds
+`firstFrameDelayMs` (poster-frame hold, as below) and `maxWidth` (downscale bound; `0` = natural
+size), and returns the captured frame count. Two honest limits: frames are **viewport-only**
+(scroll the subject into view first; element/region targeting stays with the poll recorders), and
+a page that never composites during the window throws instead of writing an empty GIF — a static
+page has nothing to film.
+
 **Hold the opening frame.** `recordGifElement`'s widest overload takes a `firstFrameDelayMs` — the
 first frame is held that long before the animation runs, so the viewer registers the *before* state
 (an intact equation, a button at rest) then watches it change:

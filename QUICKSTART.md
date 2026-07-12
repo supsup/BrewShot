@@ -74,6 +74,10 @@ shot.recordGifFullPage(30, 130, /*scale*/ 0.4, Path.of("whole-page.gif"));
 // every viewport of the document; scale keeps bytes sane (in-browser, free)
 
 shot.recordGifRegion(0.5, 1.0, 24, 130, 0.55, Path.of("bottom-half.gif"));
+
+// Smoothest capture of a live animation: stream frames at the compositor's own
+// pace (viewport-only) instead of polling — ~9x denser over the same window.
+int frames = shot.recordGifStream(/*durationMs*/ 1200, /*playbackDelayMs*/ 60, Path.of("smooth.gif"));
 // fractions of document height: (0, 0.5)=top half, (0.25, 0.75)=the middle
 ```
 
