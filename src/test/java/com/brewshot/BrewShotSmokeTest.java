@@ -332,6 +332,84 @@ class BrewShotSmokeTest {
     }
 
     @Test
+    void fullPageAndRegionRecordersProduceNonTrivialGifs() throws Exception {
+        TestChrome.requireChromeOrLoudSkip("BrewShotSmokeTest");
+        Path out = Files.createTempDirectory("brewshot-fullpage");
+        try (BrewShot shot = BrewShot.launch(400, 300)) {
+            // A tall gradient page: the exact banding-prone content the global
+            // palette exists to steady. Both recorders re-shoot the page/region.
+            shot.html("<style>*{margin:0}#tall{height:1400px;"
+                + "background:linear-gradient(#fff,#1a2b4c)}</style><div id=\"tall\"></div>");
+            shot.recordGifFullPage(3, 40, 0.5, out.resolve("full.gif"));
+            assertTrue(Files.size(out.resolve("full.gif")) > 500, "fullpage gif too small");
+            shot.recordGifRegion(0.5, 1.0, 3, 40, 0.6, out.resolve("region.gif"));
+            assertTrue(Files.size(out.resolve("region.gif")) > 500, "region gif too small");
+        }
+    }
+
+    /**
+     * The real regression guard for the flicker fix — no Chrome needed. Feed
+     * GifWriter two synthetic gradient frames and prove every frame decodes
+     * against the SAME palette (identical colour tables). The old
+     * independently-re-quantized writer produced a different table per frame,
+     * which is exactly the flicker; this asserts one stable global palette.
+     */
+    @Test
+    void globalPaletteIsStableAcrossFrames() throws Exception {
+        java.util.List<byte[]> frames = java.util.List.of(gradientPng(0), gradientPng(30));
+        Path gif = Files.createTempFile("brewshot-palette", ".gif");
+        BrewShot.gif(frames, 60, gif);
+
+        java.awt.image.IndexColorModel first = null;
+        int count;
+        try (var in = javax.imageio.ImageIO.createImageInputStream(gif.toFile())) {
+            var reader = javax.imageio.ImageIO.getImageReaders(in).next();
+            reader.setInput(in);
+            count = reader.getNumImages(true);
+            assertEquals(2, count, "frame count");
+            for (int i = 0; i < count; i++) {
+                var cm = reader.read(i).getColorModel();
+                assertTrue(cm instanceof java.awt.image.IndexColorModel,
+                    "frame " + i + " must be palette-indexed, got " + cm.getClass());
+                java.awt.image.IndexColorModel icm = (java.awt.image.IndexColorModel) cm;
+                if (first == null) {
+                    first = icm;
+                } else {
+                    assertEquals(first.getMapSize(), icm.getMapSize(),
+                        "palette size drifted between frames -> flicker");
+                    int n = first.getMapSize();
+                    int[] a = new int[n];
+                    int[] b = new int[n];
+                    first.getRGBs(a);
+                    icm.getRGBs(b);
+                    org.junit.jupiter.api.Assertions.assertArrayEquals(a, b,
+                        "palette entries drifted between frames -> flicker");
+                }
+            }
+            reader.dispose();
+        }
+    }
+
+    /**
+     * A 64x64 vertical gradient encoded as a PNG, with {@code offset} shifting
+     * the ramp so the two frames differ (as real animation frames would) while
+     * sharing the same gradient character.
+     */
+    private static byte[] gradientPng(int offset) throws Exception {
+        java.awt.image.BufferedImage img =
+            new java.awt.image.BufferedImage(64, 64, java.awt.image.BufferedImage.TYPE_INT_RGB);
+        for (int y = 0; y < 64; y++) {
+            for (int x = 0; x < 64; x++) {
+                int v = Math.min(255, (y * 4 + offset) % 256);
+                img.setRGB(x, y, (v << 16) | (v << 8) | (255 - v));
+            }
+        }
+        var bos = new java.io.ByteArrayOutputStream();
+        javax.imageio.ImageIO.write(img, "png", bos);
+        return bos.toByteArray();
+    }
+
+    @Test
     void opensAFileUrlAddress() throws Exception {
         TestChrome.requireChromeOrLoudSkip("BrewShotSmokeTest");
         Path page = Files.createTempFile("brewshot-open", ".html");
