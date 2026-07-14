@@ -54,6 +54,26 @@ public final class BrewShot implements AutoCloseable {
     /** One shared client for all launches — no selector-thread accumulation per launch. */
     private static final HttpClient HTTP = HttpClient.newHttpClient();
 
+    // Live instances, so ONE JVM-wide shutdown hook can force-clean any that never reached
+    // close(). On SIGINT/SIGTERM the JVM runs hooks but does NOT unwind stacks, so a
+    // try-with-resources/close() around a BrewShot never fires — Ctrl+C mid-capture is
+    // precisely the case close() misses, and Java never reaps a child process on exit while
+    // headless Chrome doesn't watch its parent, so the child + its brewshot-* temp profile
+    // would leak. The hook is force-clean (destroyForcibly + delete), not the polite close():
+    // a hook must be fast and the websocket may be wedged. SCOPE: this covers SIGINT/SIGTERM
+    // and normal exit, NOT SIGKILL or a hard JVM crash (no hook runs then) — leaks are
+    // reduced, not eliminated.
+    private static final java.util.Set<BrewShot> LIVE =
+        java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<>());
+    static {
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            for (BrewShot b : LIVE) {
+                try { b.chrome.destroyForcibly(); } catch (RuntimeException ignored) { }
+                deleteRecursively(b.profileDir);
+            }
+        }, "brewshot-shutdown-cleanup"));
+    }
+
     private final Process chrome;
     private final Path profileDir;
     private final WebSocket ws;
@@ -100,6 +120,7 @@ public final class BrewShot implements AutoCloseable {
         this.profileDir = profileDir;
         this.ws = ws;
         this.inbox = inbox;
+        LIVE.add(this); // deregistered in close(); force-cleaned by the shutdown hook otherwise
     }
 
     /** Launch with a sensible default viewport (1280x900). */
@@ -762,6 +783,7 @@ public final class BrewShot implements AutoCloseable {
 
     @Override
     public void close() {
+        LIVE.remove(this); // graceful close owns the teardown now; the hook needn't touch it
         try { ws.sendClose(WebSocket.NORMAL_CLOSURE, "done").join(); }
         catch (Exception ignored) { /* already closing */ }
         chrome.destroy();

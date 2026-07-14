@@ -42,7 +42,16 @@ final class GifWriter {
             writer.setOutput(os);
             writer.prepareWriteSequence(null);
             for (int i = 0; i < pngFrames.size(); i++) {
+                // ImageIO.read returns NULL (not throws) when no reader recognizes the
+                // bytes — a bare createFromRenderedImage(null) NPE would then kill the whole
+                // sequence at write time (the most expensive moment) with no attribution.
+                // Fail loud WITH the frame index instead; never silently skip — a dropped
+                // frame silently changes the GIF's timing/duration, a worse lie.
                 BufferedImage img = ImageIO.read(new ByteArrayInputStream(pngFrames.get(i)));
+                if (img == null) {
+                    throw new IOException("frame " + i + " of " + pngFrames.size()
+                        + " is not a decodable image (" + pngFrames.get(i).length + " bytes)");
+                }
                 IIOMetadata meta = writer.getDefaultImageMetadata(
                     ImageTypeSpecifier.createFromRenderedImage(img),
                     writer.getDefaultWriteParam());
@@ -50,6 +59,12 @@ final class GifWriter {
                 writer.writeToSequence(new IIOImage(img, null, meta), null);
             }
             writer.endWriteSequence();
+        } catch (IOException | RuntimeException e) {
+            // The try-with-resources closes the stream on the way out, leaving a PARTIAL
+            // out file (N-1 frames) that reads as a plausible truncated GIF. Delete it so a
+            // broken recording never masquerades as a finished artifact.
+            try { java.nio.file.Files.deleteIfExists(out); } catch (IOException ignored) { }
+            throw e;
         } finally {
             writer.dispose();
         }
