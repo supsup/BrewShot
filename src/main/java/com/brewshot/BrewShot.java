@@ -68,8 +68,25 @@ public final class BrewShot implements AutoCloseable {
     static {
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             for (BrewShot b : LIVE) {
-                try { b.chrome.destroyForcibly(); } catch (RuntimeException ignored) { }
+                // Kill-then-WAIT-then-delete: the ordering is load-bearing (F1-r2). The Chrome
+                // Helper children are the late writers — destroyForcibly() returns immediately
+                // and signals only the parent, so deleting while the tree is still flushing its
+                // shutdown state loses the delete race and the profile dir survives. Descendants
+                // first, then the parent, then a bounded reap (SIGKILL'd processes die in ms;
+                // the bound only guards a wedged kernel), THEN delete — with one retry as the
+                // belt for a helper that outlived the parent's wait.
+                try {
+                    b.chrome.toHandle().descendants().forEach(ProcessHandle::destroyForcibly);
+                    b.chrome.destroyForcibly();
+                    b.chrome.waitFor(2, TimeUnit.SECONDS);
+                } catch (RuntimeException ignored) {
+                } catch (InterruptedException ignored) {
+                    Thread.currentThread().interrupt();
+                }
                 deleteRecursively(b.profileDir);
+                if (java.nio.file.Files.exists(b.profileDir)) {
+                    deleteRecursively(b.profileDir);
+                }
             }
         }, "brewshot-shutdown-cleanup"));
     }
