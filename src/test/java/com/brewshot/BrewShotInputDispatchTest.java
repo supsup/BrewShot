@@ -99,6 +99,39 @@ class BrewShotInputDispatchTest {
     }
 
     @Test
+    void belowFoldSelectorClickScrollsIntoViewAndHits() throws Exception {
+        // B1 fold-blocker (brewshot 75): click(css) on a below-fold element must HIT —
+        // the selector form scrolls into view first, never silently dispatches into nowhere.
+        assumeTrue(BrewShot.available(), "no local Chrome; skipping");
+        try (BrewShot shot = BrewShot.launch(640, 480)) {
+            shot.html("<div style='height:1150px'>spacer</div>"
+                + "<button id='deep' style='width:120px;height:40px'"
+                + " onclick=\"window.hit='deep'\">Deep</button>"
+                + "<script>window.hit='never'</script>");
+            shot.click("#deep");
+            assertEquals("deep", shot.eval("window.hit"),
+                "below-fold selector click must scroll into view and hit — never a silent miss");
+        }
+    }
+
+    @Test
+    void rawCoordinateClickOutsideViewportFailsLoudNotSilent() throws Exception {
+        // The raw-coordinate twin of the fold-blocker: a document point whose viewport
+        // mapping is out of bounds throws (naming the remedy), never no-ops.
+        assumeTrue(BrewShot.available(), "no local Chrome; skipping");
+        try (BrewShot shot = BrewShot.launch(640, 480)) {
+            shot.html("<div style='height:1150px'>spacer</div>"
+                + "<button id='deep' onclick=\"window.hit='deep'\">Deep</button>"
+                + "<script>window.hit='never'</script>");
+            IllegalArgumentException out = assertThrows(IllegalArgumentException.class,
+                () -> shot.click(60, 1200));
+            assertTrue(out.getMessage().contains("outside the viewport"), out.getMessage());
+            assertTrue(out.getMessage().contains("selector form"), out.getMessage());
+            assertEquals("never", shot.eval("window.hit"), "nothing may have been dispatched");
+        }
+    }
+
+    @Test
     void selectorMissAndNonFinitePointFailLoud() throws Exception {
         assumeTrue(BrewShot.available(), "no local Chrome; skipping");
         try (BrewShot shot = BrewShot.launch(320, 240)) {

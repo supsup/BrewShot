@@ -645,33 +645,80 @@ public final class BrewShot implements AutoCloseable {
         dispatchMouse("mouseReleased", v[0], v[1], "left", 1);
     }
 
-    /** Click the center of the FIRST element matching {@code cssSelector} —
-     *  the selector-based {@link #click(double, double)}. Throws if nothing
-     *  matches (via {@link #elementBox}). */
+    /** Click the FIRST element matching {@code cssSelector} — scrolls it into
+     *  view first (Puppeteer semantics: {@code click(css)} means "click the
+     *  element", wherever it currently is), then dispatches at its visible
+     *  center. Throws if nothing matches. Below-fold elements HIT (B1
+     *  fold-blocker, brewshot 75) — they are never silently missed. */
     public void click(String cssSelector) {
-        double[] b = elementBox(cssSelector);
-        click(b[0] + b[2] / 2, b[1] + b[3] / 2);
+        double[] v = visibleCenter(cssSelector);
+        dispatchMouse("mouseMoved", v[0], v[1], "none", 0);
+        dispatchMouse("mousePressed", v[0], v[1], "left", 1);
+        dispatchMouse("mouseReleased", v[0], v[1], "left", 1);
     }
 
     /**
-     * Hover the center of the FIRST element matching {@code cssSelector}: the
-     * mouse MOVES there and STAYS — subsequent captures see the hovered state
-     * ({@code :hover} styles, tooltips, JS mouseenter effects). Pair with the
-     * per-frame recording hook to film hover-triggered animations.
+     * Hover the FIRST element matching {@code cssSelector}: scrolled into view
+     * first, then the mouse MOVES to its visible center and STAYS — subsequent
+     * captures see the hovered state ({@code :hover} styles, tooltips, JS
+     * mouseenter effects). Pair with the per-frame recording hook to film
+     * hover-triggered animations.
      */
     public void hover(String cssSelector) {
-        double[] b = elementBox(cssSelector);
-        mouse(b[0] + b[2] / 2, b[1] + b[3] / 2);
+        double[] v = visibleCenter(cssSelector);
+        dispatchMouse("mouseMoved", v[0], v[1], "none", 0);
     }
 
-    /** Document → viewport coordinates (CDP input wants viewport CSS px). */
+    /**
+     * Scroll the selector's element into view (centered) and return its
+     * post-scroll VIEWPORT center, clamped into the viewport for elements
+     * larger than it — one atomic eval, so the rect can't race a scrolling
+     * page. scrollIntoView is layout-synchronous: the rect read after it in
+     * the same eval is already post-scroll.
+     */
+    private double[] visibleCenter(String cssSelector) {
+        String sel = "'" + cssSelector.replace("\\", "\\\\").replace("'", "\\'") + "'";
+        Object v = eval("(function(){var e=document.querySelector(" + sel + ");"
+            + "if(!e)return 'none';e.scrollIntoView({block:'center',inline:'center'});"
+            + "var r=e.getBoundingClientRect();"
+            + "var cx=Math.min(Math.max(r.left+r.width/2,Math.max(r.left,0)+1),"
+            + "Math.min(r.right,window.innerWidth)-1);"
+            + "var cy=Math.min(Math.max(r.top+r.height/2,Math.max(r.top,0)+1),"
+            + "Math.min(r.bottom,window.innerHeight)-1);"
+            + "return [cx,cy].join(',');})()");
+        if (!(v instanceof String s) || s.equals("none")) {
+            throw new IllegalArgumentException("no element matches selector: " + cssSelector);
+        }
+        String[] p = s.split(",");
+        return new double[] {Double.parseDouble(p[0]), Double.parseDouble(p[1])};
+    }
+
+    /** Document → viewport coordinates (CDP input wants viewport CSS px).
+     *  FAIL-LOUD when the mapped point lands outside the viewport (B1
+     *  fold-blocker, brewshot 75): a click dispatched into nowhere is a silent
+     *  no-op the caller cannot detect — raw-coordinate callers must scroll
+     *  first (or use the selector form, which auto-scrolls). Scroll offsets
+     *  and viewport bounds are read in ONE eval, atomic against a scrolling
+     *  page. */
     private double[] viewportPoint(double x, double y) {
         if (!Double.isFinite(x) || !Double.isFinite(y)) {
             throw new IllegalArgumentException("non-finite input point: " + x + "," + y);
         }
-        double sx = ((Number) eval("window.scrollX")).doubleValue();
-        double sy = ((Number) eval("window.scrollY")).doubleValue();
-        return new double[] {x - sx, y - sy};
+        Object v = eval("[window.scrollX,window.scrollY,window.innerWidth,window.innerHeight].join(',')");
+        String[] p = String.valueOf(v).split(",");
+        double sx = Double.parseDouble(p[0]);
+        double sy = Double.parseDouble(p[1]);
+        double vw = Double.parseDouble(p[2]);
+        double vh = Double.parseDouble(p[3]);
+        double vx = x - sx;
+        double vy = y - sy;
+        if (vx < 0 || vy < 0 || vx >= vw || vy >= vh) {
+            throw new IllegalArgumentException("document point " + x + "," + y
+                + " maps outside the viewport (viewport " + vx + "," + vy + " in " + vw + "x" + vh
+                + " at scroll " + sx + "," + sy + ") — the event would silently miss;"
+                + " scroll the page first, or use the selector form (auto-scrolls into view)");
+        }
+        return new double[] {vx, vy};
     }
 
     /** One CDP Input.dispatchMouseEvent — the single seam all input rides. */
