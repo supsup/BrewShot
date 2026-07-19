@@ -160,7 +160,12 @@ public final class Main {
                 evalResult = shot.eval(evalExpr);
                 System.out.println(evalResult);
             }
-            if (clipSelector != null) {
+            if (out.toString().endsWith(".pdf")) {
+                // Output path ends .pdf → render the whole document via Page.printToPDF.
+                // Clip/scale flags are raster-only and don't map to PDF paged output, so this
+                // is a distinct first branch, not part of the screenshot cascade.
+                shot.pdf(out);
+            } else if (clipSelector != null) {
                 // Selector-driven clip: elementBox throws on no-match — that's a page-content
                 // failure (the page didn't have the element), not a usage error: exit 1, loud.
                 double[] b;
