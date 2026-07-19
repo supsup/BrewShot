@@ -83,6 +83,56 @@ class BrewShotSmokeTest {
     }
 
     @Test
+    void screencastStreamCapturesDenserThanThePollRecorder() throws Exception {
+        assumeTrue(BrewShot.available(), "no local Chrome; skipping");
+        Path out = Files.createTempDirectory("brewshot-stream");
+        try (BrewShot shot = BrewShot.launch(480, 360)) {
+            // A continuously-compositing page: rAF mutates a transform every frame.
+            shot.html("""
+                <style>#spin{width:80px;height:80px;background:#e15759;margin:40px}</style>
+                <div id="spin"></div>
+                <script>
+                  let a = 0;
+                  (function tick(){
+                    a += 7;
+                    document.getElementById('spin').style.transform = 'rotate(' + a + 'deg)';
+                    requestAnimationFrame(tick);
+                  })();
+                </script>
+                """);
+            int durationMs = 1200;
+            int streamFrames = shot.recordGifStream(durationMs, 60, out.resolve("stream.gif"));
+            assertTrue(Files.size(out.resolve("stream.gif")) > 500, "stream gif too small");
+
+            // Poll equivalent over the SAME duration: 12 shots x 100ms. The stream
+            // rides the compositor (~60fps minus ack overhead), so it must sample
+            // strictly denser — that is the whole point of the API.
+            int pollFrames = durationMs / 100;
+            shot.recordGif(0, 0, 200, 200, pollFrames, 100, out.resolve("poll.gif"));
+            assertTrue(streamFrames > pollFrames,
+                "stream sampled " + streamFrames + " frames vs poll " + pollFrames
+                    + " over the same " + durationMs + "ms window");
+        }
+    }
+
+    @Test
+    void recordGifStreamRejectsNonsenseArguments() throws Exception {
+        assumeTrue(BrewShot.available(), "no local Chrome; skipping");
+        try (BrewShot shot = BrewShot.launch(320, 240)) {
+            shot.html("<p>still</p>");
+            for (int[] bad : new int[][] {{0, 60, 60, 0}, {500, 0, 60, 0}, {500, 60, 0, 0}, {500, 60, 60, -1}}) {
+                try {
+                    shot.recordGifStream(bad[0], bad[1], bad[2], bad[3],
+                        Files.createTempFile("brewshot-bad", ".gif"));
+                    throw new AssertionError("accepted " + java.util.Arrays.toString(bad));
+                } catch (IllegalArgumentException expected) {
+                    // fail-loud on nonsense knobs, before any protocol traffic
+                }
+            }
+        }
+    }
+
+    @Test
     void staleLoadEventCannotSatisfyALaterNavigation() throws Exception {
         TestChrome.requireChromeOrLoudSkip("BrewShotSmokeTest");
         // The review's headline: html() fires a load event; if open() consumed

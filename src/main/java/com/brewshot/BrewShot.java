@@ -290,6 +290,27 @@ public final class BrewShot implements AutoCloseable {
 
     // ---- protocol ----------------------------------------------------------
 
+    /** Send one CDP command WITHOUT waiting for its result (the id-only result
+     *  message is later ignored by {@link #routeEvent}); for high-frequency
+     *  protocol chatter like screencast frame acks where blocking would drop
+     *  interleaved events. */
+    private void fireAndForget(String method, String paramsJson) {
+        int id = nextId++;
+        StringBuilder msg = new StringBuilder(96)
+            .append("{\"id\":").append(id)
+            .append(",\"method\":\"").append(method).append('"')
+            .append(",\"params\":").append(paramsJson);
+        if (sessionId != null) {
+            msg.append(",\"sessionId\":\"").append(sessionId).append('"');
+        }
+        msg.append('}');
+        try {
+            ws.sendText(msg, true).join();
+        } catch (java.util.concurrent.CompletionException e) {
+            throw new IllegalStateException(chromeDeathReason("sending " + method), e);
+        }
+    }
+
     /** Send one CDP command and block for its id-matched result. */
     @SuppressWarnings("unchecked")
     private Map<String, Object> command(String method, String paramsJson) {
@@ -1041,6 +1062,87 @@ public final class BrewShot implements AutoCloseable {
             throw new IllegalArgumentException(
                 "region fractions want 0 <= from < to <= 1, got " + from + ".." + to);
         }
+    }
+
+    /** Streamed viewport GIF at the compositor's own pace; see the full overload. */
+    public int recordGifStream(int durationMs, int playbackDelayMs, Path out) throws IOException {
+        return recordGifStream(durationMs, playbackDelayMs, playbackDelayMs, 0, out);
+    }
+
+    /**
+     * Record the VIEWPORT as a looping GIF from a CDP screencast STREAM
+     * ({@code Page.startScreencast} → {@code Page.screencastFrame} events)
+     * instead of polling {@code Page.captureScreenshot}. Chrome pushes a frame
+     * whenever the compositor produces one, so a fast animation samples at the
+     * pace it actually rendered — denser and smoother than the poll recorders,
+     * whose per-shot cost floors the capture cadence at ≈20-30ms.
+     * <ul>
+     *   <li>{@code durationMs} — how long to keep the stream open (real time).</li>
+     *   <li>{@code playbackDelayMs} / {@code firstFrameDelayMs} — the same
+     *       playback knobs as {@link #recordGif}: per-frame display duration
+     *       stamped into the GIF, with the poster-frame hold.</li>
+     *   <li>{@code maxWidth} — downscale bound in device px ({@code 0} keeps the
+     *       viewport's natural size). Chrome preserves aspect ratio.</li>
+     * </ul>
+     * Returns the number of frames captured. Screencast frames are
+     * VIEWPORT-ONLY (no clip, no beyond-viewport capture) — scroll the subject
+     * into view first, or stay with the poll recorders for element/region
+     * targeting. A page that never composites during the window produces no
+     * frames, which throws rather than writing an empty GIF: a static page is
+     * a caller bug (there was nothing to film), not a quiet success.
+     */
+    public int recordGifStream(int durationMs, int playbackDelayMs, int firstFrameDelayMs,
+                               int maxWidth, Path out) throws IOException {
+        if (durationMs <= 0 || playbackDelayMs <= 0 || firstFrameDelayMs <= 0 || maxWidth < 0) {
+            throw new IllegalArgumentException("recordGifStream wants durationMs/delays > 0"
+                + " and maxWidth >= 0, got " + durationMs + "/" + playbackDelayMs + "/"
+                + firstFrameDelayMs + "/" + maxWidth);
+        }
+        List<byte[]> frames = new ArrayList<>();
+        command("Page.startScreencast", maxWidth > 0
+            ? "{\"format\":\"png\",\"everyNthFrame\":1,\"maxWidth\":" + maxWidth + "}"
+            : "{\"format\":\"png\",\"everyNthFrame\":1}");
+        try {
+            long deadline = System.currentTimeMillis() + durationMs;
+            while (System.currentTimeMillis() < deadline) {
+                Map<String, Object> m;
+                try {
+                    m = nextMessage(deadline, "Page.screencastFrame");
+                } catch (IllegalStateException quietWindow) {
+                    // A deadline lapse on a live Chrome just means the page stopped
+                    // compositing before the window closed — that ends the recording.
+                    // Anything else (dead Chrome, closed socket) stays fatal.
+                    if (chrome.isAlive()
+                            && String.valueOf(quietWindow.getMessage()).startsWith("CDP timeout")) {
+                        break;
+                    }
+                    throw quietWindow;
+                }
+                if ("Page.screencastFrame".equals(m.get("method"))) {
+                    frames.add(Base64.getDecoder().decode(
+                        String.valueOf(MiniJson.get(m, "params.data"))));
+                    // Ack immediately or Chrome stops pushing after a few frames — but
+                    // fire-and-forget: blocking for the ack RESULT would route any frame
+                    // that arrives mid-wait into routeEvent's drop branch and lose it.
+                    // The unawaited result later surfaces as an id-only message, which
+                    // this loop hands to routeEvent, which ignores method-less messages.
+                    Object sid = MiniJson.get(m, "params.sessionId");
+                    fireAndForget("Page.screencastFrameAck",
+                        "{\"sessionId\":" + ((Double) sid).intValue() + "}");
+                } else {
+                    routeEvent(m);
+                }
+            }
+        } finally {
+            command("Page.stopScreencast", "{}");
+        }
+        if (frames.isEmpty()) {
+            throw new IllegalStateException("screencast produced no frames in " + durationMs
+                + "ms — screencast only emits when the page composites; a static page has"
+                + " nothing to film (use screenshot()/recordGif for stills)");
+        }
+        GifWriter.write(frames, playbackDelayMs, firstFrameDelayMs, out);
+        return frames.size();
     }
 
     /**

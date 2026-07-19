@@ -176,6 +176,7 @@ shapes beyond one card:
 ```java
 shot.recordGifFullPage(30, 130, 0.4, out);        // every viewport, downscaled
 shot.recordGifRegion(0.5, 1.0, 24, 130, 0.55, out); // "the bottom half"
+shot.recordGifStream(1200, 60, out);              // compositor-paced stream (viewport-only, densest)
 ```
 
 And the screen-recording-style TOUR — viewport-sized frames while the page
