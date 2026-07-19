@@ -4,8 +4,8 @@
 
 **For when text is not enough.** Java brews screenshots: a zero-dependency
 headless-browser harness — point it at a URL, or hand it raw HTML source, and
-get back real-Chrome screenshots, JS evaluation results, and looping GIF
-recordings. Pure JDK; the only thing it needs from the world is the Chrome you
+get back real-Chrome screenshots, print-fidelity PDFs, JS evaluation results,
+and looping GIF recordings. Pure JDK; the only thing it needs from the world is the Chrome you
 already have installed.
 
 ```java
@@ -43,6 +43,7 @@ WebSocket client since 11. BrewShot is those messages, wrapped well:
 | `Network` + lifecycle | `waitReady()` · `waitForNetworkIdle(quietMs, timeoutMs)` · `waitForFontsReady()` — render-settled waits instead of a blind `settle(ms)` |
 | `Runtime.consoleAPICalled` / `exceptionThrown` | `console()` / `errors()` — the page's voice, one-line health asserts |
 | `Page.captureScreenshot` | `screenshot(path)` / `screenshotClip(x,y,w,h)` · `screenshotElement("css")` |
+| `Page.printToPDF` | `pdf(path)` / `pdf(path, PdfOptions)` — the page as a paged, print-fidelity PDF |
 | `Input.dispatchMouseEvent` | `mouse(x,y)` · `click(x,y)` / `click("css")` · `hover("css")` — real trusted input |
 | + JDK ImageIO | `recordGif(rect…)` · `recordGifElement("css", …)` · `recordGifScroll(…)` · `recordGifFullPage(…, scale, …)` · `recordGifRegion(0.5, 1.0, …)` |
 
@@ -156,6 +157,42 @@ LatteX fx catalogue:
 First proven as the [LatteX](https://github.com/supsup/LatteX) fx-runtime test
 harness, where it pinned real rendering bugs (glyph placement, animation
 lifecycle leaks, hover-state wiring) that no stubbed DOM could catch.
+
+## Print to PDF — paged capture, native-binary-clean
+
+`pdf(path)` renders the whole document via CDP `Page.printToPDF` — a paged,
+print-fidelity PDF, not a raster. The default is deliberately *not* the
+browser's print dialog (which drops backgrounds and adds margins): US Letter,
+portrait, zero margins, backgrounds **on**, scale 1.0 — the page as a print
+artifact. `PdfOptions` withers tune it per call, and a bad envelope
+(non-positive paper, negative margin, scale outside CDP's 0.1–2.0) throws
+`IllegalArgumentException` instead of an opaque Chrome reject:
+
+```java
+try (BrewShot shot = BrewShot.launch(1280, 900)) {
+    shot.open("https://example.com");
+    shot.waitReady();
+    shot.pdf(Path.of("page.pdf"));               // US Letter, full-bleed
+
+    shot.pdf(Path.of("report.pdf"),              // A4 landscape,
+        BrewShot.PdfOptions.a4()                 // half-inch margins
+            .landscape(true).margin(0.5));       // all round
+}
+```
+
+From the shell, a `.pdf` output path is the whole story — the CLI infers the
+mode from the extension:
+
+```bash
+brewshot https://example.com -o page.pdf
+```
+
+(`--clip-selector` / `--scale` / `--clip-padding` are raster-only and don't
+apply to `.pdf` output — PDF is paged, not clipped.)
+
+Unlike GIF recording, PDF rides **no ImageIO/AWT** — `printToPDF` hands back
+the PDF bytes directly — so the same call works everywhere *including the
+macOS native binary* (the metrics table's GIF caveat doesn't apply here).
 
 ## Compare two shots — a citable verdict, not an eyeball job
 
