@@ -38,6 +38,7 @@ WebSocket client since 11. BrewShot is those messages, wrapped well:
 | `Page.navigate` | `open(url)` |
 | `Page.setDocumentContent` | `html(source)` — scripts execute, load fires |
 | `Runtime.evaluate` | `eval(js)` → String/Double/Boolean/Map/List · `waitFor(predicate, ms)` |
+| `Network` + lifecycle | `waitReady()` · `waitForNetworkIdle(quietMs, timeoutMs)` · `waitForFontsReady()` — render-settled waits instead of a blind `settle(ms)` |
 | `Runtime.consoleAPICalled` / `exceptionThrown` | `console()` / `errors()` — the page's voice, one-line health asserts |
 | `Page.captureScreenshot` | `screenshot(path)` / `screenshotClip(x,y,w,h)` · `screenshotElement("css")` |
 | `Input.dispatchMouseEvent` | `mouse(x,y)` · `click(x,y)` / `click("css")` · `hover("css")` — real trusted input |
@@ -208,7 +209,9 @@ the macOS native binary). Library callers get the same engine as
 ## What it deliberately is not
 
 Not a Playwright/Selenium replacement: one browser (local Chrome/Chromium), one
-page at a time, no selector engine, no auto-waiting, no cross-browser patches.
+page at a time, no selector engine, no cross-browser patches. Waiting is
+opt-in: `open()` returns on the load event, and you reach for `waitReady()`
+(network-idle + fonts) or `waitFor(predicate)` when a page settles after load.
 `eval()` is the escape hatch for all of that — dispatch events, read layout,
 poll conditions with the full power of page-side JS. ~800 lines of core CDP
 client (≈1,300 with the CLI and JSON codec), and it intends to stay lean.
@@ -286,6 +289,9 @@ things not to do: **[SECURITY.md](SECURITY.md)**.
 
 - JDK 21+ (built with 25)
 - A local Chrome or Chromium (auto-discovered; override with `BREWSHOT_CHROME`)
+
+The load/navigation wait budget defaults to 15s; raise it for a heavy page with
+`BREWSHOT_TIMEOUT_MS` or per-instance `shot.navTimeout(ms)`.
 
 ## Docs
 

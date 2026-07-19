@@ -13,8 +13,10 @@ import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Comparator;
 import java.util.Deque;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -106,6 +108,29 @@ public final class BrewShot implements AutoCloseable {
     private boolean captureConsole = true;
     private String sessionId; // null during browser-scope bootstrap, then the tab session
     private int nextId = 1;
+    // Network in-flight tracking for waitForNetworkIdle. A SET of live CDP
+    // requestIds, not a counter: CDP reuses one requestId across a redirect
+    // chain — a fresh requestWillBeSent (carrying redirectResponse) per hop but
+    // only ONE terminal loadingFinished/loadingFailed. A counter would leak +N
+    // per N-hop redirect and never reach idle (brewshot #82); adding the same id
+    // is idempotent and remove-on-terminal is robust to duplicate/out-of-order
+    // events. Mutated only in routeEvent on the single draining thread, so a
+    // plain HashSet is safe. Cleared per navigation.
+    private final Set<String> inFlightRequestIds = new HashSet<>();
+    private long lastNetChangeMs;
+    // Load/navigation wait budget (ms). Defaults from BREWSHOT_TIMEOUT_MS or the
+    // 15s constant; override per-instance with navTimeout(). Governs open()/html()
+    // and the ready-waits, so a slow page on a loaded CI runner isn't unraisable.
+    private long navTimeoutMs = envTimeoutMs();
+
+    private static long envTimeoutMs() {
+        String v = System.getenv("BREWSHOT_TIMEOUT_MS");
+        if (v != null) {
+            try { long ms = Long.parseLong(v.trim()); if (ms > 0) { return ms; } }
+            catch (NumberFormatException ignored) { /* fall through to default */ }
+        }
+        return DEFAULT_TIMEOUT_MS;
+    }
 
     // ---- discovery ---------------------------------------------------------
 
@@ -278,6 +303,7 @@ public final class BrewShot implements AutoCloseable {
             c.sessionId = (String) MiniJson.get(attached, "sessionId");
             c.command("Page.enable", "{}");
             c.command("Runtime.enable", "{}");
+            c.command("Network.enable", "{}"); // in-flight tracking for waitForNetworkIdle
             return c;
         } catch (RuntimeException | IOException | Error e) {
             p.destroyForcibly();
@@ -419,6 +445,18 @@ public final class BrewShot implements AutoCloseable {
                 bounded(errorLog, "uncaught: " + desc);
             }
             case "Page.loadEventFired" -> pendingEvents.add(m);
+            case "Network.requestWillBeSent" -> {
+                // A redirect hop reuses the requestId (idempotent add); only a
+                // genuinely new request grows the set. Either way it is activity.
+                Object rid = MiniJson.get(m, "params.requestId");
+                if (rid != null) { inFlightRequestIds.add(String.valueOf(rid)); }
+                lastNetChangeMs = System.currentTimeMillis();
+            }
+            case "Network.loadingFinished", "Network.loadingFailed" -> {
+                Object rid = MiniJson.get(m, "params.requestId");
+                if (rid != null) { inFlightRequestIds.remove(String.valueOf(rid)); }
+                lastNetChangeMs = System.currentTimeMillis();
+            }
             default -> { /* drop: nothing awaits it, nothing reads it */ }
         }
     }
@@ -494,7 +532,7 @@ public final class BrewShot implements AutoCloseable {
         if (err != null && !String.valueOf(err).isEmpty()) {
             throw new IllegalStateException("navigation to " + url + " failed: " + err);
         }
-        waitEvent("Page.loadEventFired", DEFAULT_TIMEOUT_MS);
+        waitEvent("Page.loadEventFired", navTimeoutMs);
     }
 
     /**
@@ -509,7 +547,7 @@ public final class BrewShot implements AutoCloseable {
         String frameId = (String) MiniJson.get(tree, "frameTree.frame.id");
         command("Page.setDocumentContent",
             "{\"frameId\":\"" + frameId + "\",\"html\":\"" + MiniJson.esc(source) + "\"}");
-        waitEvent("Page.loadEventFired", DEFAULT_TIMEOUT_MS);
+        waitEvent("Page.loadEventFired", navTimeoutMs);
     }
 
     /**
@@ -523,6 +561,8 @@ public final class BrewShot implements AutoCloseable {
         pendingEvents.removeIf(e -> "Page.loadEventFired".equals(e.get("method")));
         consoleLog.clear();
         errorLog.clear();
+        inFlightRequestIds.clear();
+        lastNetChangeMs = System.currentTimeMillis();
     }
 
     /**
@@ -636,6 +676,54 @@ public final class BrewShot implements AutoCloseable {
             throw new IllegalStateException("page JS threw: " + (desc != null ? desc : ex));
         }
         return MiniJson.get(r, "result.value");
+    }
+
+    /**
+     * Set the load/navigation wait budget (ms) for {@link #open}/{@link #html}
+     * and the ready-waits. Also settable via {@code BREWSHOT_TIMEOUT_MS}. A slow
+     * dashboard on a loaded CI runner that needs &gt;15s is no longer unraisable.
+     */
+    public BrewShot navTimeout(long millis) {
+        if (millis > 0) { this.navTimeoutMs = millis; }
+        return this;
+    }
+
+    /**
+     * Wait until no network request has been in flight for {@code quietMillis},
+     * or {@code timeoutMillis} elapses (best-effort — a convenience wait, not a
+     * hard gate). {@link #open}/{@link #html} return on {@code loadEventFired},
+     * which fires BEFORE async XHR/fetch settle; this bridges that gap. Network
+     * is tracked from launch and the in-flight count resets per navigation.
+     */
+    public void waitForNetworkIdle(long quietMillis, long timeoutMillis) {
+        long deadline = System.currentTimeMillis() + timeoutMillis;
+        while (System.currentTimeMillis() < deadline) {
+            drainInboxNonBlocking();
+            long now = System.currentTimeMillis();
+            if (inFlightRequestIds.isEmpty() && now - lastNetChangeMs >= quietMillis) { return; }
+            try { Thread.sleep(15); }
+            catch (InterruptedException e) { Thread.currentThread().interrupt(); return; }
+        }
+    }
+
+    /**
+     * Wait until webfonts have finished loading ({@code document.fonts.ready}),
+     * so captured text is the real face rather than a FOUT fallback. No-op on a
+     * page without the Font Loading API.
+     */
+    public void waitForFontsReady() {
+        eval("(document.fonts ? document.fonts.ready.then(function () { return true; }) : true)");
+    }
+
+    /**
+     * Deterministic readiness: network-idle (500&nbsp;ms quiet) then fonts-ready.
+     * The render-settled wait to prefer over a blind {@link #settle} for CI /
+     * unattended shots and for stable visual diffs — it removes the FOUT/decode/
+     * late-XHR race that makes a fixed sleep flaky.
+     */
+    public void waitReady() {
+        waitForNetworkIdle(500, navTimeoutMs);
+        waitForFontsReady();
     }
 
     /** Sleep helper for settle waits between eval steps. */
