@@ -1,5 +1,27 @@
 # BrewShot — Release Notes ☕📸
 
+## 0.7.1
+
+GIF quality and CI honesty, plus a version-string fix.
+
+- **Stable global GIF palette — gradients stop flickering.** ImageIO's default GIF
+  writer re-quantized each frame to its own 256-colour table, so a gradient landed on a
+  shifting palette and flickered frame-to-frame. `GifWriter` now builds **one** shared
+  palette by median cut over a pooled colour histogram and Floyd–Steinberg dithers every
+  frame against that fixed `IndexColorModel`, so each frame's colour table is identical
+  and gradients hold steady. Also fixes a `ClassCastException` in
+  `recordGifFullPage`/`recordGifRegion`/`screenshotRegion` where a JSON-integer eval
+  result was cast to `Double` instead of `Number`.
+- **CI honesty — a required run must execute or fail, never skip.** The reference CI
+  installs Chrome and sets `BREWSHOT_REQUIRE_CHROME=1`; an `afterSuite` guard turns any
+  skip into a build failure, so a green build proves the browser suite actually ran
+  ("green that tested nothing" can't pass). Every Chrome-driving test now gates through
+  `TestChrome.requireChromeOrLoudSkip`, which prints an unmissable banner and records a
+  JUnit skip locally while failing loud under `REQUIRE`.
+- **Version string fixed.** `BrewShot.VERSION` had lagged at `0.6.0` while the build was
+  `0.7.0`, so `--version` and the `--json` manifest under-reported provenance; both are
+  now single-sourced at `0.7.1`.
+
 ## 0.7.0
 
 Six features land together — capture gets **deterministic**, input gets **typed**,
