@@ -6,12 +6,14 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.WebSocket;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Base64;
-import java.util.Comparator;
 import java.util.Deque;
 import java.util.HashSet;
 import java.util.List;
@@ -47,7 +49,7 @@ public final class BrewShot implements AutoCloseable {
     // Single source of truth for --version and the --json manifest. MUST move with every
     // release cut — it sat at 0.3.0 through the 0.4.x/0.5.x releases, so --version lied
     // about vendored-jar provenance (caught by Fixpoint, sirentide #121).
-    public static final String VERSION = "0.6.0";
+    public static final String VERSION = "0.7.1";
 
     private static final Pattern WS_LINE = Pattern.compile("DevTools listening on (ws://\\S+)");
     private static final long DEFAULT_TIMEOUT_MS = 15_000;
@@ -1297,9 +1299,33 @@ public final class BrewShot implements AutoCloseable {
     }
 
     private static void deleteRecursively(Path dir) {
-        try (var walk = Files.walk(dir)) {
-            walk.sorted(Comparator.reverseOrder()).forEach(p -> {
-                try { Files.deleteIfExists(p); } catch (IOException ignored) { }
+        // walkFileTree, NOT Files.walk: a live Chrome tears down its own profile
+        // concurrently — its `.com.google.Chrome.<rand>` singleton lock can vanish
+        // between directory enumeration and visitation. Files.walk's lazy stream
+        // surfaces that as an UncheckedIOException(NoSuchFileException) mid-forEach,
+        // which escapes a plain `catch (IOException)` and fails the caller (seen only
+        // on Linux CI, not macOS — different Chrome file lifecycle). walkFileTree routes
+        // a vanished entry through visitFileFailed instead, so we continue and still
+        // best-effort delete everything that remains.
+        try {
+            Files.walkFileTree(dir, new SimpleFileVisitor<Path>() {
+                @Override
+                public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+                    try { Files.deleteIfExists(file); } catch (IOException ignored) { }
+                    return FileVisitResult.CONTINUE;
+                }
+
+                @Override
+                public FileVisitResult visitFileFailed(Path file, IOException exc) {
+                    // Already gone (Chrome removed it) — that's the desired end state.
+                    return FileVisitResult.CONTINUE;
+                }
+
+                @Override
+                public FileVisitResult postVisitDirectory(Path d, IOException exc) {
+                    try { Files.deleteIfExists(d); } catch (IOException ignored) { }
+                    return FileVisitResult.CONTINUE;
+                }
             });
         } catch (IOException ignored) { }
     }
