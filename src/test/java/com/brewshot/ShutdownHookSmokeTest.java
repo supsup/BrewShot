@@ -3,7 +3,6 @@ package com.brewshot;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
@@ -31,7 +30,7 @@ class ShutdownHookSmokeTest {
 
     @Test
     void sigtermReapsChromeTreeAndDeletesProfileDir() throws Exception {
-        assumeTrue(BrewShot.available(), "no local Chrome; skipping");
+        TestChrome.requireChromeOrLoudSkip("ShutdownHookSmokeTest");
 
         String javaBin = Path.of(System.getProperty("java.home"), "bin", "java").toString();
         Process probe = new ProcessBuilder(javaBin,
