@@ -12,8 +12,10 @@ import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Comparator;
 import java.util.Deque;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -67,10 +69,15 @@ public final class BrewShot implements AutoCloseable {
     private boolean captureConsole = true;
     private String sessionId; // null during browser-scope bootstrap, then the tab session
     private int nextId = 1;
-    // Network in-flight tracking for waitForNetworkIdle. Updated only in
-    // routeEvent, which runs on the single draining thread — so plain ints are
-    // safe (no cross-thread races). Reset to 0 per navigation.
-    private int netInFlight;
+    // Network in-flight tracking for waitForNetworkIdle. A SET of live CDP
+    // requestIds, not a counter: CDP reuses one requestId across a redirect
+    // chain — a fresh requestWillBeSent (carrying redirectResponse) per hop but
+    // only ONE terminal loadingFinished/loadingFailed. A counter would leak +N
+    // per N-hop redirect and never reach idle (brewshot #82); adding the same id
+    // is idempotent and remove-on-terminal is robust to duplicate/out-of-order
+    // events. Mutated only in routeEvent on the single draining thread, so a
+    // plain HashSet is safe. Cleared per navigation.
+    private final Set<String> inFlightRequestIds = new HashSet<>();
     private long lastNetChangeMs;
     // Load/navigation wait budget (ms). Defaults from BREWSHOT_TIMEOUT_MS or the
     // 15s constant; override per-instance with navTimeout(). Governs open()/html()
@@ -295,11 +302,15 @@ public final class BrewShot implements AutoCloseable {
             }
             case "Page.loadEventFired" -> pendingEvents.add(m);
             case "Network.requestWillBeSent" -> {
-                netInFlight++;
+                // A redirect hop reuses the requestId (idempotent add); only a
+                // genuinely new request grows the set. Either way it is activity.
+                Object rid = MiniJson.get(m, "params.requestId");
+                if (rid != null) { inFlightRequestIds.add(String.valueOf(rid)); }
                 lastNetChangeMs = System.currentTimeMillis();
             }
             case "Network.loadingFinished", "Network.loadingFailed" -> {
-                if (netInFlight > 0) { netInFlight--; }
+                Object rid = MiniJson.get(m, "params.requestId");
+                if (rid != null) { inFlightRequestIds.remove(String.valueOf(rid)); }
                 lastNetChangeMs = System.currentTimeMillis();
             }
             default -> { /* drop: nothing awaits it, nothing reads it */ }
@@ -406,7 +417,7 @@ public final class BrewShot implements AutoCloseable {
         pendingEvents.removeIf(e -> "Page.loadEventFired".equals(e.get("method")));
         consoleLog.clear();
         errorLog.clear();
-        netInFlight = 0;
+        inFlightRequestIds.clear();
         lastNetChangeMs = System.currentTimeMillis();
     }
 
@@ -545,7 +556,7 @@ public final class BrewShot implements AutoCloseable {
         while (System.currentTimeMillis() < deadline) {
             drainInboxNonBlocking();
             long now = System.currentTimeMillis();
-            if (netInFlight == 0 && now - lastNetChangeMs >= quietMillis) { return; }
+            if (inFlightRequestIds.isEmpty() && now - lastNetChangeMs >= quietMillis) { return; }
             try { Thread.sleep(15); }
             catch (InterruptedException e) { Thread.currentThread().interrupt(); return; }
         }
