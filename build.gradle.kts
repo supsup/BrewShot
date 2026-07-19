@@ -44,8 +44,33 @@ tasks.jar {
 
 tasks.test {
     useJUnitPlatform()
-    // Browser tests assume-skip when no local Chrome exists; keep CI honest.
-    testLogging { events("skipped", "failed") }
+    // Browser tests loud-skip when no local Chrome exists; keep CI honest.
+    // A red CI that doesn't show WHY is only half-honest — surface full
+    // exceptions (expected-vs-actual) so a failure names its own cause.
+    testLogging {
+        events("skipped", "failed")
+        exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
+        showExceptions = true
+        showCauses = true
+        showStackTraces = true
+    }
+
+    // CI-honesty guard: when BREWSHOT_REQUIRE_CHROME is set (CI sets it), NO test
+    // may skip — the Chrome-driving suite must run or fail, never report
+    // skipped==green. TestChrome.requireChromeOrLoudSkip turns absence into a
+    // failure per-test under REQUIRE; this is the belt-and-suspenders that also
+    // catches any future test that forgets the gate and skips on its own.
+    val requireChrome = System.getenv("BREWSHOT_REQUIRE_CHROME")
+        ?.let { it == "1" || it.equals("true", true) || it.equals("yes", true) } ?: false
+    afterSuite(KotlinClosure2<TestDescriptor, TestResult, Unit>({ desc, result ->
+        if (desc.parent == null && requireChrome && result.skippedTestCount > 0) {
+            throw GradleException(
+                "BREWSHOT_REQUIRE_CHROME is set but ${result.skippedTestCount} test(s) were " +
+                "SKIPPED — a required run must execute or fail every test, never skip " +
+                "(green-that-tested-nothing guard)."
+            )
+        }
+    }))
 }
 
 // Native binary: `./gradlew nativeImage` with a GraalVM JDK selected (or
