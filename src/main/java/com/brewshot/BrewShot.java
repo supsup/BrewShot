@@ -20,6 +20,7 @@ import java.util.concurrent.CompletionStage;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.function.IntConsumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -701,8 +702,27 @@ public final class BrewShot implements AutoCloseable {
     public void recordGif(double x, double y, double width, double height,
                           int frames, int captureDelayMs, int playbackDelayMs, Path out)
             throws IOException {
+        recordGif(x, y, width, height, frames, captureDelayMs, playbackDelayMs, NO_HOOK, out);
+    }
+
+    /** The no-op frame hook the hookless recorders ride — one shared loop. */
+    private static final IntConsumer NO_HOOK = i -> { };
+
+    /**
+     * Record a rectangle as a looping GIF, driving the page BETWEEN frames:
+     * {@code beforeFrame} is invoked with the frame index (0-based) immediately
+     * before that frame is captured — trigger the animation at {@code i == 0},
+     * advance deterministic state ({@code shot.eval("step()")}), or perturb
+     * mid-recording ({@code shot.click(...)}, {@code shot.hover(...)}). The hook
+     * runs on the recording thread against this instance (single-threaded
+     * protocol — interact freely); an exception it throws aborts the recording.
+     */
+    public void recordGif(double x, double y, double width, double height,
+                          int frames, int captureDelayMs, int playbackDelayMs,
+                          IntConsumer beforeFrame, Path out) throws IOException {
         List<byte[]> shots = new ArrayList<>(frames);
         for (int i = 0; i < frames; i++) {
+            beforeFrame.accept(i);
             shots.add(screenshotClip(x, y, width, height));
             settle(captureDelayMs);
         }
@@ -727,6 +747,117 @@ public final class BrewShot implements AutoCloseable {
         String[] p = s.split(",");
         return new double[] {Double.parseDouble(p[0]), Double.parseDouble(p[1]),
                              Double.parseDouble(p[2]), Double.parseDouble(p[3])};
+    }
+
+    // ---- input dispatch ----------------------------------------------------
+
+    /**
+     * Move the mouse to a DOCUMENT coordinate — the same coordinate space as
+     * {@link #elementBox}/{@link #screenshotClip}, so the capture and input
+     * surfaces compose ({@code mouse(box[0]+box[2]/2, box[1]+box[3]/2)}). The
+     * scroll offset is subtracted internally because CDP dispatches input in
+     * viewport coordinates. This is a REAL trusted browser event: mousemove/
+     * mouseover handlers fire and {@code :hover} styles engage — nothing a
+     * page-side synthetic event can fake.
+     */
+    public void mouse(double x, double y) {
+        double[] v = viewportPoint(x, y);
+        dispatchMouse("mouseMoved", v[0], v[1], "none", 0);
+    }
+
+    /**
+     * Click (left button, single) at a DOCUMENT coordinate: move, press,
+     * release — the sequence real users produce, so hover-then-click handlers
+     * and {@code event.isTrusted} checks behave as in a real session.
+     */
+    public void click(double x, double y) {
+        double[] v = viewportPoint(x, y);
+        dispatchMouse("mouseMoved", v[0], v[1], "none", 0);
+        dispatchMouse("mousePressed", v[0], v[1], "left", 1);
+        dispatchMouse("mouseReleased", v[0], v[1], "left", 1);
+    }
+
+    /** Click the FIRST element matching {@code cssSelector} — scrolls it into
+     *  view first (Puppeteer semantics: {@code click(css)} means "click the
+     *  element", wherever it currently is), then dispatches at its visible
+     *  center. Throws if nothing matches. Below-fold elements HIT (B1
+     *  fold-blocker, brewshot 75) — they are never silently missed. */
+    public void click(String cssSelector) {
+        double[] v = visibleCenter(cssSelector);
+        dispatchMouse("mouseMoved", v[0], v[1], "none", 0);
+        dispatchMouse("mousePressed", v[0], v[1], "left", 1);
+        dispatchMouse("mouseReleased", v[0], v[1], "left", 1);
+    }
+
+    /**
+     * Hover the FIRST element matching {@code cssSelector}: scrolled into view
+     * first, then the mouse MOVES to its visible center and STAYS — subsequent
+     * captures see the hovered state ({@code :hover} styles, tooltips, JS
+     * mouseenter effects). Pair with the per-frame recording hook to film
+     * hover-triggered animations.
+     */
+    public void hover(String cssSelector) {
+        double[] v = visibleCenter(cssSelector);
+        dispatchMouse("mouseMoved", v[0], v[1], "none", 0);
+    }
+
+    /**
+     * Scroll the selector's element into view (centered) and return its
+     * post-scroll VIEWPORT center, clamped into the viewport for elements
+     * larger than it — one atomic eval, so the rect can't race a scrolling
+     * page. scrollIntoView is layout-synchronous: the rect read after it in
+     * the same eval is already post-scroll.
+     */
+    private double[] visibleCenter(String cssSelector) {
+        String sel = "'" + cssSelector.replace("\\", "\\\\").replace("'", "\\'") + "'";
+        Object v = eval("(function(){var e=document.querySelector(" + sel + ");"
+            + "if(!e)return 'none';e.scrollIntoView({block:'center',inline:'center'});"
+            + "var r=e.getBoundingClientRect();"
+            + "var cx=Math.min(Math.max(r.left+r.width/2,Math.max(r.left,0)+1),"
+            + "Math.min(r.right,window.innerWidth)-1);"
+            + "var cy=Math.min(Math.max(r.top+r.height/2,Math.max(r.top,0)+1),"
+            + "Math.min(r.bottom,window.innerHeight)-1);"
+            + "return [cx,cy].join(',');})()");
+        if (!(v instanceof String s) || s.equals("none")) {
+            throw new IllegalArgumentException("no element matches selector: " + cssSelector);
+        }
+        String[] p = s.split(",");
+        return new double[] {Double.parseDouble(p[0]), Double.parseDouble(p[1])};
+    }
+
+    /** Document → viewport coordinates (CDP input wants viewport CSS px).
+     *  FAIL-LOUD when the mapped point lands outside the viewport (B1
+     *  fold-blocker, brewshot 75): a click dispatched into nowhere is a silent
+     *  no-op the caller cannot detect — raw-coordinate callers must scroll
+     *  first (or use the selector form, which auto-scrolls). Scroll offsets
+     *  and viewport bounds are read in ONE eval, atomic against a scrolling
+     *  page. */
+    private double[] viewportPoint(double x, double y) {
+        if (!Double.isFinite(x) || !Double.isFinite(y)) {
+            throw new IllegalArgumentException("non-finite input point: " + x + "," + y);
+        }
+        Object v = eval("[window.scrollX,window.scrollY,window.innerWidth,window.innerHeight].join(',')");
+        String[] p = String.valueOf(v).split(",");
+        double sx = Double.parseDouble(p[0]);
+        double sy = Double.parseDouble(p[1]);
+        double vw = Double.parseDouble(p[2]);
+        double vh = Double.parseDouble(p[3]);
+        double vx = x - sx;
+        double vy = y - sy;
+        if (vx < 0 || vy < 0 || vx >= vw || vy >= vh) {
+            throw new IllegalArgumentException("document point " + x + "," + y
+                + " maps outside the viewport (viewport " + vx + "," + vy + " in " + vw + "x" + vh
+                + " at scroll " + sx + "," + sy + ") — the event would silently miss;"
+                + " scroll the page first, or use the selector form (auto-scrolls into view)");
+        }
+        return new double[] {vx, vy};
+    }
+
+    /** One CDP Input.dispatchMouseEvent — the single seam all input rides. */
+    private void dispatchMouse(String type, double vx, double vy, String button, int clickCount) {
+        command("Input.dispatchMouseEvent",
+            "{\"type\":\"" + type + "\",\"x\":" + vx + ",\"y\":" + vy
+                + ",\"button\":\"" + button + "\",\"clickCount\":" + clickCount + "}");
     }
 
     /** Clipped PNG of the element matching {@code cssSelector} — the
@@ -788,9 +919,39 @@ public final class BrewShot implements AutoCloseable {
     public void recordGifElement(String cssSelector, int frames, int captureDelayMs,
                                  int playbackDelayMs, int firstFrameDelayMs,
                                  double scale, Path out) throws IOException {
+        recordGifElement(cssSelector, frames, captureDelayMs, playbackDelayMs,
+                         firstFrameDelayMs, scale, NO_HOOK, out);
+    }
+
+    /**
+     * Record one element as a GIF, driving the page BETWEEN frames — the
+     * element-targeted sibling of the
+     * {@link #recordGif(double, double, double, double, int, int, int, IntConsumer, Path)}
+     * hook overload (same hook contract: 0-based index, invoked before each
+     * capture, exceptions abort). The element's box is resolved ONCE, before
+     * the first hook call, so a hook that moves things around cannot shift the
+     * filmed region mid-recording.
+     */
+    public void recordGifElement(String cssSelector, int frames, int captureDelayMs,
+                                 int playbackDelayMs, double scale,
+                                 IntConsumer beforeFrame, Path out) throws IOException {
+        recordGifElement(cssSelector, frames, captureDelayMs, playbackDelayMs,
+                         playbackDelayMs, scale, beforeFrame, out);
+    }
+
+    /**
+     * The full-knob element recorder: per-frame hook AND a first-frame hold
+     * (film the intact opening state for a beat, then let the hook drive) —
+     * see {@link #recordGifElement(String, int, int, int, int, double, Path)}
+     * for the hold semantics and the hook overloads above for the hook contract.
+     */
+    public void recordGifElement(String cssSelector, int frames, int captureDelayMs,
+                                 int playbackDelayMs, int firstFrameDelayMs, double scale,
+                                 IntConsumer beforeFrame, Path out) throws IOException {
         double[] b = elementBox(cssSelector);
         List<byte[]> shots = new ArrayList<>(frames);
         for (int i = 0; i < frames; i++) {
+            beforeFrame.accept(i);
             shots.add(screenshotClip(b[0], b[1], b[2], b[3], scale));
             settle(captureDelayMs);
         }

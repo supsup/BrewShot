@@ -40,6 +40,7 @@ WebSocket client since 11. BrewShot is those messages, wrapped well:
 | `Runtime.evaluate` | `eval(js)` → String/Double/Boolean/Map/List · `waitFor(predicate, ms)` |
 | `Runtime.consoleAPICalled` / `exceptionThrown` | `console()` / `errors()` — the page's voice, one-line health asserts |
 | `Page.captureScreenshot` | `screenshot(path)` / `screenshotClip(x,y,w,h)` · `screenshotElement("css")` |
+| `Input.dispatchMouseEvent` | `mouse(x,y)` · `click(x,y)` / `click("css")` · `hover("css")` — real trusted input |
 | + JDK ImageIO | `recordGif(rect…)` · `recordGifElement("css", …)` · `recordGifScroll(…)` · `recordGifFullPage(…, scale, …)` · `recordGifRegion(0.5, 1.0, …)` |
 
 **Target one element by CSS selector.** `elementBox("css")` resolves an element's
@@ -48,6 +49,19 @@ capture *just that element* — no hand-computing `getBoundingClientRect()`. Tri
 animation first (`open`/`eval`), then film it: `recordGifElement` resolves the box once and
 films that fixed region, so motion *within* the element (glyph jitter, a spinner) is captured
 cleanly. Built for exactly this — recording one card's effect out of a page full of them.
+
+**Poke the page with real input.** `click("css")` / `hover("css")` hit an element's center;
+`mouse(x, y)` / `click(x, y)` take *document* coordinates (the same space `elementBox` speaks —
+the scroll offset is handled at the CDP seam). These are **trusted browser events**: handlers see
+`event.isTrusted === true` and `:hover` styles actually engage — things a page-side
+`el.dispatchEvent(new MouseEvent(...))` can never do. Hover something, *then* screenshot it, and
+the capture shows the hovered state, because the mouse genuinely stays there.
+
+**Drive a recording frame-by-frame.** `recordGif`/`recordGifElement` overloads take a
+`beforeFrame` hook (`IntConsumer`) invoked with the 0-based frame index right before each shot —
+trigger the animation at `i == 0`, advance deterministic state (`eval("step()")`), or perturb
+mid-recording (`click(...)`, `hover(...)`). The hook runs on the recording thread against the
+same instance, so it composes with the whole surface; an exception aborts the recording.
 
 **Scale is a re-raster, not an upscale.** The `scale` on `screenshotClip`/`screenshotElement`
 makes Chrome **re-render** the clip region at that factor — `screenshotElement("svg", 3.0)`
@@ -109,11 +123,13 @@ first frame is held that long before the animation runs, so the viewer registers
 Capturing an effect that fires on hover/click has three gotchas, learned the hard way filming the
 LatteX fx catalogue:
 
-1. **Trigger *after* recording starts, not before.** If you dispatch the click then start recording,
-   you miss the opening (the frames fly by before the first shot). Schedule the trigger a beat into
-   the capture so the early frames catch the *before* state:
-   `eval("setTimeout(() => el.dispatchEvent(new MouseEvent('click',{bubbles:true})), 150)")`, then
-   `recordGifElement` immediately. Pair with `firstFrameDelayMs` to hold that intact opening.
+1. **Trigger *after* recording starts, not before.** If you fire the click then start recording,
+   you miss the opening (the frames fly by before the first shot). Use the `beforeFrame` hook to
+   trigger *inside* the recording — the early frames catch the *before* state, then the effect runs:
+   `recordGifElement(".fx", 60, 25, 75, 1.3, i -> { if (i == 2) shot.click(".fx"); }, out)`.
+   Pair with `firstFrameDelayMs` to hold that intact opening. (The hook's `click`/`hover` are
+   trusted input, so `isTrusted`-checking handlers fire too — the old page-side
+   `setTimeout(() => el.dispatchEvent(...))` workaround is obsolete, and never engaged `:hover`.)
 2. **Sample dense, play slow.** Use the `(captureDelayMs, playbackDelayMs)` overload: shoot as fast
    as Chrome allows (~25 ms) and stamp a slower playback (75–110 ms). A fast effect stays smooth but
    readable — no re-encoding afterward.
