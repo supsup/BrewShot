@@ -4,7 +4,6 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import java.awt.image.BufferedImage;
 import java.nio.file.Files;
@@ -24,7 +23,7 @@ class BrewShotInputDispatchTest {
 
     @Test
     void clickDispatchesTrustedPressReleaseClickToHandlers() throws Exception {
-        assumeTrue(BrewShot.available(), "no local Chrome; skipping");
+        TestChrome.requireChromeOrLoudSkip("BrewShotInputDispatchTest");
         try (BrewShot shot = BrewShot.launch(640, 480)) {
             shot.html("""
                 <style>*{margin:0;padding:0}
@@ -49,7 +48,7 @@ class BrewShotInputDispatchTest {
 
     @Test
     void hoverEngagesRealHoverStateNotJustHandlers() throws Exception {
-        assumeTrue(BrewShot.available(), "no local Chrome; skipping");
+        TestChrome.requireChromeOrLoudSkip("BrewShotInputDispatchTest");
         try (BrewShot shot = BrewShot.launch(640, 480)) {
             shot.html("""
                 <style>*{margin:0;padding:0}
@@ -74,7 +73,7 @@ class BrewShotInputDispatchTest {
 
     @Test
     void clickTakesDocumentCoordinatesEvenAfterScroll() throws Exception {
-        assumeTrue(BrewShot.available(), "no local Chrome; skipping");
+        TestChrome.requireChromeOrLoudSkip("BrewShotInputDispatchTest");
         // The coordinate-space pin: elementBox speaks document coordinates,
         // CDP input wants viewport coordinates. Scroll the page, then click at
         // the element's DOCUMENT center — if the scroll offset weren't
@@ -102,7 +101,7 @@ class BrewShotInputDispatchTest {
     void belowFoldSelectorClickScrollsIntoViewAndHits() throws Exception {
         // B1 fold-blocker (brewshot 75): click(css) on a below-fold element must HIT —
         // the selector form scrolls into view first, never silently dispatches into nowhere.
-        assumeTrue(BrewShot.available(), "no local Chrome; skipping");
+        TestChrome.requireChromeOrLoudSkip("BrewShotInputDispatchTest");
         try (BrewShot shot = BrewShot.launch(640, 480)) {
             shot.html("<div style='height:1150px'>spacer</div>"
                 + "<button id='deep' style='width:120px;height:40px'"
@@ -118,7 +117,7 @@ class BrewShotInputDispatchTest {
     void rawCoordinateClickOutsideViewportFailsLoudNotSilent() throws Exception {
         // The raw-coordinate twin of the fold-blocker: a document point whose viewport
         // mapping is out of bounds throws (naming the remedy), never no-ops.
-        assumeTrue(BrewShot.available(), "no local Chrome; skipping");
+        TestChrome.requireChromeOrLoudSkip("BrewShotInputDispatchTest");
         try (BrewShot shot = BrewShot.launch(640, 480)) {
             shot.html("<div style='height:1150px'>spacer</div>"
                 + "<button id='deep' onclick=\"window.hit='deep'\">Deep</button>"
@@ -133,7 +132,7 @@ class BrewShotInputDispatchTest {
 
     @Test
     void selectorMissAndNonFinitePointFailLoud() throws Exception {
-        assumeTrue(BrewShot.available(), "no local Chrome; skipping");
+        TestChrome.requireChromeOrLoudSkip("BrewShotInputDispatchTest");
         try (BrewShot shot = BrewShot.launch(320, 240)) {
             shot.html("<p>empty</p>");
             assertThrows(IllegalArgumentException.class, () -> shot.click("#nope"));
@@ -146,7 +145,7 @@ class BrewShotInputDispatchTest {
 
     @Test
     void perFrameHookDrivesTheRecordingDeterministically() throws Exception {
-        assumeTrue(BrewShot.available(), "no local Chrome; skipping");
+        TestChrome.requireChromeOrLoudSkip("BrewShotInputDispatchTest");
         Path out = Files.createTempDirectory("brewshot-hook");
         Path gif = out.resolve("stepped.gif");
         List<Integer> hookCalls = new ArrayList<>();
@@ -192,7 +191,7 @@ class BrewShotInputDispatchTest {
 
     @Test
     void rectHookOverloadRecordsAndHooklessPathStillWorks() throws Exception {
-        assumeTrue(BrewShot.available(), "no local Chrome; skipping");
+        TestChrome.requireChromeOrLoudSkip("BrewShotInputDispatchTest");
         Path out = Files.createTempDirectory("brewshot-rect-hook");
         List<Integer> calls = new ArrayList<>();
         try (BrewShot shot = BrewShot.launch(320, 240)) {
@@ -207,7 +206,7 @@ class BrewShotInputDispatchTest {
 
     @Test
     void hookPlusClickFilmsAnInputTriggeredAnimation() throws Exception {
-        assumeTrue(BrewShot.available(), "no local Chrome; skipping");
+        TestChrome.requireChromeOrLoudSkip("BrewShotInputDispatchTest");
         // The consumer story this slice exists for (LatteX L3): an fx that only
         // runs when REAL input pokes it, filmed by nudging it mid-recording.
         Path out = Files.createTempDirectory("brewshot-nudge");
