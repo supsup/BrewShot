@@ -127,6 +127,41 @@ First proven as the [LatteX](https://github.com/supsup/LatteX) fx-runtime test
 harness, where it pinned real rendering bugs (glyph placement, animation
 lifecycle leaks, hover-state wiring) that no stubbed DOM could catch.
 
+## Compare two shots — a citable verdict, not an eyeball job
+
+`brewshot diff` turns "did this page change?" into a sentence you can paste
+straight into a PR review (on private repos a quoted verdict travels where an
+image upload won't):
+
+```bash
+$ brewshot diff before.png after.png --json verdict.json --diff-out heat.png
+0.55% of pixels changed (1365 of 250400; 771 anti-aliasing px ignored);
+largest cluster at 173,203 (43x17, 20% of the change) — in the body.
+```
+
+- **Anti-aliasing forgiveness is ON by default** — a raw AA diff of two
+  re-renders is a noise wall (font hinting shifts every glyph edge a pixel).
+  A 3×3 shifted-edge heuristic forgives those, and everything it forgives is
+  **counted and printed** in the verdict — nothing is silently eaten.
+  `--pixel-exact` opts out for byte-faithful comparison.
+- **Threshold gate**: `--fail-over 0.5` (percent) / `--fail-pixels 100` →
+  **exit 4 with the verdict and artifacts still written** — the same
+  evidence-first contract as `--fail-js`.
+- **Mask dynamic regions** (`--mask x,y,w,h`, repeatable): zero a clock or
+  spinner on both images so the numbers stay stable and citable.
+- **Heatmap** (`--diff-out diff.png`): the base image dimmed, changed pixels
+  magenta — the eyes-artifact companion when someone does want to look.
+- **Localization**: connected-component analysis names the largest changed
+  cluster (centroid, box, share) and its page band — header / body / footer —
+  so the verdict says *where to look first*.
+- A **size mismatch** renders an explicit verdict (never a crash); under any
+  `--fail-*` gate it exits 4.
+
+No Chrome involved — `diff` is pure JDK image work, so it runs anywhere the
+jar runs (it rides ImageIO, the same JVM-path caveat as GIF recording; not
+the macOS native binary). Library callers get the same engine as
+`BrewShotDiff.diff(imgA, imgB, options)` → a `Verdict` record.
+
 ## What it's good for
 
 - **Visual pins in JUnit** — "this page renders, and no element exploded" as a
