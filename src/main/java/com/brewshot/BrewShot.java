@@ -1,5 +1,6 @@
 package com.brewshot;
 
+import java.io.File;
 import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -70,21 +71,104 @@ public final class BrewShot implements AutoCloseable {
 
     // ---- discovery ---------------------------------------------------------
 
-    /** Locate a Chrome/Chromium binary, or null. Override with BREWSHOT_CHROME. */
+    /**
+     * Executable base names to look for on {@code PATH}, in preference order:
+     * Chrome/Chromium first, then Edge (all Chromium-based, all driveable over
+     * CDP). On Windows each is also tried with a {@code .exe} suffix.
+     */
+    static final String[] PATH_NAMES = {
+        "google-chrome", "google-chrome-stable", "chromium", "chromium-browser",
+        "chrome", "msedge", "microsoft-edge",
+    };
+
+    /**
+     * Locate a Chrome/Chromium/Edge binary, or null. Precedence:
+     * {@code BREWSHOT_CHROME} env override, then a scan of every {@code PATH}
+     * entry for a known executable name, then common absolute install
+     * locations (macOS / Linux / Windows). Override with BREWSHOT_CHROME.
+     */
     public static String findChrome() {
-        String env = System.getenv("BREWSHOT_CHROME");
-        if (env != null && Files.isExecutable(Path.of(env))) { return env; }
-        String[] candidates = {
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-            "/Applications/Chromium.app/Contents/MacOS/Chromium",
-            "/usr/bin/google-chrome",
-            "/usr/bin/chromium",
-            "/usr/bin/chromium-browser",
-        };
-        for (String c : candidates) {
+        return findChrome(System.getenv(), isWindows());
+    }
+
+    /** True on Windows — gates the {@code .exe}-suffix PATH probe. */
+    private static boolean isWindows() {
+        return System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT)
+            .startsWith("windows");
+    }
+
+    /**
+     * Pure discovery over an injected environment (testable seam): reads
+     * {@code BREWSHOT_CHROME}, {@code PATH}, and the Windows {@code ProgramFiles*}
+     * / {@code LocalAppData} vars from {@code env} only — no {@code System.getenv}
+     * — and does nothing but filesystem {@link Files#isExecutable} probes.
+     */
+    static String findChrome(Map<String, String> env, boolean windows) {
+        String override = env.get("BREWSHOT_CHROME");
+        if (override != null && Files.isExecutable(Path.of(override))) { return override; }
+        String onPath = scanPath(env.get("PATH"), windows);
+        if (onPath != null) { return onPath; }
+        for (String c : knownLocations(env)) {
             if (Files.isExecutable(Path.of(c))) { return c; }
         }
         return null;
+    }
+
+    /**
+     * Scan each entry of a {@code PATH} string (split on {@link File#pathSeparator})
+     * for the first executable {@link #PATH_NAMES} match, or null. On Windows the
+     * {@code .exe} suffix is tried too. Pure: PATH string in, path (or null) out.
+     */
+    static String scanPath(String path, boolean windows) {
+        if (path == null || path.isEmpty()) { return null; }
+        for (String dir : path.split(Pattern.quote(File.pathSeparator))) {
+            if (dir.isEmpty()) { continue; }
+            for (String name : PATH_NAMES) {
+                Path candidate = Path.of(dir, name);
+                if (Files.isExecutable(candidate)) { return candidate.toString(); }
+                if (windows) {
+                    Path exe = Path.of(dir, name + ".exe");
+                    if (Files.isExecutable(exe)) { return exe.toString(); }
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Common absolute install locations across macOS, Linux, and Windows. The
+     * Windows {@code C:\...} strings are inert on other OSes (only probed via
+     * {@link Files#isExecutable}, never resolved), and the {@code %ProgramFiles%}
+     * / {@code %LocalAppData%} forms come from the injected {@code env} so they
+     * work under any locale/drive.
+     */
+    private static List<String> knownLocations(Map<String, String> env) {
+        List<String> l = new ArrayList<>();
+        // macOS
+        l.add("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
+        l.add("/Applications/Chromium.app/Contents/MacOS/Chromium");
+        l.add("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge");
+        // Linux
+        l.add("/usr/bin/google-chrome");
+        l.add("/usr/bin/google-chrome-stable");
+        l.add("/usr/bin/chromium");
+        l.add("/usr/bin/chromium-browser");
+        l.add("/usr/bin/microsoft-edge");
+        // Windows — fixed default install roots
+        l.add("C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe");
+        l.add("C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe");
+        l.add("C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe");
+        l.add("C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe");
+        // Windows — env-based (locale-/drive-independent)
+        addUnder(l, env.get("ProgramFiles"), "\\Google\\Chrome\\Application\\chrome.exe");
+        addUnder(l, env.get("ProgramFiles(x86)"), "\\Google\\Chrome\\Application\\chrome.exe");
+        addUnder(l, env.get("ProgramFiles(x86)"), "\\Microsoft\\Edge\\Application\\msedge.exe");
+        addUnder(l, env.get("LocalAppData"), "\\Google\\Chrome\\Application\\chrome.exe");
+        return l;
+    }
+
+    private static void addUnder(List<String> l, String base, String suffix) {
+        if (base != null && !base.isBlank()) { l.add(base + suffix); }
     }
 
     /** True when a driveable Chrome exists — tests gate on this (assumeTrue). */
@@ -500,10 +584,45 @@ public final class BrewShot implements AutoCloseable {
         catch (InterruptedException e) { Thread.currentThread().interrupt(); }
     }
 
+    /**
+     * Output image encoding for {@link #screenshot}/{@link #screenshotClip}.
+     * PNG is lossless (the default everywhere); JPEG is lossy but far smaller
+     * for photographic/gradient-heavy pages, and takes a {@code quality} knob.
+     */
+    public enum ImageFormat { PNG, JPEG }
+
+    /**
+     * The CDP {@code Page.captureScreenshot} format+quality JSON fragment for a
+     * format selector — {@code "format":"png"} or {@code "format":"jpeg","quality":N}.
+     * Fails loud with {@link IllegalArgumentException} when a JPEG quality is
+     * outside 1-100 (CDP's valid range). Package-private so the validation is
+     * unit-testable without a browser.
+     */
+    static String captureFormatParams(ImageFormat fmt, int quality) {
+        if (fmt == ImageFormat.JPEG) {
+            if (quality < 1 || quality > 100) {
+                throw new IllegalArgumentException(
+                    "jpeg quality must be 1-100, got " + quality);
+            }
+            return "\"format\":\"jpeg\",\"quality\":" + quality;
+        }
+        return "\"format\":\"png\"";
+    }
+
     /** Full-page PNG (beyond the viewport), written to the given path. */
     public void screenshot(Path out) throws IOException {
+        screenshot(out, ImageFormat.PNG, 0);
+    }
+
+    /**
+     * Full-page screenshot in the given {@link ImageFormat}, written to the
+     * given path. {@code quality} (1-100) applies to JPEG only and is ignored
+     * for PNG; an out-of-range JPEG quality throws {@link IllegalArgumentException}.
+     * The PNG default of {@link #screenshot(Path)} is unchanged.
+     */
+    public void screenshot(Path out, ImageFormat fmt, int quality) throws IOException {
         Map<String, Object> r = command("Page.captureScreenshot",
-            "{\"format\":\"png\",\"captureBeyondViewport\":true}");
+            "{" + captureFormatParams(fmt, quality) + ",\"captureBeyondViewport\":true}");
         String b64 = (String) r.get("data");
         Files.write(out, Base64.getDecoder().decode(b64));
     }
@@ -523,6 +642,18 @@ public final class BrewShot implements AutoCloseable {
      * native-image-clean (no AWT).
      */
     public byte[] screenshotClip(double x, double y, double width, double height, double scale) {
+        return screenshotClip(x, y, width, height, scale, ImageFormat.PNG, 0);
+    }
+
+    /**
+     * Clipped screenshot with OUTPUT SCALING and an explicit {@link ImageFormat}
+     * — the JPEG-capable form of {@link #screenshotClip(double, double, double,
+     * double, double)}. {@code quality} (1-100) applies to JPEG only (ignored for
+     * PNG); an out-of-range JPEG quality throws {@link IllegalArgumentException}.
+     * The GIF recorders keep using the PNG path (GifWriter assembles PNG frames).
+     */
+    public byte[] screenshotClip(double x, double y, double width, double height,
+                                 double scale, ImageFormat fmt, int quality) {
         if (!Double.isFinite(x) || !Double.isFinite(y)
                 || !Double.isFinite(width) || !Double.isFinite(height)
                 || !Double.isFinite(scale) || scale <= 0) {
@@ -530,7 +661,8 @@ public final class BrewShot implements AutoCloseable {
                 + x + "," + y + " " + width + "x" + height + " @" + scale);
         }
         Map<String, Object> r = command("Page.captureScreenshot",
-            "{\"format\":\"png\",\"captureBeyondViewport\":true,\"clip\":{"
+            "{" + captureFormatParams(fmt, quality)
+                + ",\"captureBeyondViewport\":true,\"clip\":{"
                 + "\"x\":" + x + ",\"y\":" + y
                 + ",\"width\":" + width + ",\"height\":" + height
                 + ",\"scale\":" + scale + "}}");
