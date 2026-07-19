@@ -3,7 +3,6 @@ package com.brewshot;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import com.sun.net.httpserver.HttpServer;
 import java.net.InetSocketAddress;
@@ -15,14 +14,14 @@ import org.junit.jupiter.api.Test;
  * BEFORE an async fetch settles; waitForNetworkIdle must bridge that gap so the
  * captured page reflects the late content, not the mid-flight state.
  *
- * <p>(Off main, pre-CI-honesty branch, so it still gates with assumeTrue; on a
- * rebase past the ChromeGate slice this switches to ChromeGate.gate().)
+ * <p>Gates on {@link TestChrome#requireChromeOrLoudSkip} like the rest of the
+ * suite: a plain loud-skip locally, a hard failure under {@code BREWSHOT_REQUIRE_CHROME}.
  */
 class BrewShotSettleTest {
 
     @Test
     void networkIdleWaitsForAPostLoadFetch() throws Exception {
-        assumeTrue(BrewShot.available(), "no local Chrome; skipping");
+        TestChrome.requireChromeOrLoudSkip("BrewShotSettleTest");
 
         // "/" loads instantly and kicks off a fetch to a SLOW endpoint; "/late"
         // takes 500ms then returns DONE, which the page stores on window.__late.
@@ -67,7 +66,7 @@ class BrewShotSettleTest {
 
     @Test
     void networkIdleReachesIdleThroughARedirectInsteadOfBurningTheTimeout() throws Exception {
-        assumeTrue(BrewShot.available(), "no local Chrome; skipping");
+        TestChrome.requireChromeOrLoudSkip("BrewShotSettleTest");
 
         // "/" kicks off fetch('/redirect'); "/redirect" 302s to "/final" which
         // returns DONE. CDP reuses ONE requestId across the 302 hop (two
@@ -126,7 +125,7 @@ class BrewShotSettleTest {
 
     @Test
     void fontsReadyAndNavTimeoutSetterAreWiredAndSafe() throws Exception {
-        assumeTrue(BrewShot.available(), "no local Chrome; skipping");
+        TestChrome.requireChromeOrLoudSkip("BrewShotSettleTest");
         try (BrewShot shot = BrewShot.launch(400, 300)) {
             assertEquals(shot, shot.navTimeout(30_000), "navTimeout is fluent");
             shot.html("<!doctype html><html><body><span>font check</span></body></html>");

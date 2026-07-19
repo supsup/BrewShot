@@ -1,5 +1,7 @@
 # BrewShot ☕📸
 
+[![CI](https://github.com/supsup/BrewShot/actions/workflows/ci.yml/badge.svg)](https://github.com/supsup/BrewShot/actions/workflows/ci.yml)
+
 **For when text is not enough.** Java brews screenshots: a zero-dependency
 headless-browser harness — point it at a URL, or hand it raw HTML source, and
 get back real-Chrome screenshots, JS evaluation results, and looping GIF
@@ -289,6 +291,11 @@ things not to do: **[SECURITY.md](SECURITY.md)**.
 
 - JDK 21+ (built with 25)
 - A local Chrome or Chromium (auto-discovered; override with `BREWSHOT_CHROME`)
+
+Locally, the Chrome-driving tests loud-skip when no Chrome is found. In CI they
+must not: the reference workflow sets `BREWSHOT_REQUIRE_CHROME=1`, which turns any
+skip into a failure — so a green build proves the end-to-end suite actually ran,
+never "green that tested nothing."
 
 The load/navigation wait budget defaults to 15s; raise it for a heavy page with
 `BREWSHOT_TIMEOUT_MS` or per-instance `shot.navTimeout(ms)`.
