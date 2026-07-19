@@ -1139,8 +1139,8 @@ public final class BrewShot implements AutoCloseable {
      */
     public void recordGifFullPage(int frames, int frameDelayMs, double scale, Path out)
             throws IOException {
-        double w = ((Double) eval("document.documentElement.scrollWidth")).doubleValue();
-        double h = ((Double) eval("document.documentElement.scrollHeight")).doubleValue();
+        double w = ((Number) eval("document.documentElement.scrollWidth")).doubleValue();
+        double h = ((Number) eval("document.documentElement.scrollHeight")).doubleValue();
         List<byte[]> shots = new ArrayList<>(frames);
         for (int i = 0; i < frames; i++) {
             shots.add(screenshotClip(0, 0, w, h, scale));
@@ -1157,8 +1157,8 @@ public final class BrewShot implements AutoCloseable {
      */
     public byte[] screenshotRegion(double fromFraction, double toFraction, double scale) {
         checkFractions(fromFraction, toFraction);
-        double w = ((Double) eval("document.documentElement.scrollWidth")).doubleValue();
-        double h = ((Double) eval("document.documentElement.scrollHeight")).doubleValue();
+        double w = ((Number) eval("document.documentElement.scrollWidth")).doubleValue();
+        double h = ((Number) eval("document.documentElement.scrollHeight")).doubleValue();
         return screenshotClip(0, h * fromFraction, w, h * (toFraction - fromFraction), scale);
     }
 
@@ -1171,8 +1171,8 @@ public final class BrewShot implements AutoCloseable {
                                 int frames, int frameDelayMs, double scale, Path out)
             throws IOException {
         checkFractions(fromFraction, toFraction);
-        double w = ((Double) eval("document.documentElement.scrollWidth")).doubleValue();
-        double h = ((Double) eval("document.documentElement.scrollHeight")).doubleValue();
+        double w = ((Number) eval("document.documentElement.scrollWidth")).doubleValue();
+        double h = ((Number) eval("document.documentElement.scrollHeight")).doubleValue();
         double y = h * fromFraction;
         double regionH = h * (toFraction - fromFraction);
         List<byte[]> shots = new ArrayList<>(frames);
