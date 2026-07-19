@@ -84,7 +84,7 @@ class BrewShotSmokeTest {
 
     @Test
     void screencastStreamCapturesDenserThanThePollRecorder() throws Exception {
-        assumeTrue(BrewShot.available(), "no local Chrome; skipping");
+        TestChrome.requireChromeOrLoudSkip("BrewShotSmokeTest");
         Path out = Files.createTempDirectory("brewshot-stream");
         try (BrewShot shot = BrewShot.launch(480, 360)) {
             // A continuously-compositing page: rAF mutates a transform every frame.
@@ -117,7 +117,7 @@ class BrewShotSmokeTest {
 
     @Test
     void recordGifStreamRejectsNonsenseArguments() throws Exception {
-        assumeTrue(BrewShot.available(), "no local Chrome; skipping");
+        TestChrome.requireChromeOrLoudSkip("BrewShotSmokeTest");
         try (BrewShot shot = BrewShot.launch(320, 240)) {
             shot.html("<p>still</p>");
             for (int[] bad : new int[][] {{0, 60, 60, 0}, {500, 0, 60, 0}, {500, 60, 0, 0}, {500, 60, 60, -1}}) {
