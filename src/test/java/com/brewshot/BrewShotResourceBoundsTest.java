@@ -99,6 +99,62 @@ class BrewShotResourceBoundsTest {
         }
     }
 
+    // ---- the SCREENCAST recorder's trip (brewshot 105 blocker) --------------------
+
+    /// The screencast family is the higher-runaway-risk one: it films until a stop
+    /// condition rather than a caller-bounded frame count, so it is the path a long
+    /// capture actually OOMs on. The shared FrameBudget LOGIC is proven above; this
+    /// pins the screencast INTEGRATION (the :1449 gate) — a dropped break or a frame
+    /// not routed through budget.add passes the rest of the suite, and fails here.
+    @Test
+    void recordingHeapBudgetStopsTheScreencastRecorderAnnouncedNotSilent(@TempDir Path dir)
+            throws Exception {
+        TestChrome.requireChromeOrLoudSkip("BrewShotResourceBoundsTest");
+        try (BrewShot shot = BrewShot.launch(320, 240)) {
+            // A CSS animation so the screencast actually pushes a steady frame stream
+            // (Chrome only emits screencastFrame on visual change).
+            shot.html("<!doctype html><html><head><style>"
+                + "@keyframes spin{from{transform:rotate(0)}to{transform:rotate(360deg)}}"
+                + "#w{width:90px;height:90px;background:#c33;margin:20px;animation:spin .4s linear infinite}"
+                + "</style></head><body><div id=\"w\"></div></body></html>");
+
+            PrintStream realErr = System.err;
+            Path truncated = dir.resolve("cast-truncated.gif");
+            ByteArrayOutputStream errBuf = new ByteArrayOutputStream();
+            int truncatedFrames;
+            try {
+                System.setErr(new PrintStream(errBuf, true, StandardCharsets.UTF_8));
+                shot.recordingHeapBudget(12_000); // ~1-2 screencast frames' worth
+                truncatedFrames = shot.recordGifStream(900, 40, truncated);
+            } finally {
+                System.setErr(realErr);
+            }
+            String announced = errBuf.toString(StandardCharsets.UTF_8);
+            assertTrue(announced.contains("recording stopped") && announced.contains("heap budget"),
+                "screencast truncation must be ANNOUNCED on stderr, got: " + announced);
+            assertTrue(Files.exists(truncated) && Files.size(truncated) > 0,
+                "a truncated screencast recording still writes the frames it captured");
+
+            // Control in the same fixture: the default budget films the full window
+            // with NO truncation claim and strictly more frames.
+            Path full = dir.resolve("cast-full.gif");
+            ByteArrayOutputStream quiet = new ByteArrayOutputStream();
+            int fullFrames;
+            try {
+                System.setErr(new PrintStream(quiet, true, StandardCharsets.UTF_8));
+                shot.recordingHeapBudget(BrewShot.DEFAULT_MAX_RECORDING_BYTES);
+                fullFrames = shot.recordGifStream(900, 40, full);
+            } finally {
+                System.setErr(realErr);
+            }
+            assertFalse(quiet.toString(StandardCharsets.UTF_8).contains("recording stopped"),
+                "an in-budget screencast must not claim truncation");
+            assertTrue(fullFrames > truncatedFrames,
+                "the un-truncated screencast holds strictly more frames ("
+                    + fullFrames + " vs " + truncatedFrames + ")");
+        }
+    }
+
     /** Bytes of one PNG frame of the 160x120 clip — sizes the budget deterministically. */
     private static long probeFrameBytes(BrewShot shot) {
         byte[] png = shot.screenshotClip(0, 0, 160, 120);
