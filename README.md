@@ -337,6 +337,19 @@ never "green that tested nothing."
 The load/navigation wait budget defaults to 15s; raise it for a heavy page with
 `BREWSHOT_TIMEOUT_MS` or per-instance `shot.navTimeout(ms)`.
 
+Two further resource bounds, each a separate axis:
+
+- **Per-CDP-call budget** — how long one DevTools round-trip may take (a
+  full-page screenshot of a tall document is the motivating case: navigation was
+  fast, the single capture call wasn't). `BREWSHOT_COMMAND_TIMEOUT_MS` or
+  `shot.commandTimeout(ms)`; falls back to `BREWSHOT_TIMEOUT_MS`, then 15s.
+- **Recording heap budget** — the GIF recorders hold every PNG frame in memory
+  until encoding, so an unbounded recording is an OOM waiting for a long enough
+  page. Both recorder families (frame-count and screencast) stop at
+  `BREWSHOT_MAX_RECORDING_BYTES` (default 256 MiB; `shot.recordingHeapBudget(bytes)`),
+  write the frames captured so far, and say so on stderr — a truncated GIF that
+  announces itself beats both an OOM and a silently short one.
+
 ## Docs
 
 - [QUICKSTART.md](QUICKSTART.md) — the whole API in two minutes
