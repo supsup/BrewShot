@@ -49,7 +49,7 @@ public final class BrewShot implements AutoCloseable {
     // Single source of truth for --version and the --json manifest. MUST move with every
     // release cut — it sat at 0.3.0 through the 0.4.x/0.5.x releases, so --version lied
     // about vendored-jar provenance (caught by Fixpoint, sirentide #121).
-    public static final String VERSION = "0.7.1";
+    public static final String VERSION = "0.8.0";
 
     private static final Pattern WS_LINE = Pattern.compile("DevTools listening on (ws://\\S+)");
     private static final long DEFAULT_TIMEOUT_MS = 15_000;
@@ -773,6 +773,104 @@ public final class BrewShot implements AutoCloseable {
     public void screenshot(Path out, ImageFormat fmt, int quality) throws IOException {
         Map<String, Object> r = command("Page.captureScreenshot",
             "{" + captureFormatParams(fmt, quality) + ",\"captureBeyondViewport\":true}");
+        String b64 = (String) r.get("data");
+        Files.write(out, Base64.getDecoder().decode(b64));
+    }
+
+    /**
+     * Options for {@link #pdf(Path, PdfOptions)} — paper size and margins in
+     * INCHES (CDP's {@code Page.printToPDF} unit), plus background/scale/orientation.
+     * {@link #defaults()} is a US-Letter, full-bleed (zero-margin), backgrounds-on
+     * capture — the "this is what the page looks like, as a print artifact" default,
+     * not the browser's own print defaults (which drop backgrounds and add margins).
+     * Withers give ergonomic one-off tweaks; presets cover the common paper sizes.
+     */
+    public record PdfOptions(boolean landscape, boolean printBackground, double scale,
+                             double paperWidthIn, double paperHeightIn,
+                             double marginTopIn, double marginRightIn,
+                             double marginBottomIn, double marginLeftIn) {
+        /** US Letter, portrait, zero-margin, backgrounds on, scale 1.0. */
+        public static PdfOptions defaults() {
+            return new PdfOptions(false, true, 1.0, 8.5, 11.0, 0, 0, 0, 0);
+        }
+
+        /** A4 (8.27 × 11.69 in), otherwise like {@link #defaults()}. */
+        public static PdfOptions a4() {
+            return defaults().paper(8.27, 11.69);
+        }
+
+        public PdfOptions landscape(boolean v) {
+            return new PdfOptions(v, printBackground, scale, paperWidthIn, paperHeightIn,
+                marginTopIn, marginRightIn, marginBottomIn, marginLeftIn);
+        }
+
+        public PdfOptions printBackground(boolean v) {
+            return new PdfOptions(landscape, v, scale, paperWidthIn, paperHeightIn,
+                marginTopIn, marginRightIn, marginBottomIn, marginLeftIn);
+        }
+
+        public PdfOptions scale(double v) {
+            return new PdfOptions(landscape, printBackground, v, paperWidthIn, paperHeightIn,
+                marginTopIn, marginRightIn, marginBottomIn, marginLeftIn);
+        }
+
+        public PdfOptions paper(double widthIn, double heightIn) {
+            return new PdfOptions(landscape, printBackground, scale, widthIn, heightIn,
+                marginTopIn, marginRightIn, marginBottomIn, marginLeftIn);
+        }
+
+        /** Uniform margin on all four sides. */
+        public PdfOptions margin(double inches) {
+            return new PdfOptions(landscape, printBackground, scale, paperWidthIn, paperHeightIn,
+                inches, inches, inches, inches);
+        }
+    }
+
+    /**
+     * The CDP {@code Page.printToPDF} parameter fragment for {@code opts}. Validates
+     * the numeric envelope CDP accepts — positive paper dimensions, non-negative
+     * margins, and a scale in CDP's 0.1–2.0 range — failing loud with
+     * {@link IllegalArgumentException} rather than emitting a request Chrome would
+     * reject opaquely. Package-private so the validation is unit-testable without a
+     * browser (mirrors {@link #captureFormatParams(ImageFormat, int)}).
+     */
+    static String printPdfParams(PdfOptions o) {
+        if (o.paperWidthIn() <= 0 || o.paperHeightIn() <= 0) {
+            throw new IllegalArgumentException(
+                "pdf paper size must be positive inches, got "
+                    + o.paperWidthIn() + "x" + o.paperHeightIn());
+        }
+        if (o.marginTopIn() < 0 || o.marginRightIn() < 0
+                || o.marginBottomIn() < 0 || o.marginLeftIn() < 0) {
+            throw new IllegalArgumentException("pdf margins must be non-negative inches");
+        }
+        if (o.scale() < 0.1 || o.scale() > 2.0) {
+            throw new IllegalArgumentException("pdf scale must be 0.1-2.0, got " + o.scale());
+        }
+        return "\"landscape\":" + o.landscape()
+            + ",\"printBackground\":" + o.printBackground()
+            + ",\"scale\":" + o.scale()
+            + ",\"paperWidth\":" + o.paperWidthIn()
+            + ",\"paperHeight\":" + o.paperHeightIn()
+            + ",\"marginTop\":" + o.marginTopIn()
+            + ",\"marginRight\":" + o.marginRightIn()
+            + ",\"marginBottom\":" + o.marginBottomIn()
+            + ",\"marginLeft\":" + o.marginLeftIn();
+    }
+
+    /** The page as a PDF at {@link PdfOptions#defaults()}, written to {@code out}. */
+    public void pdf(Path out) throws IOException {
+        pdf(out, PdfOptions.defaults());
+    }
+
+    /**
+     * The page as a print-fidelity PDF via CDP {@code Page.printToPDF}, written to
+     * {@code out}. Unlike GIF, this rides no ImageIO/AWT — {@code printToPDF} returns
+     * base64 PDF bytes — so it works on the native binary too. {@code opts} controls
+     * paper size, margins, background, scale, and orientation.
+     */
+    public void pdf(Path out, PdfOptions opts) throws IOException {
+        Map<String, Object> r = command("Page.printToPDF", "{" + printPdfParams(opts) + "}");
         String b64 = (String) r.get("data");
         Files.write(out, Base64.getDecoder().decode(b64));
     }

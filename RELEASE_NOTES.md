@@ -1,5 +1,27 @@
 # BrewShot — Release Notes ☕📸
 
+## 0.8.0
+
+The page as a **print-fidelity PDF** — and, unlike GIF, it runs on the native binary.
+
+- **PDF capture via `Page.printToPDF`.** `pdf(out)` / `pdf(out, PdfOptions)` render the
+  whole document as a paged, print-fidelity PDF straight from CDP — base64 PDF bytes,
+  **no ImageIO/AWT** — so it works on the macOS native binary, where GIF recording
+  can't.
+- **`PdfOptions` — a wither record with honest defaults.** `defaults()` is US Letter,
+  portrait, zero margins, backgrounds on, scale 1.0 — "what the page looks like, as a
+  print artifact," not the browser's print defaults (which drop backgrounds and add
+  margins). An `a4()` preset plus withers `landscape` / `printBackground` / `scale` /
+  `paper(widthIn, heightIn)` / `margin(inches)`; a bad envelope (non-positive paper,
+  negative margin, scale outside CDP's 0.1–2.0) throws `IllegalArgumentException`
+  loudly instead of an opaque Chrome reject.
+- **CLI infers `.pdf` output** — case-insensitively, so `-o out.PDF` writes a real PDF
+  rather than PNG bytes in a `.PDF` file. `brewshot URL -o page.pdf` routes to `pdf(out)`
+  instead of a screenshot. The clip/scale flags are raster-only: combining any of
+  `--clip-selector` / `--clip-js` / `--scale` / `--clip-padding` with a `.pdf` output is
+  **refused loudly** (exit 2), never silently producing a full-page PDF — BrewShot output
+  is review evidence, so a silently-wrong artifact fails closed.
+
 ## 0.7.1
 
 GIF quality and CI honesty, plus a version-string fix.
