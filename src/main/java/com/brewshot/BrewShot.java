@@ -124,6 +124,23 @@ public final class BrewShot implements AutoCloseable {
     // 15s constant; override per-instance with navTimeout(). Governs open()/html()
     // and the ready-waits, so a slow page on a loaded CI runner isn't unraisable.
     private long navTimeoutMs = envTimeoutMs();
+    // Per-CDP-CALL wait budget (ms) — a DIFFERENT axis from navTimeoutMs above. A single
+    // full-page Page.captureScreenshot on a tall document can legitimately exceed the 15s
+    // default, and before this it threw a spurious CDP timeout that no caller could raise.
+    // Kept separate deliberately: collapsing it into navTimeoutMs would make one knob mean
+    // two things, so a caller wanting a longer screenshot budget would also be loosening
+    // every navigation wait. Same default source and setter shape as navTimeout, though —
+    // one PATTERN, two values.
+    private long commandTimeoutMs = envCommandTimeoutMs();
+
+    private static long envCommandTimeoutMs() {
+        String v = System.getenv("BREWSHOT_COMMAND_TIMEOUT_MS");
+        if (v != null) {
+            try { long ms = Long.parseLong(v.trim()); if (ms > 0) { return ms; } }
+            catch (NumberFormatException ignored) { /* fall through to the shared default */ }
+        }
+        return envTimeoutMs();
+    }
 
     private static long envTimeoutMs() {
         String v = System.getenv("BREWSHOT_TIMEOUT_MS");
@@ -395,7 +412,7 @@ public final class BrewShot implements AutoCloseable {
             throw new IllegalStateException(chromeDeathReason("sending " + method), e);
         }
 
-        long deadline = System.currentTimeMillis() + DEFAULT_TIMEOUT_MS;
+        long deadline = System.currentTimeMillis() + commandTimeoutMs;
         while (true) {
             Map<String, Object> m = nextMessage(deadline, method);
             Object mid = m.get("id");
@@ -687,6 +704,21 @@ public final class BrewShot implements AutoCloseable {
      */
     public BrewShot navTimeout(long millis) {
         if (millis > 0) { this.navTimeoutMs = millis; }
+        return this;
+    }
+
+    /**
+     * Set the per-CDP-call wait budget (ms) — how long any single DevTools command may take
+     * before it is treated as a timeout. Also settable via {@code BREWSHOT_COMMAND_TIMEOUT_MS},
+     * falling back to {@code BREWSHOT_TIMEOUT_MS} and then the 15s default.
+     *
+     * <p>Distinct from {@link #navTimeout}: that governs how long a PAGE may take to load,
+     * this governs how long one CDP round-trip may take. A full-page screenshot of a tall
+     * document is the motivating case — it can exceed 15s on a slow runner while navigation
+     * itself was fast, and raising the navigation budget would not have helped it.
+     */
+    public BrewShot commandTimeout(long millis) {
+        if (millis > 0) { this.commandTimeoutMs = millis; }
         return this;
     }
 
