@@ -132,6 +132,54 @@ public final class BrewShot implements AutoCloseable {
     // every navigation wait. Same default source and setter shape as navTimeout, though —
     // one PATTERN, two values.
     private long commandTimeoutMs = envCommandTimeoutMs();
+    // Recording heap budget (bytes of accumulated PNG frames). The recorders hold every frame
+    // in memory until the GIF is encoded, so an unbounded recording is an OOM waiting for a
+    // long enough page: 30fps of full-page PNGs reaches a gigabyte in well under a minute.
+    // A bound that STOPS the recording is the honest failure — the alternative is dying with
+    // an OutOfMemoryError that names nothing the caller can act on. Overridable per-instance
+    // (recordingHeapBudget) or via BREWSHOT_MAX_RECORDING_BYTES.
+    static final long DEFAULT_MAX_RECORDING_BYTES = 256L * 1024 * 1024;
+    private long maxRecordingBytes = envMaxRecordingBytes();
+
+    private static long envMaxRecordingBytes() {
+        String v = System.getenv("BREWSHOT_MAX_RECORDING_BYTES");
+        if (v != null) {
+            try { long b = Long.parseLong(v.trim()); if (b > 0) { return b; } }
+            catch (NumberFormatException ignored) { /* fall through to the default */ }
+        }
+        return DEFAULT_MAX_RECORDING_BYTES;
+    }
+
+    /// Accumulates captured frames against the heap budget. Returns false once the budget is
+    /// spent, so a recorder STOPS and writes what it has instead of growing until the JVM dies.
+    /// Truncation is announced on stderr and never silent: a short GIF that pretends to be the
+    /// whole recording is the same class of quiet lie as a test that stops testing.
+    private final class FrameBudget {
+        private final List<byte[]> frames = new ArrayList<>();
+        private long bytes;
+        private boolean truncated;
+
+        boolean add(byte[] frame) {
+            if (bytes + frame.length > maxRecordingBytes) {
+                if (!truncated) {
+                    truncated = true;
+                    System.err.println("brewshot: recording stopped at " + frames.size()
+                        + " frames / " + bytes + " bytes — heap budget "
+                        + maxRecordingBytes + " reached. The GIF holds what was captured up to"
+                        + " this point. Raise it with BREWSHOT_MAX_RECORDING_BYTES or"
+                        + " recordingHeapBudget(), or record a shorter window / smaller maxWidth.");
+                }
+                return false;
+            }
+            frames.add(frame);
+            bytes += frame.length;
+            return true;
+        }
+
+        List<byte[]> frames() { return frames; }
+        boolean truncated() { return truncated; }
+        int size() { return frames.size(); }
+    }
 
     private static long envCommandTimeoutMs() {
         String v = System.getenv("BREWSHOT_COMMAND_TIMEOUT_MS");
@@ -719,6 +767,21 @@ public final class BrewShot implements AutoCloseable {
      */
     public BrewShot commandTimeout(long millis) {
         if (millis > 0) { this.commandTimeoutMs = millis; }
+        return this;
+    }
+
+    /**
+     * Set the recording heap budget (bytes of accumulated PNG frames) for the GIF recorders.
+     * Also settable via {@code BREWSHOT_MAX_RECORDING_BYTES}; defaults to
+     * {@value #DEFAULT_MAX_RECORDING_BYTES} bytes.
+     *
+     * <p>The recorders hold every frame in memory until the GIF is encoded, so without a bound
+     * a long enough recording is an OutOfMemoryError. On reaching the budget the recording
+     * STOPS, writes the frames captured so far, and says so on stderr — a truncated GIF that
+     * announces itself beats both an OOM and a silently short one.
+     */
+    public BrewShot recordingHeapBudget(long bytes) {
+        if (bytes > 0) { this.maxRecordingBytes = bytes; }
         return this;
     }
 
@@ -1356,7 +1419,7 @@ public final class BrewShot implements AutoCloseable {
                 + " and maxWidth >= 0, got " + durationMs + "/" + playbackDelayMs + "/"
                 + firstFrameDelayMs + "/" + maxWidth);
         }
-        List<byte[]> frames = new ArrayList<>();
+        FrameBudget budget = new FrameBudget();
         command("Page.startScreencast", maxWidth > 0
             ? "{\"format\":\"png\",\"everyNthFrame\":1,\"maxWidth\":" + maxWidth + "}"
             : "{\"format\":\"png\",\"everyNthFrame\":1}");
@@ -1377,8 +1440,10 @@ public final class BrewShot implements AutoCloseable {
                     throw quietWindow;
                 }
                 if ("Page.screencastFrame".equals(m.get("method"))) {
-                    frames.add(Base64.getDecoder().decode(
-                        String.valueOf(MiniJson.get(m, "params.data"))));
+                    if (!budget.add(Base64.getDecoder().decode(
+                            String.valueOf(MiniJson.get(m, "params.data"))))) {
+                        break; // heap budget spent — stop filming, keep what we have
+                    }
                     // Ack immediately or Chrome stops pushing after a few frames — but
                     // fire-and-forget: blocking for the ack RESULT would route any frame
                     // that arrives mid-wait into routeEvent's drop branch and lose it.
@@ -1394,13 +1459,13 @@ public final class BrewShot implements AutoCloseable {
         } finally {
             command("Page.stopScreencast", "{}");
         }
-        if (frames.isEmpty()) {
+        if (budget.size() == 0) {
             throw new IllegalStateException("screencast produced no frames in " + durationMs
                 + "ms — screencast only emits when the page composites; a static page has"
                 + " nothing to film (use screenshot()/recordGif for stills)");
         }
-        GifWriter.write(frames, playbackDelayMs, firstFrameDelayMs, out);
-        return frames.size();
+        GifWriter.write(budget.frames(), playbackDelayMs, firstFrameDelayMs, out);
+        return budget.size();
     }
 
     /**
