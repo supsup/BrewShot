@@ -155,6 +155,46 @@ class BrewShotResourceBoundsTest {
         }
     }
 
+    /// brewshot 109: EVERY accumulating recorder family rides the one FrameBudget — the reviewer's
+    /// 8-frame element probe ignored a ~1.5-frame budget with no announcement, and scroll/fullpage/
+    /// region had the same private-list shape. One trip per family, each asserting the announced
+    /// stop + a still-written GIF; the earlier tests carry the in-budget controls for the class.
+    @Test
+    void everyAccumulatingRecorderFamilyHonorsTheBudget(@TempDir Path dir) throws Exception {
+        TestChrome.requireChromeOrLoudSkip("BrewShotResourceBoundsTest");
+        try (BrewShot shot = BrewShot.launch(320, 240)) {
+            shot.html("<!doctype html><html><body style=\"margin:0;background:#f2f5ff\">"
+                + "<div id=\"el\" style=\"width:100px;height:70px;background:#274\"></div>"
+                + "<div style=\"height:900px\"></div></body></html>");
+            long one = shot.screenshotClip(0, 0, 100, 70).length;
+
+            interface RecorderThrow { void go(Path out) throws Exception; }
+            java.util.Map<String, RecorderThrow> cases = new java.util.LinkedHashMap<>();
+            cases.put("element", out -> shot.recordGifElement("#el", 8, 10, 40, 1.0, out));
+            cases.put("fullpage", out -> shot.recordGifFullPage(8, 10, 0.4, out));
+            cases.put("region", out -> shot.recordGifRegion(0.0, 0.4, 8, 10, 0.5, out));
+            cases.put("scroll", out -> shot.recordGifScroll(6, 2, 40, 0.5, out));
+
+            PrintStream realErr = System.err;
+            for (var e : cases.entrySet()) {
+                Path out = dir.resolve(e.getKey() + ".gif");
+                ByteArrayOutputStream errBuf = new ByteArrayOutputStream();
+                try {
+                    System.setErr(new PrintStream(errBuf, true, StandardCharsets.UTF_8));
+                    shot.recordingHeapBudget(one + one / 2);
+                    e.getValue().go(out);
+                } finally {
+                    System.setErr(realErr);
+                }
+                String announced = errBuf.toString(StandardCharsets.UTF_8);
+                assertTrue(announced.contains("recording stopped") && announced.contains("heap budget"),
+                    e.getKey() + ": truncation must be ANNOUNCED, got: " + announced);
+                assertTrue(Files.exists(out) && Files.size(out) > 0,
+                    e.getKey() + ": a truncated recording still writes its frames");
+            }
+        }
+    }
+
     /** Bytes of one PNG frame of the 160x120 clip — sizes the budget deterministically. */
     private static long probeFrameBytes(BrewShot shot) {
         byte[] png = shot.screenshotClip(0, 0, 160, 120);

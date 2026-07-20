@@ -160,7 +160,11 @@ public final class BrewShot implements AutoCloseable {
         private boolean truncated;
 
         boolean add(byte[] frame) {
-            if (bytes + frame.length > maxRecordingBytes) {
+            // The FIRST frame is always kept — the budget governs GROWTH, and a
+            // 1-frame GIF that announces its truncation beats an empty-output
+            // error that names nothing (review brewshot 109: a sub-one-frame
+            // budget used to surface as GifWriter's bare "no frames").
+            if (!frames.isEmpty() && bytes + frame.length > maxRecordingBytes) {
                 if (!truncated) {
                     truncated = true;
                     System.err.println("brewshot: recording stopped at " + frames.size()
@@ -173,7 +177,14 @@ public final class BrewShot implements AutoCloseable {
             }
             frames.add(frame);
             bytes += frame.length;
-            return true;
+            if (frames.size() == 1 && bytes > maxRecordingBytes && !truncated) {
+                truncated = true;
+                System.err.println("brewshot: recording stopped at 1 frame / " + bytes
+                    + " bytes — a single frame already exceeds the heap budget "
+                    + maxRecordingBytes + ". The GIF holds that one frame. Raise the budget or"
+                    + " reduce the capture size/scale.");
+            }
+            return bytes <= maxRecordingBytes;
         }
 
         List<byte[]> frames() { return frames; }
@@ -1297,13 +1308,16 @@ public final class BrewShot implements AutoCloseable {
                                  int playbackDelayMs, int firstFrameDelayMs, double scale,
                                  IntConsumer beforeFrame, Path out) throws IOException {
         double[] b = elementBox(cssSelector);
-        List<byte[]> shots = new ArrayList<>(frames);
+        // brewshot 109: EVERY accumulating recorder rides the one FrameBudget.
+        FrameBudget budget = new FrameBudget();
         for (int i = 0; i < frames; i++) {
             beforeFrame.accept(i);
-            shots.add(screenshotClip(b[0], b[1], b[2], b[3], scale));
+            if (!budget.add(screenshotClip(b[0], b[1], b[2], b[3], scale))) {
+                break;
+            }
             settle(captureDelayMs);
         }
-        GifWriter.write(shots, playbackDelayMs, firstFrameDelayMs, out);
+        GifWriter.write(budget.frames(), playbackDelayMs, firstFrameDelayMs, out);
     }
 
     /**
@@ -1322,15 +1336,21 @@ public final class BrewShot implements AutoCloseable {
         double h = ((Number) eval("document.documentElement.scrollHeight")).doubleValue();
         double vh = ((Number) eval("window.innerHeight")).doubleValue();
         double maxY = Math.max(0, h - vh);
-        List<byte[]> shots = new ArrayList<>(panFrames + 2 * holdFrames);
-        for (int i = 0; i < holdFrames; i++) shots.add(screenshotClip(0, 0, w, vh, scale));
-        for (int i = 0; i < panFrames; i++) {
-            double t = panFrames <= 1 ? 1 : i / (double) (panFrames - 1);
-            double eased = t * t * (3 - 2 * t);
-            shots.add(screenshotClip(0, eased * maxY, w, vh, scale));
+        FrameBudget budget = new FrameBudget();
+        record: {
+            for (int i = 0; i < holdFrames; i++) {
+                if (!budget.add(screenshotClip(0, 0, w, vh, scale))) break record;
+            }
+            for (int i = 0; i < panFrames; i++) {
+                double t = panFrames <= 1 ? 1 : i / (double) (panFrames - 1);
+                double eased = t * t * (3 - 2 * t);
+                if (!budget.add(screenshotClip(0, eased * maxY, w, vh, scale))) break record;
+            }
+            for (int i = 0; i < holdFrames; i++) {
+                if (!budget.add(screenshotClip(0, maxY, w, vh, scale))) break record;
+            }
         }
-        for (int i = 0; i < holdFrames; i++) shots.add(screenshotClip(0, maxY, w, vh, scale));
-        GifWriter.write(shots, playbackDelayMs, out);
+        GifWriter.write(budget.frames(), playbackDelayMs, out);
     }
 
     /**
@@ -1342,12 +1362,14 @@ public final class BrewShot implements AutoCloseable {
             throws IOException {
         double w = ((Number) eval("document.documentElement.scrollWidth")).doubleValue();
         double h = ((Number) eval("document.documentElement.scrollHeight")).doubleValue();
-        List<byte[]> shots = new ArrayList<>(frames);
+        FrameBudget budget = new FrameBudget();
         for (int i = 0; i < frames; i++) {
-            shots.add(screenshotClip(0, 0, w, h, scale));
+            if (!budget.add(screenshotClip(0, 0, w, h, scale))) {
+                break;
+            }
             settle(frameDelayMs);
         }
-        GifWriter.write(shots, frameDelayMs, out);
+        GifWriter.write(budget.frames(), frameDelayMs, out);
     }
 
     /**
@@ -1376,12 +1398,14 @@ public final class BrewShot implements AutoCloseable {
         double h = ((Number) eval("document.documentElement.scrollHeight")).doubleValue();
         double y = h * fromFraction;
         double regionH = h * (toFraction - fromFraction);
-        List<byte[]> shots = new ArrayList<>(frames);
+        FrameBudget budget = new FrameBudget();
         for (int i = 0; i < frames; i++) {
-            shots.add(screenshotClip(0, y, w, regionH, scale));
+            if (!budget.add(screenshotClip(0, y, w, regionH, scale))) {
+                break;
+            }
             settle(frameDelayMs);
         }
-        GifWriter.write(shots, frameDelayMs, out);
+        GifWriter.write(budget.frames(), frameDelayMs, out);
     }
 
     private static void checkFractions(double from, double to) {
