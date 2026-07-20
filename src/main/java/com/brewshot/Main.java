@@ -3,6 +3,7 @@ package com.brewshot;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Locale;
 
 /**
  * The {@code brewshot} CLI — one screenshot, no ceremony. Built for the
@@ -128,6 +129,18 @@ public final class Main {
         if (clipSelector != null && clipJs != null) {
             return err("--clip-selector and --clip-js are mutually exclusive (pick one clip source)");
         }
+        // .pdf output is decided by extension, CASE-INSENSITIVELY (an `-o out.PDF` that fell
+        // through to the raster path would write PNG bytes into a .PDF file and report success).
+        boolean pdfOut = isPdfOutput(out);
+        // Raster-only flags cannot be honored on the paged PDF path, and the .pdf branch runs
+        // FIRST, so they would be silently ignored — a full-page PDF where the caller asked for a
+        // crop. BrewShot output is review evidence, so refuse LOUDLY (exit 2) rather than emit a
+        // silently-wrong artifact (Fix review, brewshot 99 F1).
+        if (pdfOut && (clipSelector != null || clipJs != null || scale != 1.0 || clipPadding != 0)) {
+            return err("clip/scale flags are raster-only and cannot apply to a .pdf output "
+                + "(PDF is paged, not clipped) — drop --clip-selector/--clip-js/--scale/--clip-padding, "
+                + "or write a raster format (.png/.jpg)");
+        }
 
         // Resolve the input MODE before touching Chrome, so arg mistakes fail
         // fast with a clear message.
@@ -160,10 +173,10 @@ public final class Main {
                 evalResult = shot.eval(evalExpr);
                 System.out.println(evalResult);
             }
-            if (out.toString().endsWith(".pdf")) {
-                // Output path ends .pdf → render the whole document via Page.printToPDF.
-                // Clip/scale flags are raster-only and don't map to PDF paged output, so this
-                // is a distinct first branch, not part of the screenshot cascade.
+            if (pdfOut) {
+                // Output path ends .pdf (case-insensitive) → render the whole document via
+                // Page.printToPDF. Clip/scale flags are raster-only and don't map to PDF paged
+                // output; a .pdf combined with them was already refused above (never silent here).
                 shot.pdf(out);
             } else if (clipSelector != null) {
                 // Selector-driven clip: elementBox throws on no-match — that's a page-content
@@ -448,6 +461,18 @@ public final class Main {
     private static int err(String msg) {
         System.err.println("brewshot: " + msg);
         return 2;
+    }
+
+    /**
+     * Whether an output path selects the PDF branch — a {@code .pdf} extension, matched
+     * CASE-INSENSITIVELY. This is the ONLY extension-based dispatch in the CLI; a
+     * case-sensitive compare let {@code -o out.PDF} fall through and write PNG bytes into a
+     * {@code .PDF} file (Fix review, brewshot 99 F2). Package-private so the dispatch decision
+     * is unit-testable without Chrome. Mirrors the codebase's only other case-normalization
+     * ({@code osName().toLowerCase(Locale.ROOT)} in {@link BrewShot}).
+     */
+    static boolean isPdfOutput(Path out) {
+        return out.toString().toLowerCase(Locale.ROOT).endsWith(".pdf");
     }
 
     private static void usage() {

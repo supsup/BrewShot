@@ -1,6 +1,7 @@
 package com.brewshot;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -15,6 +16,46 @@ import org.junit.jupiter.api.Test;
  * Mirrors {@link BrewShotJpegTest}.
  */
 class BrewShotPdfTest {
+
+    // ---- Chrome-free: CLI dispatch decisions (Fix review, brewshot 99) ------
+
+    @Test
+    void isPdfOutputIsCaseInsensitive() {
+        // F2: the .pdf dispatch is case-insensitive, so `-o out.PDF` cannot fall through to the
+        // raster path and write PNG bytes into a .PDF file while reporting success.
+        assertTrue(Main.isPdfOutput(Path.of("page.pdf")));
+        assertTrue(Main.isPdfOutput(Path.of("page.PDF")), "uppercase .PDF must route to pdf");
+        assertTrue(Main.isPdfOutput(Path.of("page.Pdf")));
+        assertTrue(Main.isPdfOutput(Path.of("/tmp/deep/REPORT.Pdf")));
+        assertFalse(Main.isPdfOutput(Path.of("page.png")));
+        assertFalse(Main.isPdfOutput(Path.of("page.jpg")));
+        assertFalse(Main.isPdfOutput(Path.of("pdf.png")), "'.pdf' must be the extension, not a prefix");
+    }
+
+    @Test
+    void pdfWithRasterFlagRefusesLoudlyOnDispatch() throws Exception {
+        // F1: a raster-only flag on a .pdf output must FAIL LOUD (exit 2) rather than silently
+        // emit a full-page PDF — BrewShot output is review evidence. Chrome-free: the refusal is a
+        // pre-launch arg validation, so no browser is touched.
+        String[][] rasterFlags = {
+            {"--clip-selector", "#nope"}, {"--clip-js", "({x:0,y:0,w:1,h:1})"},
+            {"--scale", "2"}, {"--clip-padding", "5"},
+        };
+        for (String[] flag : rasterFlags) {
+            java.io.ByteArrayOutputStream errBuf = new java.io.ByteArrayOutputStream();
+            java.io.PrintStream origErr = System.err;
+            int rc;
+            try {
+                System.setErr(new java.io.PrintStream(errBuf));
+                rc = Main.run(new String[] {"x.html", "-o", "out.pdf", flag[0], flag[1]});
+            } finally {
+                System.setErr(origErr);
+            }
+            assertEquals(2, rc, flag[0] + " on a .pdf output must exit 2");
+            assertTrue(errBuf.toString().contains("raster-only"),
+                flag[0] + " refusal must name the raster-only reason, got: " + errBuf);
+        }
+    }
 
     // ---- Chrome-free: printToPDF param building & validation ---------------
 
