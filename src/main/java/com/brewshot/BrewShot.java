@@ -1062,13 +1062,19 @@ public final class BrewShot implements AutoCloseable {
     public void recordGif(double x, double y, double width, double height,
                           int frames, int captureDelayMs, int playbackDelayMs,
                           IntConsumer beforeFrame, Path out) throws IOException {
-        List<byte[]> shots = new ArrayList<>(frames);
+        // The frame COUNT bounds the loop but not the BYTES — full-page frames at a
+        // large count are the same OOM the screencast recorder guards against, so
+        // both recorder families ride the ONE FrameBudget (the write-side twin the
+        // screencast-only fix would have left open).
+        FrameBudget budget = new FrameBudget();
         for (int i = 0; i < frames; i++) {
             beforeFrame.accept(i);
-            shots.add(screenshotClip(x, y, width, height));
+            if (!budget.add(screenshotClip(x, y, width, height))) {
+                break; // heap budget spent — encode what we have (announced on stderr)
+            }
             settle(captureDelayMs);
         }
-        GifWriter.write(shots, playbackDelayMs, out);
+        GifWriter.write(budget.frames(), playbackDelayMs, out);
     }
 
     /**
