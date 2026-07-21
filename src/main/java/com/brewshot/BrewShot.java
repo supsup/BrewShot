@@ -108,6 +108,13 @@ public final class BrewShot implements AutoCloseable {
     private final List<String> errorLog = new ArrayList<>();
     private final Map<String, String> extraHeaders = new java.util.LinkedHashMap<>();
     private boolean captureConsole = true;
+    // Emulated media state (plan 02af3a3d) — null means "no override, whatever the browser
+    // would naturally report." Applied immediately when a setter is called AND re-sent from
+    // freshNavigation() before every open()/html(), so a caller who sets these before OR after
+    // launch gets them in effect for every capture, not just the first.
+    private String emulatedColorScheme;   // "dark" | "light" | "no-preference" | null
+    private String emulatedMediaType;     // "print" | "screen" | null
+    private String emulatedReducedMotion; // "reduce" | "no-preference" | null
     private String sessionId; // null during browser-scope bootstrap, then the tab session
     private int nextId = 1;
     // Network in-flight tracking for waitForNetworkIdle. A SET of live CDP
@@ -641,6 +648,11 @@ public final class BrewShot implements AutoCloseable {
         errorLog.clear();
         inFlightRequestIds.clear();
         lastNetChangeMs = System.currentTimeMillis();
+        // Re-send any active colorScheme/media/reducedMotion override BEFORE the navigation
+        // command below, so the new document paints under it from the first frame — a no-op
+        // when none was ever set (plan 02af3a3d: emulation must survive "any new page/navigation
+        // the harness opens", not just the page open() was first called on).
+        applyEmulatedMedia();
     }
 
     /**
@@ -698,6 +710,83 @@ public final class BrewShot implements AutoCloseable {
         if (Boolean.FALSE.equals(r.get("success"))) {
             throw new IllegalStateException("cookie rejected: " + name + " @ " + domain);
         }
+    }
+
+    /**
+     * Force the page's {@code prefers-color-scheme} media feature — {@code "dark"},
+     * {@code "light"}, or {@code "no-preference"} — via CDP {@code Emulation.setEmulatedMedia},
+     * so a dark-mode-only stylesheet (or a light-only one) renders without an OS-level toggle.
+     * Applied immediately (works whether called before or after {@link #open}/{@link #html}),
+     * and re-sent on every subsequent navigation — see {@link #applyEmulatedMedia()}. Chainable
+     * like {@link #navTimeout}/{@link #commandTimeout}/{@link #recordingHeapBudget}.
+     */
+    public BrewShot colorScheme(String scheme) {
+        if (!"dark".equals(scheme) && !"light".equals(scheme) && !"no-preference".equals(scheme)) {
+            throw new IllegalArgumentException(
+                "colorScheme wants dark|light|no-preference, got: " + scheme);
+        }
+        this.emulatedColorScheme = scheme;
+        applyEmulatedMedia();
+        return this;
+    }
+
+    /**
+     * Force the page's emulated media TYPE — {@code "print"} or {@code "screen"} — via CDP
+     * {@code Emulation.setEmulatedMedia}, so {@code @media print} rules render (or a page that
+     * hides content under {@code @media print} stays hidden) without an actual print dialog.
+     * Same application/chaining contract as {@link #colorScheme}.
+     */
+    public BrewShot media(String type) {
+        if (!"print".equals(type) && !"screen".equals(type)) {
+            throw new IllegalArgumentException("media wants print|screen, got: " + type);
+        }
+        this.emulatedMediaType = type;
+        applyEmulatedMedia();
+        return this;
+    }
+
+    /**
+     * Force the page's {@code prefers-reduced-motion} media feature — {@code "reduce"} or
+     * {@code "no-preference"} — via CDP {@code Emulation.setEmulatedMedia}, so a CSS-guarded
+     * animation ({@code @media (prefers-reduced-motion: reduce) { animation: none !important }})
+     * is deterministically stilled for a stable capture. Same application/chaining contract as
+     * {@link #colorScheme}.
+     */
+    public BrewShot reducedMotion(String preference) {
+        if (!"reduce".equals(preference) && !"no-preference".equals(preference)) {
+            throw new IllegalArgumentException(
+                "reducedMotion wants reduce|no-preference, got: " + preference);
+        }
+        this.emulatedReducedMotion = preference;
+        applyEmulatedMedia();
+        return this;
+    }
+
+    /**
+     * Send {@code Emulation.setEmulatedMedia} with whatever combination of
+     * {@link #colorScheme}/{@link #media}/{@link #reducedMotion} has been set so far. A no-op
+     * when none of the three has ever been called (nothing to override — never sends a command
+     * that would reset an unrelated caller's state). Called both from each setter (immediate
+     * effect) and from {@link #freshNavigation} (re-applied before every {@link #open}/
+     * {@link #html}, since a fresh page is exactly the case this must not silently drop).
+     */
+    private void applyEmulatedMedia() {
+        if (emulatedColorScheme == null && emulatedMediaType == null
+                && emulatedReducedMotion == null) {
+            return;
+        }
+        List<String> features = new ArrayList<>();
+        if (emulatedColorScheme != null) {
+            features.add("{\"name\":\"prefers-color-scheme\",\"value\":\""
+                + emulatedColorScheme + "\"}");
+        }
+        if (emulatedReducedMotion != null) {
+            features.add("{\"name\":\"prefers-reduced-motion\",\"value\":\""
+                + emulatedReducedMotion + "\"}");
+        }
+        command("Emulation.setEmulatedMedia",
+            "{\"media\":\"" + (emulatedMediaType != null ? emulatedMediaType : "")
+                + "\",\"features\":[" + String.join(",", features) + "]}");
     }
 
     /** Toggle console/error capture (default ON; bounded either way). */

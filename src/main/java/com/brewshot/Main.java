@@ -73,6 +73,9 @@ public final class Main {
         Path jsonManifest = null;
         java.util.List<String[]> cookies = new java.util.ArrayList<>();
         java.util.List<String[]> headers = new java.util.ArrayList<>();
+        String colorScheme = null;
+        String mediaType = null;
+        boolean reducedMotion = false;
 
         // The ARGUMENT-PARSING phase only: a bad flag value (missing value,
         // non-numeric --size/--settle/--wait-timeout, unreadable --eval-file)
@@ -112,6 +115,11 @@ public final class Main {
                     if (hv.length != 2) { return err("--header wants 'Name: value'"); }
                     headers.add(new String[] {hv[0].trim(), hv[1].trim()});
                 }
+                case "--color-scheme" -> colorScheme =
+                    requireOneOf("--color-scheme", requireValue(args, ++i), "dark", "light");
+                case "--media" -> mediaType =
+                    requireOneOf("--media", requireValue(args, ++i), "print", "screen");
+                case "--reduced-motion" -> reducedMotion = true;
                 case "-h", "--help" -> { usage(); return 0; }
                 case "--version" -> { System.out.println("brewshot " + BrewShot.VERSION); return 0; }
                 default -> {
@@ -161,6 +169,9 @@ public final class Main {
         try (BrewShot shot = BrewShot.launch(width, height)) {
             for (String[] h : headers) { shot.header(h[0], h[1]); }
             for (String[] c : cookies) { shot.cookie(c[0], c[1], c[2]); }
+            if (colorScheme != null) { shot.colorScheme(colorScheme); }
+            if (mediaType != null) { shot.media(mediaType); }
+            if (reducedMotion) { shot.reducedMotion("reduce"); }
             switch (mode) {
                 case "stdin" -> shot.html(new String(
                     System.in.readAllBytes(), StandardCharsets.UTF_8));
@@ -451,6 +462,15 @@ public final class Main {
         return d;
     }
 
+    /** Validate a flag value against a fixed allowed set; throws (usage error, exit 2) otherwise. */
+    private static String requireOneOf(String flag, String v, String... allowed) {
+        for (String a : allowed) {
+            if (a.equals(v)) { return v; }
+        }
+        throw new IllegalArgumentException(
+            flag + " wants one of " + String.join("|", allowed) + ", got: " + v);
+    }
+
     private static String requireValue(String[] args, int i) {
         if (i >= args.length) {
             throw new IllegalArgumentException("flag " + args[i - 1] + " wants a value");
@@ -501,6 +521,9 @@ public final class Main {
               --clip-padding   CSS px of breathing room inflated around the clip rect
               --cookie     name=value[@domain] session auth  (repeatable)
               --header     'Name: value' on every request    (repeatable)
+              --color-scheme dark|light  force prefers-color-scheme before capture
+              --media      print|screen  force the emulated media type (e.g. @media print)
+              --reduced-motion  force prefers-reduced-motion: reduce before capture
               --fail-js    JS assertion; false -> exit 4 (PNG still written)
               --json       write a machine-readable manifest beside the PNG
               --version    print the version and exit
