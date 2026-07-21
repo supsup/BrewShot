@@ -21,6 +21,15 @@ The page as a **print-fidelity PDF** — and, unlike GIF, it runs on the native 
   `--clip-selector` / `--clip-js` / `--scale` / `--clip-padding` with a `.pdf` output is
   **refused loudly** (exit 2), never silently producing a full-page PDF — BrewShot output
   is review evidence, so a silently-wrong artifact fails closed.
+- **Emulated media before capture.** `colorScheme("dark"|"light"|"no-preference")`,
+  `media("print"|"screen")`, and `reducedMotion("reduce"|"no-preference")` force those media
+  features via CDP `Emulation.setEmulatedMedia` — a dark-mode-only stylesheet, an
+  `@media print` layout, or a `prefers-reduced-motion`-guarded animation now renders under
+  the *intended* condition instead of whatever the OS happens to report. Chainable knobs
+  (`navTimeout`/`commandTimeout` idiom) that apply immediately and are re-sent on every
+  subsequent `open`/`html` on the same instance, so a second navigation never silently drops
+  the override. CLI: `--color-scheme dark|light`, `--media print|screen`, `--reduced-motion`
+  (boolean → `reduce`).
 
 ## 0.7.1
 

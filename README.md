@@ -44,6 +44,7 @@ WebSocket client since 11. BrewShot is those messages, wrapped well:
 | `Runtime.consoleAPICalled` / `exceptionThrown` | `console()` / `errors()` — the page's voice, one-line health asserts |
 | `Page.captureScreenshot` | `screenshot(path)` / `screenshotClip(x,y,w,h)` · `screenshotElement("css")` |
 | `Page.printToPDF` | `pdf(path)` / `pdf(path, PdfOptions)` — the page as a paged, print-fidelity PDF |
+| `Emulation.setEmulatedMedia` | `colorScheme("dark"\|"light")` · `media("print"\|"screen")` · `reducedMotion("reduce")` |
 | `Input.dispatchMouseEvent` | `mouse(x,y)` · `click(x,y)` / `click("css")` · `hover("css")` — real trusted input |
 | + JDK ImageIO | `recordGif(rect…)` · `recordGifElement("css", …)` · `recordGifScroll(…)` · `recordGifFullPage(…, scale, …)` · `recordGifRegion(0.5, 1.0, …)` |
 
@@ -193,6 +194,39 @@ apply to `.pdf` output — PDF is paged, not clipped.)
 Unlike GIF recording, PDF rides **no ImageIO/AWT** — `printToPDF` hands back
 the PDF bytes directly — so the same call works everywhere *including the
 macOS native binary* (the metrics table's GIF caveat doesn't apply here).
+
+## Emulated media — dark mode, print, reduced motion
+
+A dark-mode-only stylesheet, an `@media print` layout, or a CSS animation guarded by
+`@media (prefers-reduced-motion: reduce)` can't be captured faithfully by just opening the
+page — the browser reports its *actual* OS-level preferences unless told otherwise.
+`colorScheme`/`media`/`reducedMotion` force those media features via CDP
+`Emulation.setEmulatedMedia`, **before** the capture:
+
+```java
+try (BrewShot shot = BrewShot.launch(1280, 900)) {
+    shot.colorScheme("dark");        // "dark" | "light" | "no-preference"
+    shot.reducedMotion("reduce");    // "reduce" | "no-preference" — freezes @media
+                                      // (prefers-reduced-motion: reduce) { animation: none }
+    shot.open("https://example.com");
+    shot.screenshot(Path.of("dark.png"));
+
+    shot.media("print");             // "print" | "screen" — @media print rules apply
+    shot.screenshot(Path.of("print-preview.png"));
+}
+```
+
+Each setter is chainable (returns `this`, like `navTimeout`/`commandTimeout`) and takes effect
+immediately, whether called before or after `open`/`html` — and it **survives every subsequent
+navigation** on the same instance without being called again: `open`/`html` re-send whatever
+override is active before the new document paints, so a second `open()` on the same `shot`
+never silently reverts to the browser's real preference. The same three knobs ride the CLI:
+
+```bash
+brewshot page.html -o dark.png --color-scheme dark
+brewshot page.html -o preview.png --media print
+brewshot page.html -o still.png --reduced-motion
+```
 
 ## Compare two shots — a citable verdict, not an eyeball job
 
