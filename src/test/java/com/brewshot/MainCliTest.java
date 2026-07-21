@@ -54,6 +54,18 @@ class MainCliTest {
     }
 
     @Test
+    void emulatedMediaFlagShapesValidate() throws Exception {
+        // plan 02af3a3d: --color-scheme/--media are a fixed enum; a bad value is a usage
+        // error (exit 2) caught during arg parsing, before Chrome is ever touched.
+        assertEquals(2, Main.run(new String[] {"--color-scheme", "bogus", "https://example.com"}));
+        assertEquals(2, Main.run(new String[] {"--media", "bogus", "https://example.com"}));
+        // = forms parse through to input resolution (exit 2 = "no such file", not unknown flag)
+        assertEquals(2, Main.run(new String[] {"--color-scheme=dark", "no-such-file.html"}));
+        assertEquals(2, Main.run(new String[] {"--media=print", "no-such-file.html"}));
+        assertEquals(2, Main.run(new String[] {"--reduced-motion", "no-such-file.html"}));
+    }
+
+    @Test
     void badFlagValuesExitCleanlyNotWithAStackTrace() throws Exception {
         // Lattice's four repros (brewshot/9): thrown parse/value exceptions must
         // route through err() -> exit 2, never escape as a stack trace + exit 1.
