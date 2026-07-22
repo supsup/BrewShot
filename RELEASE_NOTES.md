@@ -10,10 +10,13 @@
   dialog on the operator's desktop, and under some conditions (cold `--no-daemon`
   suite runs) the serving process itself dies pre-DevTools. Reported by Charles;
   reproduced 5/15 storm launches without the flag, 0/15 with it, captures intact.
-  Reaches embedders (LatteX/Sirentide suites) on their next jar re-vendor; until then
-  their vendored 0.8.0 jars already honor `BREWSHOT_CHROME_ARGS=--no-startup-window`
-  as an immediate env workaround (correction credit: Marlow, brewshot/130 — the
-  original "no env hook" claim here came from a vacuous jar check).
+  Reaches embedders (LatteX/Sirentide suites) on their next jar re-vendor. Interim
+  workaround is LINEAGE-SPECIFIC (correction credits: Marlow, brewshot/130 AND /132 —
+  two claims here were wrong before this wording): LatteX **main** vendors 0.8.0,
+  which honors `BREWSHOT_CHROME_ARGS=--no-startup-window` today; the frozen
+  0.11.0-release lineage (the in-review seam-patch branch) still vendors **0.2.0**,
+  which has no env hook — suite runs on that lineage cannot take the workaround and
+  will keep spawning dialogs until the fixed jar exists.
 
 ## 0.8.0
 
