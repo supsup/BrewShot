@@ -355,7 +355,15 @@ public final class BrewShot implements AutoCloseable {
             "--remote-debugging-port=0",
             "--user-data-dir=" + profile,
             "--no-first-run",
-            "--no-default-browser-check"));
+            "--no-default-browser-check",
+            // macOS 26 + Chrome 150 (plan ba9dafd7, 2026-07-22): without this flag, ~1/3 of
+            // rapid headless launches spawn a doomed secondary Chrome that abort()s inside
+            // TransformProcessType -> _RegisterApplication (LaunchServices refuses the
+            // registration under launch storms). Captures still succeed — the abort feeds the
+            // OPERATOR's "Chrome quit unexpectedly" dialog queue. Empirically eliminated by
+            // skipping the startup-window/app-registration path (0/15 storm launches vs 5/15
+            // without); harmless on Linux/CI.
+            "--no-startup-window"));
         // Extra Chrome flags via env — the container hook (e.g. the Docker
         // image sets BREWSHOT_CHROME_ARGS=--no-sandbox: Chrome's sandbox needs
         // privileges containers don't grant by default). Space-separated.
