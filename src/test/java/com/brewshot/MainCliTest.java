@@ -89,6 +89,12 @@ class MainCliTest {
         assertEquals(2, Main.run(new String[] {"--gif=10", "no-such-file.html"}));
         assertEquals(2, Main.run(new String[] {"--gif=10", "--gif-element=svg", "no-such-file.html"}));
         assertEquals(2, Main.run(new String[] {"--gif=10", "--gif-delay=25", "no-such-file.html"}));
+        // F1 (review brewshot/126, live-repro'd): the STILL path with a .gif out must refuse —
+        // the third direction of the misnamed-extension class (it wrote PNG bytes into a .gif,
+        // exit 0). Case-insensitive like the guard itself.
+        assertEquals(2, Main.run(new String[] {"-o", "out.gif", "https://example.com"}));
+        assertEquals(2, Main.run(new String[] {"-o", "out.GIF", "https://example.com"}));
+        assertEquals(2, Main.run(new String[] {"--out=still.gif", "no-such-file.html"}));
     }
 
     @Test

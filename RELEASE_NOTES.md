@@ -19,7 +19,9 @@ CLI GIF parity — the recorder family finally reachable without writing Java.
   case-insensitively, same rule as the PDF dispatch. Still-shot-only flags
   (`--clip-selector`/`--clip-js`/`--clip-padding`) and `--gif-element`/`--gif-delay`
   without `--gif` are usage errors, and `--gif 0` refuses instead of silently
-  degrading to a still.
+  degrading to a still. The guard is symmetric: a STILL shoot with a `.gif` output
+  (`-o demo.gif`, no `--gif`) is refused too — previously it wrote PNG bytes into a
+  `.gif` with exit 0 (found in review, live-repro'd).
 - **The native-binary gap stays documented AND enforced**: GIF assembly rides
   ImageIO/AWT (unsupported under native-image on macOS) — on the native binary the
   `--gif` lane reports exactly that, loudly, instead of a stack trace; the jar path

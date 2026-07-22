@@ -158,6 +158,13 @@ public final class Main {
         if (!gifSet && (gifElement != null || gifDelaySet)) {
             return err("--gif-element/--gif-delay modify a GIF recording — add --gif N (frame count)");
         }
+        // F1 (review brewshot/126): the STILL path with a .gif output is the THIRD direction of
+        // the misnamed-extension class — without this guard it wrote PNG bytes into a .gif with
+        // exit 0. A .gif output has unambiguous intent now the gif lane exists: refuse and say so.
+        if (!gifSet && isGifOutput(out)) {
+            return err("-o names a .gif but --gif N was not given — add --gif N to record, "
+                + "or use a raster output (.png/.jpg) for a still");
+        }
         if (gifSet) {
             if (gifFrames < 1) { return err("--gif wants a positive frame count, got: " + gifFrames); }
             if (gifDelayMs < 1) { return err("--gif-delay wants a positive ms value, got: " + gifDelayMs); }
