@@ -23,7 +23,14 @@ Or from the shell:
 ```
 brewshot https://example.com -o page.png
 cat report.html | brewshot - -o report.png
+brewshot ./fx.html --gif 40 --gif-element ".lx-math" -o fx.gif   # film an element (jar path)
 ```
+
+The `--gif N` lane records N frames as a looping GIF instead of a still —
+`--gif-delay` sets the per-frame cadence (capture == playback, default 40 ms) and
+`--gif-element CSS` films just that element's box (composes with `--scale`).
+**Jar path only**: GIF assembly rides ImageIO, which the macOS native binary
+doesn't have — the CLI reports this loudly instead of half-working.
 
 ## Why it exists
 

@@ -15,13 +15,15 @@ import java.util.Locale;
  *   brewshot ./report.html -o report.png            # local file
  *   cat page.html | brewshot - -o page.png          # direct HTML on stdin
  *   brewshot URL -o page.png --size 1440x1000 --settle 1500 --eval "document.title"
+ *   brewshot ./fx.html --gif 40 --gif-element ".lx-math" -o fx.gif   # film an element
  * </pre>
  *
  * Exit codes: 0 ok · 2 bad arguments · 3 no Chrome found · 4 --fail-js
  * assertion failed (screenshot still written) or a `diff` gate exceeded
  * (verdict still written) · 1 runtime failure.
- * Note: GIF recording and `diff` are library/jar-path (ImageIO/AWT is not yet
- * supported by native-image on macOS); the PNG shoot path is native-clean.
+ * Note: the {@code --gif} lane and `diff` are library/jar-path (ImageIO/AWT is
+ * not yet supported by native-image on macOS — the CLI refuses/reports this
+ * loudly rather than half-working); the PNG shoot path is native-clean.
  */
 public final class Main {
 
@@ -76,6 +78,13 @@ public final class Main {
         String colorScheme = null;
         String mediaType = null;
         boolean reducedMotion = false;
+        int gifFrames = 0;
+        boolean gifSet = false;     // explicit flag, NOT a 0-sentinel: `--gif 0` must refuse
+                                    // loudly below, never fall through to a silent still shot
+        int gifDelayMs = 40;        // capture == playback cadence (the single-delay overloads)
+        boolean gifDelaySet = false;
+        String gifElement = null;
+        boolean outSet = false;
 
         // The ARGUMENT-PARSING phase only: a bad flag value (missing value,
         // non-numeric --size/--settle/--wait-timeout, unreadable --eval-file)
@@ -84,7 +93,7 @@ public final class Main {
         try {
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
-                case "-o", "--out" -> out = Path.of(requireValue(args, ++i));
+                case "-o", "--out" -> { out = Path.of(requireValue(args, ++i)); outSet = true; }
                 case "--size" -> {
                     String[] wh = requireValue(args, ++i).split("x");
                     if (wh.length != 2) { return err("--size wants WxH, e.g. 1440x1000"); }
@@ -120,6 +129,12 @@ public final class Main {
                 case "--media" -> mediaType =
                     requireOneOf("--media", requireValue(args, ++i), "print", "screen");
                 case "--reduced-motion" -> reducedMotion = true;
+                case "--gif" -> { gifFrames = posInt("--gif", requireValue(args, ++i)); gifSet = true; }
+                case "--gif-delay" -> {
+                    gifDelayMs = posInt("--gif-delay", requireValue(args, ++i));
+                    gifDelaySet = true;
+                }
+                case "--gif-element" -> gifElement = requireValue(args, ++i);
                 case "-h", "--help" -> { usage(); return 0; }
                 case "--version" -> { System.out.println("brewshot " + BrewShot.VERSION); return 0; }
                 default -> {
@@ -136,6 +151,37 @@ public final class Main {
         if (input == null) { usage(); return 2; }
         if (clipSelector != null && clipJs != null) {
             return err("--clip-selector and --clip-js are mutually exclusive (pick one clip source)");
+        }
+        // GIF lane (plan 6cc2d9ec): --gif N flips the shoot to the recordGif* family. All
+        // constraints are LOUD usage errors (exit 2) — BrewShot output is review evidence,
+        // so a flag that cannot be honored refuses rather than silently degrading.
+        if (!gifSet && (gifElement != null || gifDelaySet)) {
+            return err("--gif-element/--gif-delay modify a GIF recording — add --gif N (frame count)");
+        }
+        // F1 (review brewshot/126): the STILL path with a .gif output is the THIRD direction of
+        // the misnamed-extension class — without this guard it wrote PNG bytes into a .gif with
+        // exit 0. A .gif output has unambiguous intent now the gif lane exists: refuse and say so.
+        if (!gifSet && isGifOutput(out)) {
+            return err("-o names a .gif but --gif N was not given — add --gif N to record, "
+                + "or use a raster output (.png/.jpg) for a still");
+        }
+        if (gifSet) {
+            if (gifFrames < 1) { return err("--gif wants a positive frame count, got: " + gifFrames); }
+            if (gifDelayMs < 1) { return err("--gif-delay wants a positive ms value, got: " + gifDelayMs); }
+            if (!outSet) {
+                out = Path.of("brewshot.gif");
+            } else if (!isGifOutput(out)) {
+                return err("--gif records a GIF — give -o a .gif path, got: " + out
+                    + " (GIF bytes under a misnamed extension would lie to their reader)");
+            }
+            if (clipSelector != null || clipJs != null) {
+                return err("--clip-selector/--clip-js are still-shot flags — film an element with "
+                    + "--gif-element SEL instead");
+            }
+            if (clipPadding != 0) {
+                return err("--clip-padding is still-shot only (the GIF recorders film the exact "
+                    + "element/page box)");
+            }
         }
         // .pdf output is decided by extension, CASE-INSENSITIVELY (an `-o out.PDF` that fell
         // through to the raster path would write PNG bytes into a .PDF file and report success).
@@ -184,7 +230,30 @@ public final class Main {
                 evalResult = shot.eval(evalExpr);
                 System.out.println(evalResult);
             }
-            if (pdfOut) {
+            if (gifSet) {
+                // The GIF lane: element-targeted when --gif-element names a selector,
+                // else the whole page. Single-delay overloads (capture == playback);
+                // --scale composes as a true re-raster, exactly like the still path.
+                try {
+                    if (gifElement != null) {
+                        shot.recordGifElement(gifElement, gifFrames, gifDelayMs, scale, out);
+                    } else {
+                        shot.recordGifFullPage(gifFrames, gifDelayMs, scale, out);
+                    }
+                } catch (IllegalArgumentException e) {
+                    // No element matches --gif-element: a page-content failure (parity with
+                    // --clip-selector's posture), not a usage error — exit 1, loud.
+                    System.err.println("brewshot: " + e.getMessage());
+                    return 1;
+                } catch (LinkageError e) {
+                    // The documented native-image gap, loudly: GIF assembly rides ImageIO/AWT,
+                    // which native-image does not support on macOS — the jar path has it.
+                    System.err.println("brewshot: GIF recording needs the jar path "
+                        + "(java -jar brewshot.jar) — the native binary cannot encode GIFs "
+                        + "(ImageIO/AWT is unsupported under native-image): " + e);
+                    return 1;
+                }
+            } else if (pdfOut) {
                 // Output path ends .pdf (case-insensitive) → render the whole document via
                 // Page.printToPDF. Clip/scale flags are raster-only and don't map to PDF paged
                 // output; a .pdf combined with them was already refused above (never silent here).
@@ -495,6 +564,16 @@ public final class Main {
         return out.toString().toLowerCase(Locale.ROOT).endsWith(".pdf");
     }
 
+    /**
+     * Whether an output path is a {@code .gif}, matched case-insensitively — the {@code --gif}
+     * lane's output guard (an explicit non-.gif {@code -o} under {@code --gif} is refused, exit 2,
+     * never GIF bytes under a misnamed extension). Same normalization rule as
+     * {@link #isPdfOutput}; package-private so the guard is unit-testable without Chrome.
+     */
+    static boolean isGifOutput(Path out) {
+        return out.toString().toLowerCase(Locale.ROOT).endsWith(".gif");
+    }
+
     private static void usage() {
         System.err.println("""
             brewshot — Java brews screenshots (headless Chrome over CDP, zero deps)
@@ -526,6 +605,14 @@ public final class Main {
               --reduced-motion  force prefers-reduced-motion: reduce before capture
               --fail-js    JS assertion; false -> exit 4 (PNG still written)
               --json       write a machine-readable manifest beside the PNG
+              --gif N      record N frames as a looping GIF instead of a still
+                           (default -o becomes brewshot.gif; an explicit non-.gif
+                           -o is refused). JAR PATH ONLY: GIF assembly rides
+                           ImageIO/AWT, which the native binary does not have —
+                           run via java -jar brewshot.jar
+              --gif-delay  ms between frames, capture AND playback  (default 40)
+              --gif-element  CSS selector: film just that element's box (resolved
+                           once, exit 1 if nothing matches); composes with --scale
               --version    print the version and exit
 
             subcommands:

@@ -49,7 +49,7 @@ public final class BrewShot implements AutoCloseable {
     // Single source of truth for --version and the --json manifest. MUST move with every
     // release cut — it sat at 0.3.0 through the 0.4.x/0.5.x releases, so --version lied
     // about vendored-jar provenance (caught by Fixpoint, sirentide #121).
-    public static final String VERSION = "0.8.0";
+    public static final String VERSION = "0.9.0";
 
     private static final Pattern WS_LINE = Pattern.compile("DevTools listening on (ws://\\S+)");
     private static final long DEFAULT_TIMEOUT_MS = 15_000;

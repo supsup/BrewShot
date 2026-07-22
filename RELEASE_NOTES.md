@@ -1,6 +1,9 @@
 # BrewShot — Release Notes ☕📸
 
-## Unreleased
+## 0.9.0
+
+CLI GIF parity — the recorder family finally reachable without writing Java — plus
+the end of the macOS crash-dialog spam.
 
 - **macOS crash-dialog spam eliminated** (`--no-startup-window` in the default launch
   args): on macOS 26 + Chrome 150, rapid headless launches sporadically abort in
@@ -17,6 +20,28 @@
   0.11.0-release lineage (the in-review seam-patch branch) still vendors **0.2.0**,
   which has no env hook — suite runs on that lineage cannot take the workaround and
   will keep spawning dialogs until the fixed jar exists.
+- **`--gif N` records a looping GIF from the CLI** (plan 6cc2d9ec, roadmap B4): the
+  whole `recordGif*` family was library-only, so `java -jar` users had GIFs in the
+  engine and zero access from the shell. `--gif N` flips the shoot to a recording
+  (full page by default), `--gif-delay MS` sets the per-frame cadence (capture ==
+  playback, default 40), and `--gif-element CSS` films just that element's box —
+  resolved once, exit 1 loud if nothing matches (the `--clip-selector` posture).
+  `--scale` composes as a true re-raster; setup flags (`--settle`, `--wait-js`,
+  `--eval`, cookies/headers/emulated media) all run before recording, so you can
+  trigger an animation and film it.
+- **Loud refusals, honest output** (the `.pdf` lane's discipline): default `-o`
+  becomes `brewshot.gif`; an explicit non-`.gif` `-o` is refused (exit 2) rather
+  than writing GIF bytes under a misnamed extension — `isGifOutput` matches
+  case-insensitively, same rule as the PDF dispatch. Still-shot-only flags
+  (`--clip-selector`/`--clip-js`/`--clip-padding`) and `--gif-element`/`--gif-delay`
+  without `--gif` are usage errors, and `--gif 0` refuses instead of silently
+  degrading to a still. The guard is symmetric: a STILL shoot with a `.gif` output
+  (`-o demo.gif`, no `--gif`) is refused too — previously it wrote PNG bytes into a
+  `.gif` with exit 0 (found in review, live-repro'd).
+- **The native-binary gap stays documented AND enforced**: GIF assembly rides
+  ImageIO/AWT (unsupported under native-image on macOS) — on the native binary the
+  `--gif` lane reports exactly that, loudly, instead of a stack trace; the jar path
+  (`java -jar brewshot.jar`) records as always.
 
 ## 0.8.0
 
