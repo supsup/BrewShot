@@ -1,5 +1,18 @@
 # BrewShot — Release Notes ☕📸
 
+## Unreleased
+
+- **macOS crash-dialog spam eliminated** (`--no-startup-window` in the default launch
+  args): on macOS 26 + Chrome 150, rapid headless launches sporadically abort in
+  `TransformProcessType → _RegisterApplication` (LaunchServices refuses the app
+  registration under launch storms) — usually a doomed secondary process while the
+  capture still succeeds, but each abort queues a "Google Chrome quit unexpectedly"
+  dialog on the operator's desktop, and under some conditions (cold `--no-daemon`
+  suite runs) the serving process itself dies pre-DevTools. Reported by Charles;
+  reproduced 5/15 storm launches without the flag, 0/15 with it, captures intact.
+  Reaches embedders (LatteX/Sirentide suites) on their next jar re-vendor — the old
+  vendored 0.2.0 jar has neither this flag nor the `BREWSHOT_CHROME_ARGS` env hook.
+
 ## 0.8.0
 
 The page as a **print-fidelity PDF** — and, unlike GIF, it runs on the native binary.
