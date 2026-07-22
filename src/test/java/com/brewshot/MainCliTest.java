@@ -66,6 +66,41 @@ class MainCliTest {
     }
 
     @Test
+    void gifFlagShapesValidate() throws Exception {
+        // plan 6cc2d9ec: every constraint is a LOUD exit 2 at parse, before Chrome.
+        // modifiers without --gif N
+        assertEquals(2, Main.run(new String[] {"--gif-element", "svg", "https://example.com"}));
+        assertEquals(2, Main.run(new String[] {"--gif-delay", "40", "https://example.com"}));
+        // frame count / delay must be positive numbers — and `--gif 0` must REFUSE,
+        // never fall through to a silent still shot (the 0-sentinel trap)
+        assertEquals(2, Main.run(new String[] {"--gif", "nope", "https://example.com"}));
+        assertEquals(2, Main.run(new String[] {"--gif", "0", "https://example.com"}));
+        assertEquals(2, Main.run(new String[] {"--gif", "-3", "https://example.com"}));
+        assertEquals(2, Main.run(new String[] {"--gif", "10", "--gif-delay", "0", "https://example.com"}));
+        // an explicit non-.gif -o under --gif is refused (evidence honesty, mirrors the
+        // .pdf-vs-raster refusal), including a .pdf target
+        assertEquals(2, Main.run(new String[] {"--gif", "10", "-o", "out.png", "https://example.com"}));
+        assertEquals(2, Main.run(new String[] {"--gif", "10", "-o", "out.pdf", "https://example.com"}));
+        // still-shot-only flags are refused with --gif
+        assertEquals(2, Main.run(new String[] {"--gif", "10", "--clip-selector", "svg", "https://example.com"}));
+        assertEquals(2, Main.run(new String[] {"--gif", "10", "--clip-js", "({})", "https://example.com"}));
+        assertEquals(2, Main.run(new String[] {"--gif", "10", "--clip-padding", "4", "https://example.com"}));
+        // = forms parse through to input resolution (exit 2 = "no such file", not unknown flag)
+        assertEquals(2, Main.run(new String[] {"--gif=10", "no-such-file.html"}));
+        assertEquals(2, Main.run(new String[] {"--gif=10", "--gif-element=svg", "no-such-file.html"}));
+        assertEquals(2, Main.run(new String[] {"--gif=10", "--gif-delay=25", "no-such-file.html"}));
+    }
+
+    @Test
+    void gifOutputExtensionMatchesCaseInsensitively() {
+        // The --gif output guard's unit: same normalization rule as isPdfOutput.
+        org.junit.jupiter.api.Assertions.assertTrue(Main.isGifOutput(java.nio.file.Path.of("x.gif")));
+        org.junit.jupiter.api.Assertions.assertTrue(Main.isGifOutput(java.nio.file.Path.of("x.GIF")));
+        org.junit.jupiter.api.Assertions.assertFalse(Main.isGifOutput(java.nio.file.Path.of("x.png")));
+        org.junit.jupiter.api.Assertions.assertFalse(Main.isGifOutput(java.nio.file.Path.of("gif")));
+    }
+
+    @Test
     void badFlagValuesExitCleanlyNotWithAStackTrace() throws Exception {
         // Lattice's four repros (brewshot/9): thrown parse/value exceptions must
         // route through err() -> exit 2, never escape as a stack trace + exit 1.
