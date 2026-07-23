@@ -399,8 +399,7 @@ public final class BrewShot implements AutoCloseable {
             c.command("Network.enable", "{}"); // in-flight tracking for waitForNetworkIdle
             return c;
         } catch (RuntimeException | IOException | Error e) {
-            p.destroyForcibly();
-            deleteRecursively(profile);
+            teardownTree(p.toHandle(), profile, false);
             throw e;
         }
     }
@@ -1610,12 +1609,31 @@ public final class BrewShot implements AutoCloseable {
         LIVE.remove(this); // graceful close owns the teardown now; the hook needn't touch it
         try { ws.sendClose(WebSocket.NORMAL_CLOSURE, "done").join(); }
         catch (Exception ignored) { /* already closing */ }
-        chrome.destroy();
-        try {
-            if (!chrome.waitFor(3, TimeUnit.SECONDS)) { chrome.destroyForcibly(); }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            chrome.destroyForcibly();
+        teardownTree(chrome.toHandle(), profileDir, true);
+    }
+
+    /**
+     * Teardown unit shared by the graceful {@link #close()} and the
+     * failed-bootstrap path in {@link #launch(int, int)}: kill the launched
+     * Chrome, then remove its generated profile dir. {@code politeFirst}
+     * (close) sends SIGTERM and gives Chrome a bounded grace to shut its own
+     * tree down before SIGKILL; the failure path goes straight to SIGKILL.
+     * Package-private so the dummy-process teardown tests can drive it without
+     * a real browser.
+     */
+    static void teardownTree(ProcessHandle root, Path profileDir, boolean politeFirst) {
+        if (politeFirst) {
+            root.destroy();
+            try {
+                root.onExit().get(3, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                root.destroyForcibly();
+            } catch (java.util.concurrent.ExecutionException | TimeoutException e) {
+                root.destroyForcibly();
+            }
+        } else {
+            root.destroyForcibly();
         }
         deleteRecursively(profileDir);
     }
