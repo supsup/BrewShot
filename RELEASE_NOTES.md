@@ -1,5 +1,35 @@
 # BrewShot — Release Notes ☕📸
 
+## Unreleased
+
+- **Descendant-aware teardown on every exit path** (plan 735951a2; Marlow's
+  report-only evidence, brewshot room 140): parent-only cleanup could not
+  guarantee the launched tree died — `close()` and the failed-bootstrap path
+  signalled ONLY the direct child, so a helper Chrome's launcher had re-exec'd
+  or spawned could survive and recreate the generated `brewshot-*` profile dir
+  after cleanup deleted it (the shutdown hook was already tree-aware; the other
+  two paths were not). All three paths now share one teardown unit: enumerate
+  and kill `ProcessHandle.descendants()` FIRST (children of a dead root are
+  reparented out of the walk — order is load-bearing), then the root, then a
+  bounded reap, then a sweep that force-kills any reparented orphan still
+  carrying this launch's unique `--user-data-dir=<temp>` path in its argv, and
+  only THEN delete the profile dir (one retry for a late flush). Chose the
+  pure-JDK descendants walk over POSIX process groups: `ProcessBuilder` cannot
+  `setsid`, so groups would cost a wrapper hop on every launch. Verified
+  red-then-green against dummy `/bin/sh` process trees whose surviving child
+  demonstrably recreated the dir under the old cleanup; NOT verified against a
+  real failed Chrome bootstrap (browser launches are operator-forbidden while
+  the crash-dialog investigation is live). The correlation between this leak
+  class and the macOS crash-alert reports remains THEORY — the evidence in room
+  140 shows a survivor recreating the profile dir, not that this teardown ends
+  the alerts.
+- **`BREWSHOT_FORBID_CHROME=1` test-gate kill switch**: the Chrome-gated suites
+  previously keyed only on browser availability, so a Chrome-having host could
+  not run `./gradlew test` without launching Chrome. The operator switch makes
+  gated suites loud-skip exactly like a browser-less host (banner + JUnit
+  skip); `BREWSHOT_REQUIRE_CHROME`'s no-skip guard still fails a
+  forbid+require run.
+
 ## 0.9.0
 
 CLI GIF parity — the recorder family finally reachable without writing Java — plus

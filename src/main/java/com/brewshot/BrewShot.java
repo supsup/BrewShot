@@ -74,24 +74,14 @@ public final class BrewShot implements AutoCloseable {
     static {
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             for (BrewShot b : LIVE) {
-                // Kill-then-WAIT-then-delete: the ordering is load-bearing (F1-r2). The Chrome
-                // Helper children are the late writers — destroyForcibly() returns immediately
-                // and signals only the parent, so deleting while the tree is still flushing its
-                // shutdown state loses the delete race and the profile dir survives. Descendants
-                // first, then the parent, then a bounded reap (SIGKILL'd processes die in ms;
-                // the bound only guards a wedged kernel), THEN delete — with one retry as the
-                // belt for a helper that outlived the parent's wait.
+                // Kill-then-WAIT-then-delete: the ordering is load-bearing (F1-r2), and now
+                // lives in teardownTree — descendants first, then the parent, then a bounded
+                // reap, an orphan sweep, THEN delete with one retry. politeFirst=false: a
+                // hook must be fast and SIGKILL'd processes die in ms.
                 try {
-                    b.chrome.toHandle().descendants().forEach(ProcessHandle::destroyForcibly);
-                    b.chrome.destroyForcibly();
-                    b.chrome.waitFor(2, TimeUnit.SECONDS);
+                    teardownTree(b.chrome.toHandle(), b.profileDir, false);
                 } catch (RuntimeException ignored) {
-                } catch (InterruptedException ignored) {
-                    Thread.currentThread().interrupt();
-                }
-                deleteRecursively(b.profileDir);
-                if (java.nio.file.Files.exists(b.profileDir)) {
-                    deleteRecursively(b.profileDir);
+                    // never let one instance's teardown starve the others in the hook
                 }
             }
         }, "brewshot-shutdown-cleanup"));
@@ -1612,30 +1602,107 @@ public final class BrewShot implements AutoCloseable {
         teardownTree(chrome.toHandle(), profileDir, true);
     }
 
+    /** Polite-pass grace before SIGKILL — close()'s historical 3s bound. */
+    private static final long POLITE_GRACE_MS = 3_000;
+    /** Post-SIGKILL reap bound before touching the profile dir (the hook's
+     *  historical 2s) — SIGKILL'd processes die in ms; this only guards a
+     *  wedged kernel. */
+    private static final long REAP_MS = 2_000;
+
     /**
-     * Teardown unit shared by the graceful {@link #close()} and the
-     * failed-bootstrap path in {@link #launch(int, int)}: kill the launched
-     * Chrome, then remove its generated profile dir. {@code politeFirst}
-     * (close) sends SIGTERM and gives Chrome a bounded grace to shut its own
-     * tree down before SIGKILL; the failure path goes straight to SIGKILL.
-     * Package-private so the dummy-process teardown tests can drive it without
-     * a real browser.
+     * Descendant-aware teardown, shared by graceful {@link #close()}, the
+     * failed-bootstrap path in {@link #launch(int, int)}, and the shutdown
+     * hook: kill the WHOLE launched tree, then remove the generated profile
+     * dir. Package-private so the dummy-process teardown tests can drive it
+     * without a real browser.
+     *
+     * <p>Why {@link ProcessHandle#descendants()} and not a process group:
+     * a FAILED bootstrap (Marlow's report, brewshot room 140) leaves Chrome's
+     * re-exec'd/spawned helpers alive when only the direct child is killed —
+     * and a survivor recreates the profile dir after we delete it. POSIX
+     * process groups would fix that too, but {@link ProcessBuilder} cannot
+     * setsid, so a group needs a shell/wrapper hop on every launch; the
+     * descendants walk is pure JDK, works on Windows, and covers the same
+     * tree. The ordering is load-bearing: enumerate and kill descendants
+     * FIRST (children of a dead root are reparented and vanish from the
+     * walk), then the root, then a bounded reap, and only THEN delete — a
+     * still-flushing helper otherwise wins the recreate race.
+     *
+     * <p>{@code politeFirst} (close): SIGTERM the tree and give Chrome
+     * {@link #POLITE_GRACE_MS} to shut down cleanly before the forcible pass;
+     * failure paths and the hook go straight to SIGKILL.
      */
     static void teardownTree(ProcessHandle root, Path profileDir, boolean politeFirst) {
+        // Snapshot while the root handle can still see its tree.
+        List<ProcessHandle> tree = root.descendants().collect(
+            java.util.stream.Collectors.toCollection(ArrayList::new));
         if (politeFirst) {
+            tree.forEach(ProcessHandle::destroy);
             root.destroy();
+            awaitExit(tree, root, POLITE_GRACE_MS);
+        }
+        // Forcible pass: re-walk (a helper forked during the grace is in the
+        // live tree but not the snapshot) + the snapshot (a survivor whose
+        // parent died is reparented out of the walk) + the root.
+        root.descendants().forEach(ProcessHandle::destroyForcibly);
+        for (ProcessHandle ph : tree) {
+            if (ph.isAlive()) { ph.destroyForcibly(); }
+        }
+        root.destroyForcibly();
+        awaitExit(tree, root, REAP_MS);
+        // Reparented-orphan sweep: when the direct child ALREADY died (e.g.
+        // "Chrome exited without a DevTools listening line"), its helpers were
+        // reparented before we could enumerate them — no walk from the dead
+        // root finds them. But every process of this launch carries the unique
+        // per-launch --user-data-dir=<temp path> in its argv, so match on the
+        // full profile path (a fresh Files.createTempDirectory name — long,
+        // random, never reused), never on a process name.
+        sweepOrphansByProfilePath(profileDir);
+        deleteRecursively(profileDir);
+        if (Files.exists(profileDir)) {
+            deleteRecursively(profileDir); // one retry — belt for a late flush
+        }
+    }
+
+    /** Bounded wait for the snapshot + root to exit; a global deadline caps the
+     *  total, so a wedged straggler cannot stack per-process timeouts. */
+    private static void awaitExit(List<ProcessHandle> tree, ProcessHandle root, long millis) {
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(millis);
+        List<ProcessHandle> all = new ArrayList<>(tree);
+        all.add(root);
+        for (ProcessHandle ph : all) {
+            long leftNs = deadline - System.nanoTime();
+            if (leftNs <= 0) { return; }
             try {
-                root.onExit().get(3, TimeUnit.SECONDS);
+                ph.onExit().get(leftNs, TimeUnit.NANOSECONDS);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-                root.destroyForcibly();
-            } catch (java.util.concurrent.ExecutionException | TimeoutException e) {
-                root.destroyForcibly();
+                return;
+            } catch (java.util.concurrent.ExecutionException | TimeoutException ignored) {
+                // timed out (deadline caps the rest) or already unwatchable — move on
             }
-        } else {
-            root.destroyForcibly();
         }
-        deleteRecursively(profileDir);
+    }
+
+    /** Force-kill any process whose command line carries this launch's unique
+     *  profile path; never the current JVM. Enumeration is best-effort —
+     *  info().commandLine() is empty for other users' processes. */
+    private static void sweepOrphansByProfilePath(Path profileDir) {
+        String needle = profileDir.toAbsolutePath().toString();
+        ProcessHandle self = ProcessHandle.current();
+        try {
+            List<ProcessHandle> orphans = ProcessHandle.allProcesses()
+                .filter(ph -> !ph.equals(self))
+                .filter(ph -> ph.info().commandLine()
+                    .map(c -> c.contains(needle)).orElse(false))
+                .collect(java.util.stream.Collectors.toList());
+            orphans.forEach(ProcessHandle::destroyForcibly);
+            if (!orphans.isEmpty()) {
+                awaitExit(orphans, orphans.get(0), REAP_MS);
+            }
+        } catch (RuntimeException ignored) {
+            // a racing exit mid-enumeration must not break the profile delete
+        }
     }
 
     private static void deleteRecursively(Path dir) {
