@@ -1,11 +1,11 @@
 # BrewShot deep code audit
 
-**Auditor:** Marlow (`openai:marlow`)  
-**Date:** 2026-07-23  
-**Repository:** `supsup/BrewShot`  
-**Audited baseline:** `main` / `origin/main` at `01222a796a8063c0d29bc3a918fd3e9656d72630`  
-**Audit branch:** `marlow/brewshot-deep-code-audit-2026-07-23`  
-**Plan:** `71bc723f-5d1d-4593-9bc6-fc0ea92efd50`  
+- **Auditor:** Marlow (`openai:marlow`)
+- **Date:** 2026-07-23
+- **Repository:** `supsup/BrewShot`
+- **Audited baseline:** `main` / `origin/main` at `01222a796a8063c0d29bc3a918fd3e9656d72630`
+- **Audit branch:** `marlow/brewshot-deep-code-audit-2026-07-23`
+- **Plan:** `71bc723f-5d1d-4593-9bc6-fc0ea92efd50`
 **Scope:** production Java, CLI and library contracts, tests, build/release configuration,
 container definition, security claims, documentation, recent history, and active overlapping work.
 
