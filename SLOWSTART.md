@@ -107,7 +107,7 @@ CLI, today:
 
 ```
 ./gradlew jar
-java -jar build/libs/brewshot-0.1.0.jar https://docs.internal/page -o page.png --settle 1200
+java -jar build/libs/brewshot-0.9.0.jar https://docs.internal/page -o page.png --settle 1200
 ```
 
 Native binary (GraalVM JDK selected):
@@ -129,10 +129,19 @@ Or straight from a bake step that has the HTML in hand:
 render-docs | build/brewshot - -o preview.png
 ```
 
+Since 0.9.0 the recording lane is on the CLI too — Sam's bake can film an
+animation without writing a line of Java:
+
+```
+java -jar build/libs/brewshot-0.9.0.jar ./fx-demo.html --gif 40 --gif-element ".fx" -o fx.gif
+# --gif N frames, --gif-delay MS cadence (capture == playback), looping GIF out
+```
+
 **The caveat Sam should know:** the PNG/eval path compiles native cleanly (pure
 JDK net + process + regex, no reflection). GIF recording rides ImageIO/AWT,
 which GraalVM native-image doesn't yet support on macOS — so GIFs are
-JVM/library-mode for now. If you need native GIFs, that's a planned
+JVM/library-mode for now: the jar records, the native binary refuses `--gif`
+loudly instead of stack-tracing. If you need native GIFs, that's a planned
 hand-rolled encoder away (GIF89a is a famously simple format).
 
 **Sam's drift review, upgraded.** "Before/after images in PRs" used to mean

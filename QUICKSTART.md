@@ -102,6 +102,7 @@ Stills have the same region trick: `screenshotRegion(from, to, scale)`, and
 `screenshotClip` takes an optional `scale` for cheap downscaled captures.
 For a screen-recording-style TOUR (viewport frames while the page scrolls),
 compose it from the primitives — recipe in SLOWSTART.
+No Java in hand? The same lane exists on the CLI — `--gif N`, below.
 
 ## CLI
 
@@ -121,6 +122,13 @@ brewshot http://localhost:8080/route -o shot.png \
   --cookie "SESSION=tok@localhost" --json shot.json
 # exit 4 when --fail-js is false — the PNG is still written (failures carry eyes)
 # (--clip-js still exists for computed rects; --clip-selector covers the common case)
+
+# film it instead of freezing it: N frames as a looping GIF (jar path)
+brewshot ./fx.html --gif 40 -o fx.gif                        # full page
+brewshot ./fx.html --gif 40 --gif-delay 60 --gif-element ".lx-math" -o fx.gif
+# --gif-delay MS: per-frame cadence, capture == playback (default 40)
+# --gif-element CSS: film just that element's box (composes with --scale)
+# -o *.gif without --gif is refused — no PNG bytes hiding in a .gif name
 ```
 
 ## Did it change? — diff two shots
