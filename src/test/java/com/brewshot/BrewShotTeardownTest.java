@@ -198,6 +198,34 @@ class BrewShotTeardownTest {
         assertMarkerStaysDeleted(marker);
     }
 
+    @Test
+    void sigtermIgnoringDescendantIsKilledByTheForcibleEscalation() throws Exception {
+        // Discriminator for the FORCIBLE pass specifically (Commander-added after a
+        // mutation check: with the forcible descendant pass disabled, every other
+        // fixture stayed green — their dummies die politely to SIGTERM, or carry the
+        // profile PATH in argv and get mopped by the orphan sweep. This one traps
+        // TERM *and* references the profile only RELATIVELY from a working dir, so
+        // neither the polite pass nor the argv-matching sweep can reap it: only the
+        // forcible descendant pass can).
+        Path marker = tmp.resolve("profile");
+        Process p = new ProcessBuilder("/bin/sh", "-c",
+            "sh -c 'trap \"\" TERM; n=0; while [ $n -lt 400 ]; do mkdir -p profile; "
+                + "sleep 0.05; n=$((n+1)); done' & echo started; sleep 60")
+            .directory(tmp.toFile())
+            .redirectErrorStream(true)
+            .start();
+        spawned.add(p.toHandle());
+        awaitStarted(p);
+        List<ProcessHandle> kids = awaitDescendants(p.toHandle(), 1);
+        awaitMarker(marker);
+
+        BrewShot.teardownTree(p.toHandle(), marker, true); // polite path: TERM is IGNORED by the child
+
+        assertFalse(p.isAlive(), "direct child must be dead");
+        assertAllDeadWithin(kids, 3_000);
+        assertMarkerStaysDeleted(marker);
+    }
+
     // ---- parent already died: the reparented-orphan half -------------------
 
     @Test
