@@ -19,11 +19,14 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.IntConsumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -53,6 +56,9 @@ public final class BrewShot implements AutoCloseable {
 
     private static final Pattern WS_LINE = Pattern.compile("DevTools listening on (ws://\\S+)");
     private static final long DEFAULT_TIMEOUT_MS = 15_000;
+    private static final long DEFAULT_CLOSE_TIMEOUT_MS = 1_000;
+    private static final long PROCESS_CLOSE_TIMEOUT_MS = 3_000;
+    private static final long PROCESS_FORCE_REAP_TIMEOUT_MS = 2_000;
     private static final int CONSOLE_CAP = 1_000;
     /** Poison message the listener enqueues on close/error so a blocked caller fails fast. */
     private static final String SOCKET_CLOSED = "{\"brewshotSocketClosed\":true}";
@@ -101,6 +107,8 @@ public final class BrewShot implements AutoCloseable {
     private final Path profileDir;
     private final WebSocket ws;
     private final LinkedBlockingQueue<String> inbox;
+    private final long closeTimeoutMs;
+    private final AtomicBoolean closed = new AtomicBoolean();
     /** Only awaitable events are kept here (Page.loadEventFired) — bounded by design. */
     private final Deque<Map<String, Object>> pendingEvents = new ArrayDeque<>();
     /** Console messages + uncaught exceptions since the last open()/html(). Bounded. */
@@ -328,12 +336,27 @@ public final class BrewShot implements AutoCloseable {
 
     private BrewShot(Process chrome, Path profileDir, WebSocket ws,
                      LinkedBlockingQueue<String> inbox) {
+        this(chrome, profileDir, ws, inbox, DEFAULT_CLOSE_TIMEOUT_MS);
+    }
+
+    /** Package-private timeout seam for pure transport tests (no Chrome process). */
+    BrewShot(Process chrome, Path profileDir, WebSocket ws,
+             LinkedBlockingQueue<String> inbox, long closeTimeoutMs) {
         this.chrome = chrome;
         this.profileDir = profileDir;
         this.ws = ws;
         this.inbox = inbox;
+        this.closeTimeoutMs = Math.max(1, closeTimeoutMs);
         LIVE.add(this); // deregistered in close(); force-cleaned by the shutdown hook otherwise
     }
+
+    @FunctionalInterface
+    interface WebSocketConnector {
+        CompletableFuture<WebSocket> connect(URI uri, WebSocket.Listener listener);
+    }
+
+    private static final WebSocketConnector HTTP_CONNECTOR =
+        (uri, listener) -> HTTP.newWebSocketBuilder().buildAsync(uri, listener);
 
     /** Launch with a sensible default viewport (1280x900). */
     public static BrewShot launch() throws IOException {
@@ -378,15 +401,31 @@ public final class BrewShot implements AutoCloseable {
             .redirectOutput(ProcessBuilder.Redirect.DISCARD)
             .start();
 
-        // Everything after the process starts must clean up on failure, or a
-        // headless Chrome + temp profile leaks per failed launch.
+        String wsUrl;
         try {
-            String wsUrl = awaitDevtoolsUrl(p);
-            LinkedBlockingQueue<String> inbox = new LinkedBlockingQueue<>();
-            WebSocket socket = HTTP.newWebSocketBuilder()
-                .buildAsync(URI.create(wsUrl), new Accumulator(inbox))
-                .join();
-            BrewShot c = new BrewShot(p, profile, socket, inbox);
+            wsUrl = awaitDevtoolsUrl(p);
+        } catch (RuntimeException | IOException | Error e) {
+            terminateProcess(p, profile, false);
+            throw e;
+        }
+        return finishLaunch(p, profile, wsUrl, HTTP_CONNECTOR, envTimeoutMs());
+    }
+
+    /**
+     * Complete the post-process-start half of launch. The connector seam keeps
+     * the never-completing-connect discriminator pure: no Chrome is launched.
+     */
+    static BrewShot finishLaunch(Process p, Path profile, String wsUrl,
+                                 WebSocketConnector connector, long connectTimeoutMs)
+            throws IOException {
+        LinkedBlockingQueue<String> inbox = new LinkedBlockingQueue<>();
+        WebSocket socket = null;
+        BrewShot c = null;
+        try {
+            CompletableFuture<WebSocket> connecting =
+                connector.connect(URI.create(wsUrl), new Accumulator(inbox));
+            socket = awaitConnection(connecting, connectTimeoutMs);
+            c = new BrewShot(p, profile, socket, inbox);
             // Browser-scope bootstrap (sessionId == null): open a tab, attach flat.
             Map<String, Object> created =
                 c.command("Target.createTarget", "{\"url\":\"about:blank\"}");
@@ -399,10 +438,41 @@ public final class BrewShot implements AutoCloseable {
             c.command("Network.enable", "{}"); // in-flight tracking for waitForNetworkIdle
             return c;
         } catch (RuntimeException | IOException | Error e) {
-            p.destroyForcibly();
-            deleteRecursively(profile);
+            if (c != null) { LIVE.remove(c); }
+            abort(socket);
+            terminateProcess(p, profile, false);
             throw e;
         }
+    }
+
+    static WebSocket awaitConnection(CompletableFuture<WebSocket> connecting,
+                                     long timeoutMs) throws IOException {
+        Deadline deadline = Deadline.afterMillis(timeoutMs);
+        try {
+            return await(connecting, deadline);
+        } catch (TimeoutException e) {
+            cancelConnection(connecting);
+            throw new IOException("DevTools WebSocket connect timed out after "
+                + timeoutMs + "ms", e);
+        } catch (InterruptedException e) {
+            cancelConnection(connecting);
+            Thread.currentThread().interrupt();
+            throw new IOException("interrupted connecting to DevTools WebSocket", e);
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause() != null ? e.getCause() : e;
+            throw new IOException("could not connect to DevTools WebSocket: "
+                + cause.getMessage(), cause);
+        } catch (CancellationException e) {
+            throw new IOException("DevTools WebSocket connect was cancelled", e);
+        }
+    }
+
+    private static void cancelConnection(CompletableFuture<WebSocket> connecting) {
+        // If completion wins the timeout/cancel race, abort the otherwise-unowned socket.
+        connecting.whenComplete((socket, failure) -> {
+            if (socket != null) { abort(socket); }
+        });
+        connecting.cancel(true);
     }
 
     /**
@@ -461,11 +531,8 @@ public final class BrewShot implements AutoCloseable {
             msg.append(",\"sessionId\":\"").append(sessionId).append('"');
         }
         msg.append('}');
-        try {
-            ws.sendText(msg, true).join();
-        } catch (java.util.concurrent.CompletionException e) {
-            throw new IllegalStateException(chromeDeathReason("sending " + method), e);
-        }
+        Deadline deadline = Deadline.afterMillis(commandTimeoutMs);
+        sendWithinDeadline(msg, method, deadline);
     }
 
     /** Send one CDP command and block for its id-matched result. */
@@ -480,13 +547,12 @@ public final class BrewShot implements AutoCloseable {
             msg.append(",\"sessionId\":\"").append(sessionId).append('"');
         }
         msg.append('}');
-        try {
-            ws.sendText(msg, true).join();
-        } catch (java.util.concurrent.CompletionException e) {
-            throw new IllegalStateException(chromeDeathReason("sending " + method), e);
-        }
+        // One budget for the complete round-trip. Starting it before send is
+        // load-bearing: a backpressured WebSocket send must spend the same
+        // commandTimeout budget as the response it is waiting to produce.
+        Deadline deadline = Deadline.afterMillis(commandTimeoutMs);
+        sendWithinDeadline(msg, method, deadline);
 
-        long deadline = System.currentTimeMillis() + commandTimeoutMs;
         while (true) {
             Map<String, Object> m = nextMessage(deadline, method);
             Object mid = m.get("id");
@@ -498,6 +564,78 @@ public final class BrewShot implements AutoCloseable {
             }
             routeEvent(m);
         }
+    }
+
+    private void sendWithinDeadline(CharSequence message, String method, Deadline deadline) {
+        CompletableFuture<WebSocket> sending;
+        try {
+            sending = ws.sendText(message, true);
+            await(sending, deadline);
+        } catch (TimeoutException e) {
+            // A timed-out send leaves ordering unknowable. Cancel the operation
+            // and abort the transport rather than letting a late write leak into
+            // a later command.
+            throw commandSendTimeout(method, e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            abort(ws);
+            throw new IllegalStateException("interrupted sending " + method, e);
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause() != null ? e.getCause() : e;
+            throw new IllegalStateException(chromeDeathReason("sending " + method), cause);
+        } catch (RuntimeException e) {
+            throw new IllegalStateException(chromeDeathReason("sending " + method), e);
+        }
+    }
+
+    private IllegalStateException commandSendTimeout(String method, TimeoutException cause) {
+        // sendText() futures are cancellable; abort is the deterministic fallback
+        // for implementations whose cancellation cannot retract an in-flight frame.
+        abort(ws);
+        return new IllegalStateException("CDP timeout sending " + method, cause);
+    }
+
+    private static <T> T await(CompletableFuture<T> future, Deadline deadline)
+            throws InterruptedException, ExecutionException, TimeoutException {
+        long remaining = deadline.remainingNanos();
+        if (remaining <= 0) {
+            future.cancel(true);
+            throw new TimeoutException();
+        }
+        try {
+            return future.get(remaining, TimeUnit.NANOSECONDS);
+        } catch (TimeoutException | InterruptedException e) {
+            future.cancel(true);
+            throw e;
+        }
+    }
+
+    /**
+     * A monotonic elapsed-time budget. It stores start + duration separately,
+     * instead of adding an absolute nano deadline, so Long.MAX_VALUE millisecond
+     * overrides saturate safely rather than wrapping into an immediate timeout.
+     */
+    private static final class Deadline {
+        private final long startedNanos;
+        private final long budgetNanos;
+
+        private Deadline(long budgetNanos) {
+            this.startedNanos = System.nanoTime();
+            this.budgetNanos = budgetNanos;
+        }
+
+        static Deadline afterMillis(long timeoutMs) {
+            long nanos = timeoutMs <= 0 ? 0 : TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+            return new Deadline(nanos);
+        }
+
+        long remainingNanos() {
+            long elapsed = System.nanoTime() - startedNanos;
+            if (elapsed <= 0) { return budgetNanos; }
+            return elapsed >= budgetNanos ? 0 : budgetNanos - elapsed;
+        }
+
+        boolean expired() { return remainingNanos() <= 0; }
     }
 
     /** Block until a given CDP event (e.g. Page.loadEventFired) is seen. */
@@ -579,11 +717,21 @@ public final class BrewShot implements AutoCloseable {
         else if (log.size() == CONSOLE_CAP) { log.add("... (capped at " + CONSOLE_CAP + ")"); }
     }
 
-    @SuppressWarnings("unchecked")
+    private Map<String, Object> nextMessage(Deadline deadline, String waitingFor) {
+        return nextMessageNanos(deadline.remainingNanos(), waitingFor);
+    }
+
     private Map<String, Object> nextMessage(long deadlineMillis, String waitingFor) {
+        long waitMillis = deadlineMillis - System.currentTimeMillis();
+        long waitNanos = waitMillis > 0 ? TimeUnit.MILLISECONDS.toNanos(waitMillis) : 0;
+        return nextMessageNanos(waitNanos, waitingFor);
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> nextMessageNanos(long waitNanos, String waitingFor) {
         try {
-            long wait = deadlineMillis - System.currentTimeMillis();
-            String raw = wait > 0 ? inbox.poll(wait, TimeUnit.MILLISECONDS) : null;
+            String raw = waitNanos > 0
+                ? inbox.poll(waitNanos, TimeUnit.NANOSECONDS) : null;
             if (raw == null) {
                 // Distinguish a dead Chrome from a merely slow page.
                 if (!chrome.isAlive()) {
@@ -864,9 +1012,10 @@ public final class BrewShot implements AutoCloseable {
     }
 
     /**
-     * Set the per-CDP-call wait budget (ms) — how long any single DevTools command may take
-     * before it is treated as a timeout. Also settable via {@code BREWSHOT_COMMAND_TIMEOUT_MS},
-     * falling back to {@code BREWSHOT_TIMEOUT_MS} and then the 15s default.
+     * Set the per-CDP-call wait budget (ms) — how long the outbound WebSocket send plus its
+     * matching DevTools response may take before they are treated as a timeout. Also settable
+     * via {@code BREWSHOT_COMMAND_TIMEOUT_MS}, falling back to {@code BREWSHOT_TIMEOUT_MS}
+     * and then the 15s default.
      *
      * <p>Distinct from {@link #navTimeout}: that governs how long a PAGE may take to load,
      * this governs how long one CDP round-trip may take. A full-page screenshot of a tall
@@ -1607,17 +1756,107 @@ public final class BrewShot implements AutoCloseable {
 
     @Override
     public void close() {
+        if (!closed.compareAndSet(false, true)) { return; }
         LIVE.remove(this); // graceful close owns the teardown now; the hook needn't touch it
-        try { ws.sendClose(WebSocket.NORMAL_CLOSURE, "done").join(); }
-        catch (Exception ignored) { /* already closing */ }
-        chrome.destroy();
         try {
-            if (!chrome.waitFor(3, TimeUnit.SECONDS)) { chrome.destroyForcibly(); }
+            closeWebSocket();
+        } finally {
+            terminateProcess(chrome, profileDir, true);
+        }
+    }
+
+    private void closeWebSocket() {
+        Deadline deadline = Deadline.afterMillis(closeTimeoutMs);
+        CompletableFuture<WebSocket> closing;
+        try {
+            closing = ws.sendClose(WebSocket.NORMAL_CLOSURE, "done");
+            await(closing, deadline);
+        } catch (TimeoutException e) {
+            abort(ws);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            chrome.destroyForcibly();
+            abort(ws);
+        } catch (ExecutionException | RuntimeException e) {
+            // Already closing, peer disappeared, or the implementation rejected
+            // close. abort() is idempotent and guarantees no transport remains.
+            abort(ws);
         }
-        deleteRecursively(profileDir);
+    }
+
+    private static void abort(WebSocket socket) {
+        if (socket == null) { return; }
+        try { socket.abort(); }
+        catch (RuntimeException ignored) { /* best-effort transport teardown */ }
+    }
+
+    /**
+     * Bounded process teardown shared by launch failure and close. Waiting is
+     * uninterruptible only inside the fixed cleanup budget; the caller's
+     * interrupt status is restored before return.
+     */
+    private static void terminateProcess(Process process, Path profileDir,
+                                         boolean gracefulFirst) {
+        boolean[] interrupted = { Thread.interrupted() };
+        try {
+            boolean exited;
+            if (gracefulFirst) {
+                try { process.destroy(); }
+                catch (RuntimeException ignored) { }
+                exited = !isAlive(process)
+                    || waitForProcess(process, PROCESS_CLOSE_TIMEOUT_MS, interrupted);
+            } else {
+                destroyForcibly(process);
+                exited = !isAlive(process)
+                    || waitForProcess(process, PROCESS_FORCE_REAP_TIMEOUT_MS, interrupted);
+            }
+
+            if (!exited && isAlive(process)) {
+                destroyForcibly(process);
+                waitForProcess(process, PROCESS_FORCE_REAP_TIMEOUT_MS, interrupted);
+            }
+        } finally {
+            try {
+                deleteRecursively(profileDir);
+                if (Files.exists(profileDir)) {
+                    deleteRecursively(profileDir);
+                }
+            } finally {
+                if (interrupted[0]) { Thread.currentThread().interrupt(); }
+            }
+        }
+    }
+
+    private static boolean waitForProcess(Process process, long timeoutMs,
+                                          boolean[] interrupted) {
+        Deadline deadline = Deadline.afterMillis(timeoutMs);
+        while (!deadline.expired()) {
+            try {
+                return process.waitFor(deadline.remainingNanos(), TimeUnit.NANOSECONDS);
+            } catch (InterruptedException e) {
+                interrupted[0] = true;
+                // InterruptedException clears the flag. Continue only inside
+                // this fixed cleanup deadline, then restore it in the caller.
+            } catch (RuntimeException e) {
+                return !isAlive(process);
+            }
+        }
+        return !isAlive(process);
+    }
+
+    private static boolean isAlive(Process process) {
+        try { return process.isAlive(); }
+        catch (RuntimeException ignored) { return true; }
+    }
+
+    private static void destroyForcibly(Process process) {
+        try (var descendants = process.toHandle().descendants()) {
+            descendants.forEach(handle -> {
+                try { handle.destroyForcibly(); }
+                catch (RuntimeException ignored) { }
+            });
+        } catch (RuntimeException ignored) { }
+        try { process.destroyForcibly(); }
+        catch (RuntimeException ignored) { }
     }
 
     private static void deleteRecursively(Path dir) {
