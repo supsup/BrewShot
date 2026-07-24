@@ -44,6 +44,10 @@ tasks.jar {
 
 tasks.test {
     useJUnitPlatform()
+    // ImageIO/AWT tests must never initialize the macOS AppKit UI process.
+    // Keep the test JVM explicit and deterministic on both desktop and CI hosts.
+    systemProperty("java.awt.headless", "true")
+
     // Browser tests loud-skip when no local Chrome exists; keep CI honest.
     // A red CI that doesn't show WHY is only half-honest — surface full
     // exceptions (expected-vs-actual) so a failure names its own cause.
