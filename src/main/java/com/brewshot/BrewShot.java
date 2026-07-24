@@ -8,6 +8,7 @@ import java.net.http.WebSocket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.SimpleFileVisitor;
 import java.nio.file.attribute.BasicFileAttributes;
@@ -382,10 +383,17 @@ public final class BrewShot implements AutoCloseable {
         boolean releaseSafe();
     }
 
+    @FunctionalInterface
+    interface ProfileAbsenceProbe {
+        boolean absent(Path profileDir);
+    }
+
     private static final ProcessTreeReleaseProof UNPROVEN_PROCESS_TREE_RELEASE =
         () -> false;
     private static final ProcessTreeReleaseProof PROVEN_PROCESS_TREE_RELEASE_FOR_TESTS =
         () -> true;
+    private static final ProfileAbsenceProbe REAL_PROFILE_ABSENCE_PROBE =
+        BrewShot::profileAbsent;
 
     /**
      * JVM-lifetime ownership of the process/profile pair. Cleanup passes
@@ -401,17 +409,20 @@ public final class BrewShot implements AutoCloseable {
         private final Path profileDir;
         private final ProfileDeleter profileDeleter;
         private final ProcessTreeReleaseProof processTreeReleaseProof;
+        private final ProfileAbsenceProbe profileAbsenceProbe;
         private ProcessHandle parentHandle;
         private final List<ProcessHandle> descendantHandles = new ArrayList<>();
         private Owner owner = Owner.LAUNCH;
 
         private ResourceLease(Process process, Path profileDir,
                               ProfileDeleter profileDeleter,
-                              ProcessTreeReleaseProof processTreeReleaseProof) {
+                              ProcessTreeReleaseProof processTreeReleaseProof,
+                              ProfileAbsenceProbe profileAbsenceProbe) {
             this.process = process;
             this.profileDir = profileDir;
             this.profileDeleter = profileDeleter;
             this.processTreeReleaseProof = processTreeReleaseProof;
+            this.profileAbsenceProbe = profileAbsenceProbe;
             refreshProcessTreeSnapshot();
         }
 
@@ -457,7 +468,7 @@ public final class BrewShot implements AutoCloseable {
                 }
             }
 
-            if (releaseProven && !profileExists(profileDir)) {
+            if (releaseProven && profileAbsenceProven()) {
                 owner = Owner.RELEASED;
                 deregister(this);
             }
@@ -476,6 +487,14 @@ public final class BrewShot implements AutoCloseable {
             try { return processTreeReleaseProof.releaseSafe(); }
             catch (RuntimeException ignored) {
                 // A failed proof is no proof. Retain the profile and lease.
+                return false;
+            }
+        }
+
+        private boolean profileAbsenceProven() {
+            try { return profileAbsenceProbe.absent(profileDir); }
+            catch (RuntimeException ignored) {
+                // An indeterminate pathname result is no proof of absence.
                 return false;
             }
         }
@@ -540,7 +559,7 @@ public final class BrewShot implements AutoCloseable {
                 ResourceLease lease =
                     new ResourceLease(
                         process, profileDir, profileDeleter,
-                        processTreeReleaseProof);
+                        processTreeReleaseProof, REAL_PROFILE_ABSENCE_PROBE);
                 admitted = lease;
                 try {
                     afterStartBeforeRegistration.run();
@@ -605,8 +624,19 @@ public final class BrewShot implements AutoCloseable {
             Process process, Path profileDir,
             ProfileDeleter profileDeleter,
             ProcessTreeReleaseProof processTreeReleaseProof) {
+        return registerLaunchLease(
+            process, profileDir, profileDeleter, processTreeReleaseProof,
+            REAL_PROFILE_ABSENCE_PROBE);
+    }
+
+    private static ResourceLease registerLaunchLease(
+            Process process, Path profileDir,
+            ProfileDeleter profileDeleter,
+            ProcessTreeReleaseProof processTreeReleaseProof,
+            ProfileAbsenceProbe profileAbsenceProbe) {
         ResourceLease lease = new ResourceLease(
-            process, profileDir, profileDeleter, processTreeReleaseProof);
+            process, profileDir, profileDeleter, processTreeReleaseProof,
+            profileAbsenceProbe);
         boolean cleanupImmediately;
         synchronized (OWNERSHIP_LOCK) {
             LIVE.add(lease);
@@ -636,6 +666,15 @@ public final class BrewShot implements AutoCloseable {
             ProcessTreeReleaseProof processTreeReleaseProof) {
         return registerLaunchLease(
             process, profileDir, profileDeleter, processTreeReleaseProof);
+    }
+
+    static ResourceLease registerContainedLaunchLeaseWithProfileAbsenceProbeForTests(
+            Process process, Path profileDir,
+            ProfileDeleter profileDeleter,
+            ProfileAbsenceProbe profileAbsenceProbe) {
+        return registerLaunchLease(
+            process, profileDir, profileDeleter,
+            PROVEN_PROCESS_TREE_RELEASE_FOR_TESTS, profileAbsenceProbe);
     }
 
     static ResourceLease registerLaunchLease(Process process, Path profileDir) {
@@ -2280,9 +2319,9 @@ public final class BrewShot implements AutoCloseable {
         return true;
     }
 
-    private static boolean profileExists(Path profileDir) {
-        try { return Files.exists(profileDir); }
-        catch (RuntimeException ignored) { return true; }
+    private static boolean profileAbsent(Path profileDir) {
+        try { return Files.notExists(profileDir, LinkOption.NOFOLLOW_LINKS); }
+        catch (RuntimeException ignored) { return false; }
     }
 
     private static void deleteRecursively(Path dir) {

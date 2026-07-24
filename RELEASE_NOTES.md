@@ -29,10 +29,13 @@ the end of the macOS crash-dialog spam.
   did not reparent after the final snapshot, however, so the zero-dependency launcher
   now conservatively retains the temp profile and its in-memory lease unless an
   external process-tree containment owner proves membership closed and fully reaped.
-  The lease remains retryable only while that JVM lives; JVM exit reclaims the registry
-  but deliberately leaves an unproven profile on disk. This corrects the older
-  “no leaked temp dirs”
-  overclaim. One JVM-hook reconciliation loop shares a five-second
+  Even then, deregistration requires `Files.notExists(..., NOFOLLOW_LINKS)` to
+  positively establish that no entry remains at the profile pathname; provider
+  uncertainty, probe failure, or a dangling symlink keeps the lease live and
+  retryable. The lease remains retryable only while that JVM lives; JVM exit
+  reclaims the registry but deliberately leaves an unproven profile on disk. This
+  corrects the older “no leaked temp dirs” overclaim. One JVM-hook reconciliation
+  loop shares a five-second
   process-wait/retry-admission budget; synchronous profile deletion and waiting for an
   already-admitted OS start remain outside it.
 - **`--gif N` records a looping GIF from the CLI** (plan 6cc2d9ec, roadmap B4): the

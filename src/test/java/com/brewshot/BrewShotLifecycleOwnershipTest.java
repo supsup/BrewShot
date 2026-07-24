@@ -17,6 +17,7 @@ import java.net.http.WebSocket;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
@@ -737,6 +738,100 @@ class BrewShotLifecycleOwnershipTest {
 
         // Controlled fake has no unobserved child; the outer test owns cleanup.
         deleteProfile(profile);
+    }
+
+    @Test
+    void indeterminateProfileAbsenceProbeRetainsLeaseAndLiveRegistration(
+            @TempDir Path temp) throws Exception {
+        FakeProcess process = new FakeProcess(1);
+        Path profile = profile(temp, "indeterminate-absence");
+        AtomicBoolean absenceProven = new AtomicBoolean();
+        BrewShot.ResourceLease lease =
+            BrewShot.registerContainedLaunchLeaseWithProfileAbsenceProbeForTests(
+                process, profile, BrewShotLifecycleOwnershipTest::deleteProfile,
+                ignored -> absenceProven.get());
+
+        lease.cleanup(false);
+
+        assertFalse(Files.exists(profile),
+            "the deleter removed the profile, matching Files.exists == false");
+        assertTrue(lease.isOwned(),
+            "an indeterminate false absence probe must retain lease ownership");
+        assertTrue(BrewShot.ownsResources(process, profile),
+            "an indeterminate false absence probe must retain LIVE registration");
+
+        absenceProven.set(true);
+        lease.cleanup(false);
+        assertFalse(lease.isOwned());
+        assertFalse(BrewShot.ownsResources(process, profile));
+    }
+
+    @Test
+    void throwingProfileAbsenceProbeRetainsLeaseAndLiveRegistration(
+            @TempDir Path temp) throws Exception {
+        FakeProcess process = new FakeProcess(1);
+        Path profile = profile(temp, "throwing-absence");
+        AtomicBoolean probeFails = new AtomicBoolean(true);
+        BrewShot.ResourceLease lease =
+            BrewShot.registerContainedLaunchLeaseWithProfileAbsenceProbeForTests(
+                process, profile, BrewShotLifecycleOwnershipTest::deleteProfile,
+                path -> {
+                    if (probeFails.get()) {
+                        throw new IllegalStateException(
+                            "injected filesystem-provider uncertainty");
+                    }
+                    return Files.notExists(path, LinkOption.NOFOLLOW_LINKS);
+                });
+
+        lease.cleanup(false);
+
+        assertFalse(Files.exists(profile));
+        assertTrue(lease.isOwned(),
+            "a probe exception must retain lease ownership");
+        assertTrue(BrewShot.ownsResources(process, profile),
+            "a probe exception must retain LIVE registration");
+
+        probeFails.set(false);
+        lease.cleanup(false);
+        assertFalse(lease.isOwned());
+        assertFalse(BrewShot.ownsResources(process, profile));
+    }
+
+    @Test
+    void danglingProfileSymlinkIsAPathEntryAndCannotReleaseLease(
+            @TempDir Path temp) throws Exception {
+        FakeProcess process = new FakeProcess(1);
+        Path profile = profile(temp, "dangling-link");
+        Path missingTarget = temp.resolve("missing-profile-target");
+        AtomicInteger deleteCalls = new AtomicInteger();
+        BrewShot.ResourceLease lease = BrewShot.registerContainedLaunchLeaseForTests(
+            process, profile, path -> {
+                deleteProfile(path);
+                if (deleteCalls.incrementAndGet() == 1) {
+                    try {
+                        Files.createSymbolicLink(path, missingTarget);
+                    } catch (IOException | UnsupportedOperationException e) {
+                        throw new IllegalStateException(
+                            "could not create dangling-symlink discriminator", e);
+                    }
+                }
+            });
+
+        lease.cleanup(false);
+
+        assertTrue(Files.isSymbolicLink(profile));
+        assertFalse(Files.exists(profile),
+            "the old follow-link existence query reports a dangling link absent");
+        assertFalse(Files.notExists(profile, LinkOption.NOFOLLOW_LINKS),
+            "NOFOLLOW sees the surviving pathname entry and must block release");
+        assertTrue(lease.isOwned());
+        assertTrue(BrewShot.ownsResources(process, profile));
+
+        lease.cleanup(false);
+        assertFalse(Files.exists(profile, LinkOption.NOFOLLOW_LINKS));
+        assertFalse(lease.isOwned());
+        assertFalse(BrewShot.ownsResources(process, profile));
+        assertEquals(2, deleteCalls.get());
     }
 
     @Test
