@@ -60,6 +60,9 @@ public final class BrewShot implements AutoCloseable {
     private static final long DEFAULT_CLOSE_TIMEOUT_MS = 1_000;
     private static final long PROCESS_CLOSE_TIMEOUT_MS = 3_000;
     private static final long PROCESS_FORCE_REAP_TIMEOUT_MS = 2_000;
+    private static final long SHUTDOWN_CLEANUP_TIMEOUT_MS = 5_000;
+    private static final long SHUTDOWN_ATTEMPT_TIMEOUT_MS = 500;
+    private static final int SHUTDOWN_CLEANUP_MAX_PASSES = 3;
     private static final int CONSOLE_CAP = 1_000;
     /** Poison message the listener enqueues on close/error so a blocked caller fails fast. */
     private static final String SOCKET_CLOSED = "{\"brewshotSocketClosed\":true}";
@@ -67,12 +70,12 @@ public final class BrewShot implements AutoCloseable {
     /** One shared client for all launches — no selector-thread accumulation per launch. */
     private static final HttpClient HTTP = HttpClient.newHttpClient();
 
-    // Process/profile ownership begins immediately after ProcessBuilder.start(), before
-    // stderr discovery or WebSocket connect. The SAME lease remains registered through
-    // bootstrap and close, so shutdown can always find resources; successful cleanup is
-    // the only operation allowed to deregister it. The lock closes the last registration
-    // race with JVM shutdown: a lease registered after shutdown's snapshot sees
-    // shutdownStarted and force-cleans itself.
+    // Launch admission, ProcessBuilder.start(), the first live process-tree snapshot, and
+    // lease registration share one monitor. Once shutdown closes admission and snapshots
+    // LIVE under that monitor, it is impossible for an already-admitted process to appear
+    // after the hook finishes. The SAME lease remains registered through discovery,
+    // bootstrap, and close; successful process-tree reap + profile deletion is the only
+    // operation allowed to deregister it.
     private static final Object OWNERSHIP_LOCK = new Object();
     private static final Set<ResourceLease> LIVE =
         java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<>());
@@ -359,6 +362,11 @@ public final class BrewShot implements AutoCloseable {
         void delete(Path profileDir);
     }
 
+    @FunctionalInterface
+    interface ProcessStarter {
+        Process start() throws IOException;
+    }
+
     /**
      * Durable ownership of the process/profile pair. Cleanup passes serialize,
      * but failed passes do not release ownership: a later close or shutdown pass
@@ -371,6 +379,9 @@ public final class BrewShot implements AutoCloseable {
         private final Process process;
         private final Path profileDir;
         private final ProfileDeleter profileDeleter;
+        private ProcessHandle parentHandle;
+        private final List<ProcessHandle> descendantHandles = new ArrayList<>();
+        private boolean hasLiveParentSnapshot;
         private Owner owner = Owner.LAUNCH;
 
         private ResourceLease(Process process, Path profileDir,
@@ -378,9 +389,11 @@ public final class BrewShot implements AutoCloseable {
             this.process = process;
             this.profileDir = profileDir;
             this.profileDeleter = profileDeleter;
+            refreshProcessTreeSnapshot();
         }
 
         synchronized void transferToClient() {
+            refreshProcessTreeSnapshot();
             if (owner != Owner.LAUNCH || !isRegistered(this) || !isAlive(process)) {
                 throw new IllegalStateException(
                     "Chrome resources were cleaned up while launch was in progress");
@@ -389,6 +402,7 @@ public final class BrewShot implements AutoCloseable {
         }
 
         synchronized void requireOwned() {
+            refreshProcessTreeSnapshot();
             if (owner == Owner.RELEASED || !isRegistered(this) || !isAlive(process)) {
                 throw new IllegalStateException(
                     "Chrome resources were cleaned up while launch was in progress");
@@ -396,27 +410,130 @@ public final class BrewShot implements AutoCloseable {
         }
 
         synchronized void cleanup(boolean gracefulFirst) {
-            if (owner == Owner.RELEASED) { return; }
+            long timeoutMs = gracefulFirst
+                ? PROCESS_CLOSE_TIMEOUT_MS + PROCESS_FORCE_REAP_TIMEOUT_MS
+                : PROCESS_FORCE_REAP_TIMEOUT_MS;
+            cleanup(gracefulFirst, Deadline.afterMillis(timeoutMs));
+        }
 
-            boolean processReaped = terminateProcess(process, gracefulFirst);
-            if (processReaped) {
+        synchronized boolean cleanup(boolean gracefulFirst, Deadline deadline) {
+            if (owner == Owner.RELEASED) { return true; }
+
+            // Refresh while the parent is still alive and before any controlled
+            // signal. Retained handles survive parent exit/reparenting.
+            refreshProcessTreeSnapshot();
+            boolean processTreeReaped = terminateProcess(
+                process, parentHandle, List.copyOf(descendantHandles),
+                hasLiveParentSnapshot, gracefulFirst, deadline);
+            if (processTreeReaped) {
                 try { profileDeleter.delete(profileDir); }
                 catch (RuntimeException ignored) {
                     // Ownership remains registered; a later close/hook retries.
                 }
             }
 
-            if (!isAlive(process) && !profileExists(profileDir)) {
+            if (processTreeReaped && !profileExists(profileDir)) {
                 owner = Owner.RELEASED;
                 deregister(this);
             }
+            return owner == Owner.RELEASED;
         }
 
         synchronized boolean isOwned() {
             return owner != Owner.RELEASED && isRegistered(this);
         }
+
+        synchronized void refreshOwnershipCheckpoint() {
+            if (owner != Owner.RELEASED) { refreshProcessTreeSnapshot(); }
+        }
+
+        /**
+         * Capture only becomes authoritative when the parent is observed alive
+         * both before and after enumeration. An empty enumeration obtained only
+         * after parent death must never authorize profile release.
+         */
+        private void refreshProcessTreeSnapshot() {
+            boolean aliveBefore = isAlive(process);
+            ProcessHandle observedParent = null;
+            List<ProcessHandle> observedDescendants = List.of();
+            boolean enumerationComplete = false;
+            try {
+                observedParent = process.toHandle();
+                try (var descendants = observedParent.descendants()) {
+                    observedDescendants = descendants.toList();
+                }
+                enumerationComplete = true;
+            } catch (RuntimeException ignored) {
+                // Without a complete live-parent snapshot, cleanup remains owned.
+            }
+
+            if (observedParent != null) {
+                if (parentHandle == null) { parentHandle = observedParent; }
+                for (ProcessHandle handle : observedDescendants) {
+                    if (!handle.equals(parentHandle)
+                            && !descendantHandles.contains(handle)) {
+                        descendantHandles.add(handle);
+                    }
+                }
+            }
+            if (aliveBefore && enumerationComplete && isAlive(process)) {
+                hasLiveParentSnapshot = true;
+            }
+        }
     }
 
+    /**
+     * Admit and register a newly started process atomically with respect to JVM
+     * shutdown. The callback is a deterministic test seam for the otherwise
+     * instruction-sized start-return/registration interval.
+     */
+    static ResourceLease startOwnedProcess(Path profileDir, ProcessStarter starter,
+                                           ProfileDeleter profileDeleter,
+                                           Runnable afterStartBeforeRegistration)
+            throws IOException {
+        ResourceLease admitted = null;
+        try {
+            synchronized (OWNERSHIP_LOCK) {
+                if (shutdownStarted) {
+                    throw new IllegalStateException(
+                        "cannot launch Chrome after JVM shutdown has started");
+                }
+                Process process = starter.start();
+                ResourceLease lease =
+                    new ResourceLease(process, profileDir, profileDeleter);
+                admitted = lease;
+                try {
+                    afterStartBeforeRegistration.run();
+                } finally {
+                    LIVE.add(lease);
+                }
+                return lease;
+            }
+        } catch (IOException | RuntimeException | Error e) {
+            if (admitted != null) {
+                // A post-start failure already has a durable lease. Its cleanup
+                // alone owns profile deletion; if reap fails, ownership and the
+                // profile must remain intact for a later pass.
+                admitted.cleanup(false);
+            } else {
+                // Shutdown rejection or starter failure created no process
+                // reference, so no lease exists to own the unstarted profile.
+                try { profileDeleter.delete(profileDir); }
+                catch (RuntimeException ignored) { }
+            }
+            throw e;
+        }
+    }
+
+    static ResourceLease startLaunchProcess(Path profileDir, ProcessStarter starter,
+                                            Runnable afterStartBeforeRegistration)
+            throws IOException {
+        return startOwnedProcess(
+            profileDir, starter, BrewShot::deleteRecursively,
+            afterStartBeforeRegistration);
+    }
+
+    /** Attach an already-started process; production launch uses the admission fence above. */
     static ResourceLease registerLaunchLease(Process process, Path profileDir,
                                              ProfileDeleter profileDeleter) {
         ResourceLease lease = new ResourceLease(process, profileDir, profileDeleter);
@@ -446,18 +563,48 @@ public final class BrewShot implements AutoCloseable {
     }
 
     private static void cleanupOwnedResources(boolean beginJvmShutdown) {
-        List<ResourceLease> snapshot;
+        List<ResourceLease> initialSnapshot;
         synchronized (OWNERSHIP_LOCK) {
             if (beginJvmShutdown) { shutdownStarted = true; }
-            snapshot = List.copyOf(LIVE);
+            initialSnapshot = List.copyOf(LIVE);
         }
-        for (ResourceLease lease : snapshot) {
-            lease.cleanup(false);
+        // Admission-lock wait is deliberately outside this budget: an admitted
+        // ProcessBuilder.start must return and register before shutdown may
+        // finish. Once that fence is acquired, all process waits and retry
+        // admission share this one deadline.
+        Deadline deadline = Deadline.afterMillis(SHUTDOWN_CLEANUP_TIMEOUT_MS);
+
+        // Synchronous filesystem deletion is not an interruptible Java
+        // operation and is not falsely claimed to be covered by the wait bound.
+        int maxPasses = beginJvmShutdown ? SHUTDOWN_CLEANUP_MAX_PASSES : 1;
+        for (int pass = 0; pass < maxPasses && !deadline.expired(); pass++) {
+            List<ResourceLease> snapshot = initialSnapshot;
+            if (pass > 0) {
+                synchronized (OWNERSHIP_LOCK) {
+                    snapshot = List.copyOf(LIVE);
+                }
+            }
+            if (snapshot.isEmpty()) { return; }
+            for (ResourceLease lease : snapshot) {
+                if (deadline.expired()) { return; }
+                lease.cleanup(false,
+                    deadline.cappedAtMillis(SHUTDOWN_ATTEMPT_TIMEOUT_MS));
+            }
         }
     }
 
     static void runShutdownCleanupForTests() {
         cleanupOwnedResources(false);
+    }
+
+    static void runJvmShutdownCleanupForTests() {
+        try {
+            cleanupOwnedResources(true);
+        } finally {
+            synchronized (OWNERSHIP_LOCK) {
+                shutdownStarted = false;
+            }
+        }
     }
 
     static boolean ownsResources(Process process, Path profileDir) {
@@ -508,26 +655,20 @@ public final class BrewShot implements AutoCloseable {
             args.addAll(List.of(extra.trim().split("\\s+")));
         }
         args.add("about:blank");
-        Process p;
-        try {
-            p = new ProcessBuilder(args)
+        ResourceLease lease = startLaunchProcess(
+            profile,
+            () -> new ProcessBuilder(args)
                 // stdout is never read — discard it so a chatty binary can't
                 // deadlock on a full 64KB pipe.
                 .redirectOutput(ProcessBuilder.Redirect.DISCARD)
-                .start();
-        } catch (RuntimeException | IOException | Error e) {
-            deleteRecursively(profile);
-            throw e;
-        }
-        // This is deliberately the first operation after start(): discovery,
-        // connect, bootstrap, and close all share this one continuously
-        // registered owner.
-        ResourceLease lease =
-            registerLaunchLease(p, profile, BrewShot::deleteRecursively);
+                .start(),
+            () -> { });
+        Process p = lease.process;
 
         String wsUrl;
         try {
             wsUrl = awaitDevtoolsUrl(p);
+            lease.refreshOwnershipCheckpoint();
         } catch (RuntimeException | IOException | Error e) {
             lease.cleanup(false);
             throw e;
@@ -776,6 +917,12 @@ public final class BrewShot implements AutoCloseable {
             long elapsed = System.nanoTime() - startedNanos;
             if (elapsed <= 0) { return budgetNanos; }
             return elapsed >= budgetNanos ? 0 : budgetNanos - elapsed;
+        }
+
+        Deadline cappedAtMillis(long timeoutMs) {
+            long cap = timeoutMs <= 0
+                ? 0 : TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+            return new Deadline(Math.min(remainingNanos(), cap));
         }
 
         boolean expired() { return remainingNanos() <= 0; }
@@ -1934,56 +2081,91 @@ public final class BrewShot implements AutoCloseable {
     }
 
     /**
-     * Bounded process teardown shared by launch failure and close. Waiting is
-     * uninterruptible only inside the fixed cleanup budget; the caller's
-     * interrupt status is restored before return.
+     * Bounded retained-process-tree teardown shared by launch failure, close,
+     * and shutdown. Every captured handle waits inside one caller-supplied
+     * deadline; the caller's interrupt status is restored before return.
      */
-    private static boolean terminateProcess(Process process, boolean gracefulFirst) {
+    private static boolean terminateProcess(
+            Process process, ProcessHandle parentHandle,
+            List<ProcessHandle> descendantHandles,
+            boolean hasLiveParentSnapshot, boolean gracefulFirst,
+            Deadline deadline) {
         boolean[] interrupted = { Thread.interrupted() };
         try {
-            if (!isAlive(process)) {
-                // A reaped Chrome parent can still have live helper processes.
-                // Preserve the shutdown hook's descendants-first sweep before
-                // allowing the profile lease to advance to deletion.
-                destroyDescendantsForcibly(process);
-                return true;
-            }
-
-            if (gracefulFirst) {
+            if (gracefulFirst && isAlive(process) && !deadline.expired()) {
                 try { process.destroy(); }
                 catch (RuntimeException ignored) { }
-                boolean exited = !isAlive(process)
-                    || waitForProcess(process, PROCESS_CLOSE_TIMEOUT_MS, interrupted);
-                if (!exited && isAlive(process)) {
-                    destroyForcibly(process);
-                    waitForProcess(
-                        process, PROCESS_FORCE_REAP_TIMEOUT_MS, interrupted);
-                }
-            } else {
-                destroyForcibly(process);
-                waitForProcess(process, PROCESS_FORCE_REAP_TIMEOUT_MS, interrupted);
+                awaitHandles(
+                    process,
+                    parentHandle == null ? List.of() : List.of(parentHandle),
+                    deadline.cappedAtMillis(PROCESS_CLOSE_TIMEOUT_MS),
+                    interrupted);
             }
-            return !isAlive(process);
+
+            if (!allProcessesDead(process, parentHandle, descendantHandles)
+                    && !deadline.expired()) {
+                // Descendants were captured while the parent was alive. Signal
+                // those retained identities even if the parent has since
+                // exited and descendants() now reports an empty snapshot.
+                for (ProcessHandle handle : descendantHandles) {
+                    if (handleAlive(handle)) {
+                        try { handle.destroyForcibly(); }
+                        catch (RuntimeException ignored) { }
+                    }
+                }
+                if (isAlive(process)) {
+                    try { process.destroyForcibly(); }
+                    catch (RuntimeException ignored) { }
+                } else if (parentHandle != null && handleAlive(parentHandle)) {
+                    try { parentHandle.destroyForcibly(); }
+                    catch (RuntimeException ignored) { }
+                }
+                List<ProcessHandle> tree = new ArrayList<>(descendantHandles);
+                if (parentHandle != null) { tree.add(parentHandle); }
+                awaitHandles(process, tree, deadline, interrupted);
+            }
+
+            // A dead parent whose descendants were first queried only after
+            // death is not evidence that no orphaned helper survives.
+            return hasLiveParentSnapshot
+                && allProcessesDead(process, parentHandle, descendantHandles);
         } finally {
             if (interrupted[0]) { Thread.currentThread().interrupt(); }
         }
     }
 
-    private static boolean waitForProcess(Process process, long timeoutMs,
-                                          boolean[] interrupted) {
-        Deadline deadline = Deadline.afterMillis(timeoutMs);
+    private static void awaitHandles(Process process, List<ProcessHandle> handles,
+                                     Deadline deadline, boolean[] interrupted) {
+        List<CompletableFuture<?>> exits = new ArrayList<>();
+        for (ProcessHandle handle : handles) {
+            if (!handleAlive(handle)) { continue; }
+            try { exits.add(handle.onExit()); }
+            catch (RuntimeException ignored) { }
+        }
+        if (exits.isEmpty() && isAlive(process)) {
+            try { exits.add(process.onExit()); }
+            catch (RuntimeException ignored) { }
+        }
+        if (exits.isEmpty()) { return; }
+
+        CompletableFuture<Void> all =
+            CompletableFuture.allOf(exits.toArray(CompletableFuture[]::new));
         while (!deadline.expired()) {
             try {
-                return process.waitFor(deadline.remainingNanos(), TimeUnit.NANOSECONDS);
+                all.get(deadline.remainingNanos(), TimeUnit.NANOSECONDS);
+                return;
             } catch (InterruptedException e) {
                 interrupted[0] = true;
                 // InterruptedException clears the flag. Continue only inside
                 // this fixed cleanup deadline, then restore it in the caller.
+            } catch (ExecutionException | CancellationException e) {
+                return;
+            } catch (TimeoutException e) {
+                return;
             } catch (RuntimeException e) {
-                return !isAlive(process);
+                return;
             }
         }
-        return !isAlive(process);
     }
 
     private static boolean isAlive(Process process) {
@@ -1991,24 +2173,25 @@ public final class BrewShot implements AutoCloseable {
         catch (RuntimeException ignored) { return true; }
     }
 
-    private static boolean profileExists(Path profileDir) {
-        try { return Files.exists(profileDir); }
+    private static boolean handleAlive(ProcessHandle handle) {
+        try { return handle.isAlive(); }
         catch (RuntimeException ignored) { return true; }
     }
 
-    private static void destroyForcibly(Process process) {
-        destroyDescendantsForcibly(process);
-        try { process.destroyForcibly(); }
-        catch (RuntimeException ignored) { }
+    private static boolean allProcessesDead(
+            Process process, ProcessHandle parentHandle,
+            List<ProcessHandle> descendantHandles) {
+        if (isAlive(process)) { return false; }
+        if (parentHandle != null && handleAlive(parentHandle)) { return false; }
+        for (ProcessHandle handle : descendantHandles) {
+            if (handleAlive(handle)) { return false; }
+        }
+        return true;
     }
 
-    private static void destroyDescendantsForcibly(Process process) {
-        try (var descendants = process.toHandle().descendants()) {
-            descendants.forEach(handle -> {
-                try { handle.destroyForcibly(); }
-                catch (RuntimeException ignored) { }
-            });
-        } catch (RuntimeException ignored) { }
+    private static boolean profileExists(Path profileDir) {
+        try { return Files.exists(profileDir); }
+        catch (RuntimeException ignored) { return true; }
     }
 
     private static void deleteRecursively(Path dir) {

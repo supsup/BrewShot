@@ -14,6 +14,7 @@ import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -23,6 +24,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
+import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -304,6 +306,7 @@ class BrewShotTransportDeadlineTest {
     private static final class FakeProcess extends Process {
         private final boolean exitsOnDestroy;
         private final AtomicBoolean alive = new AtomicBoolean(true);
+        private final ProcessHandle handle = new FakeHandle(alive);
         private final AtomicInteger destroyCalls = new AtomicInteger();
         private final AtomicInteger destroyForciblyCalls = new AtomicInteger();
 
@@ -353,6 +356,67 @@ class BrewShotTransportDeadlineTest {
         @Override
         public boolean isAlive() {
             return alive.get();
+        }
+
+        @Override
+        public ProcessHandle toHandle() {
+            return handle;
+        }
+    }
+
+    /**
+     * Transport tests are not process-wait tests: an immediately completed
+     * onExit future makes the cleanup code proceed to its force fallback
+     * without spending the production 3s graceful allowance.
+     */
+    private static final class FakeHandle implements ProcessHandle {
+        private final AtomicBoolean alive;
+
+        FakeHandle(AtomicBoolean alive) {
+            this.alive = alive;
+        }
+
+        @Override
+        public long pid() { return 808_080; }
+
+        @Override
+        public Optional<ProcessHandle> parent() { return Optional.empty(); }
+
+        @Override
+        public Stream<ProcessHandle> children() { return Stream.empty(); }
+
+        @Override
+        public Stream<ProcessHandle> descendants() { return Stream.empty(); }
+
+        @Override
+        public Info info() { return ProcessHandle.current().info(); }
+
+        @Override
+        public CompletableFuture<ProcessHandle> onExit() {
+            return CompletableFuture.completedFuture(this);
+        }
+
+        @Override
+        public boolean supportsNormalTermination() { return true; }
+
+        @Override
+        public boolean destroy() {
+            alive.set(false);
+            return true;
+        }
+
+        @Override
+        public boolean destroyForcibly() {
+            alive.set(false);
+            return true;
+        }
+
+        @Override
+        public boolean isAlive() { return alive.get(); }
+
+        @Override
+        public int compareTo(ProcessHandle other) {
+            return Long.compare(pid(), other.pid());
         }
     }
 }

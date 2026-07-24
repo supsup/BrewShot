@@ -23,9 +23,12 @@ the end of the macOS crash-dialog spam.
 - **Bounded, continuously-owned DevTools transport lifecycle.** Command timeouts now
   cover WebSocket send plus response on one monotonic deadline; connect is bounded
   both natively and at the Future boundary, and close has a timed abort fallback. A
-  process/profile lease is registered immediately after Chrome starts and remains
-  retryable through discovery, bootstrap, close, forced-reap failure, and
-  profile-delete failure, including JVM shutdown races.
+  shutdown admission fence atomically joins Chrome start to its process/profile lease;
+  retained pre-exit process-tree handles prevent reparented helpers from escaping
+  cleanup. Ownership remains retryable through discovery, bootstrap, close,
+  forced-reap failure, and profile-delete failure. One JVM-hook reconciliation
+  loop shares a five-second process-wait/retry-admission budget; synchronous
+  profile deletion and waiting for an already-admitted OS start remain outside it.
 - **`--gif N` records a looping GIF from the CLI** (plan 6cc2d9ec, roadmap B4): the
   whole `recordGif*` family was library-only, so `java -jar` users had GIFs in the
   engine and zero access from the shell. `--gif N` flips the shoot to a recording
