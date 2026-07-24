@@ -29,10 +29,16 @@ output, a huge `eval` result, a giant screenshot, a long recording. Those paths
 are bounded so a chatty or hostile page degrades loudly instead of OOMing the
 harness:
 
-- **CDP ingress** is byte-bounded per message (`brewshot.maxCdpMessageBytes`,
-  default 32 MB): a message that would exceed the ceiling is dropped — its
-  reassembly buffer released, never materialized as a giant `String` — and the
-  drop is announced once and counted.
+- **CDP ingress** is bounded on **two** axes. *Per message*
+  (`brewshot.maxCdpMessageBytes`, default 32 MB): a message that would exceed the
+  ceiling is dropped — its reassembly buffer released, never materialized as a
+  giant `String`. *Cumulatively* (`brewshot.maxInboxMessages`, default 4096): the
+  ingress queue holds at most this many undrained messages, so a page that emits a
+  flood of individually-small messages while the command thread is busy can no
+  longer grow the inbox without bound — the newest messages are dropped once the
+  cap is reached. One queue slot is reserved for the socket close/error signal, so
+  that poison is never lost to a full inbox (a stalled caller still fails fast).
+  Both drops are announced once and counted, never silent.
 - **Console/error retention** is bounded on **two** axes: entry count (1000)
   **and** a retained-byte budget (`brewshot.maxConsoleBytes`, default 1 MB), so
   a single multi-MB console entry can no longer be kept whole. Over-budget

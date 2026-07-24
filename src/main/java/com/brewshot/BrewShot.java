@@ -236,6 +236,11 @@ public final class BrewShot implements AutoCloseable {
     static final long DEFAULT_MAX_IMAGE_PIXELS = 67_108_864L;
     /** Default per-CDP-message byte/char ceiling, 32 MB. -Dbrewshot.maxCdpMessageBytes. */
     static final long DEFAULT_MAX_CDP_MESSAGE_BYTES = 33_554_432L;
+    /** Default CUMULATIVE cap on queued (undrained) CDP messages, 4096. -Dbrewshot.maxInboxMessages.
+     *  Bounds the whole ingress queue, not just each message: a chatty page emitting a flood
+     *  of individually-small messages while no thread is draining can no longer grow the inbox
+     *  without bound. See {@link Accumulator}. */
+    static final int DEFAULT_MAX_INBOX_MESSAGES = 4096;
     /** Default per-log retained-byte budget for console/error text, 1 MB. -Dbrewshot.maxConsoleBytes. */
     static final long DEFAULT_MAX_CONSOLE_BYTES = 1_048_576L;
 
@@ -267,6 +272,10 @@ public final class BrewShot implements AutoCloseable {
 
     private static long maxCdpMessageBytes() {
         return longProp("brewshot.maxCdpMessageBytes", DEFAULT_MAX_CDP_MESSAGE_BYTES);
+    }
+
+    private static int maxInboxMessages() {
+        return intProp("brewshot.maxInboxMessages", DEFAULT_MAX_INBOX_MESSAGES);
     }
 
     private static long maxConsoleBytes() {
@@ -477,9 +486,15 @@ public final class BrewShot implements AutoCloseable {
         // headless Chrome + temp profile leaks per failed launch.
         try {
             String wsUrl = awaitDevtoolsUrl(p);
-            LinkedBlockingQueue<String> inbox = new LinkedBlockingQueue<>();
+            int inboxCap = maxInboxMessages();
+            // Capacity is cap + 1: the Accumulator only enqueues up to `inboxCap` regular
+            // messages, keeping the last physical slot reserved so the close/error sentinel
+            // (SOCKET_CLOSED) can NEVER be lost to a full inbox — a blocked caller still
+            // fails fast instead of sleeping out the timeout. See Accumulator.
+            LinkedBlockingQueue<String> inbox = new LinkedBlockingQueue<>(inboxCap + 1);
             WebSocket socket = HTTP.newWebSocketBuilder()
-                .buildAsync(URI.create(wsUrl), new Accumulator(inbox, maxCdpMessageBytes()))
+                .buildAsync(URI.create(wsUrl),
+                    new Accumulator(inbox, maxCdpMessageBytes(), inboxCap))
                 .join();
             BrewShot c = new BrewShot(p, profile, socket, inbox);
             // Browser-scope bootstrap (sessionId == null): open a tab, attach flat.
@@ -1829,31 +1844,47 @@ public final class BrewShot implements AutoCloseable {
      * WebSocket listener reassembling partial text frames into whole messages.
      * On close/error it enqueues a poison message so a blocked caller fails
      * fast ("Chrome exited") instead of sleeping out the full timeout.
+     *
+     * <p>Two independent F-01 ingress bounds are enforced here, both on the single
+     * (serialized) WebSocket callback thread:
+     * <ol>
+     *   <li><b>Per-message</b> ({@link #maxMessageBytes}): a message whose reassembly
+     *       buffer would cross the ceiling is dropped, its partial buffer released the
+     *       moment it overflows — never materialized as a giant String.</li>
+     *   <li><b>Cumulative</b> ({@link #maxInboxMessages}): the ingress queue only ever
+     *       holds up to {@code maxInboxMessages} regular messages. A page emitting a
+     *       flood of individually-small messages while the command thread is not draining
+     *       used to grow the (default-unbounded) inbox without bound; now the newest
+     *       message is DROPPED once the cap is reached. The sink's physical capacity is
+     *       {@code maxInboxMessages + 1}, so one slot is always reserved for the
+     *       close/error sentinel — the poison signal can never be lost to a full inbox.</li>
+     * </ol>
+     * Both drops are announced once + counted, never silent.
      */
     static final class Accumulator implements WebSocket.Listener {
         private final LinkedBlockingQueue<String> sink;
-        // Per-message ceiling on the reassembly buffer (chars ≈ bytes for the ASCII
-        // JSON/base64 CDP traffic). F-01: the buffer used to append partial frames
-        // UNBOUNDED before enqueuing the whole message, so one pathological multi-GB
-        // CDP message could OOM the harness before it ever reached the (also uncapped)
-        // inbox queue. Now a message that would cross the ceiling is DROPPED — the
-        // partial buffer is released the moment it overflows, never materialized as a
-        // giant String — and the drop is announced once + counted, never silent.
         private final long maxMessageBytes;
+        /** Cumulative cap on queued regular messages; one further slot in {@link #sink}
+         *  is reserved for the close/error sentinel. */
+        private final int maxInboxMessages;
         private final StringBuilder buf = new StringBuilder();
         private boolean overflowed;
         private long dropped;
+        private long inboxDropped;
+        private boolean inboxDropAnnounced;
 
-        Accumulator(LinkedBlockingQueue<String> sink, long maxMessageBytes) {
+        Accumulator(LinkedBlockingQueue<String> sink, long maxMessageBytes, int maxInboxMessages) {
             this.sink = sink;
             this.maxMessageBytes = maxMessageBytes;
+            this.maxInboxMessages = maxInboxMessages;
         }
 
         /**
          * The accumulation seam, split out from {@link #onText} so it is testable
          * without a live WebSocket. Appends {@code data}; on {@code last}, enqueues
-         * the whole message — UNLESS the buffer crossed {@link #maxMessageBytes},
-         * in which case the message is dropped (buffer already released) and counted.
+         * the whole message — UNLESS the buffer crossed {@link #maxMessageBytes}
+         * (dropped, buffer already released) or the inbox is already at
+         * {@link #maxInboxMessages} (cumulative drop) — either drop counted.
          */
         void accept(CharSequence data, boolean last) {
             if (!overflowed && buf.length() + (long) data.length() > maxMessageBytes) {
@@ -1871,14 +1902,48 @@ public final class BrewShot implements AutoCloseable {
                     }
                     overflowed = false;
                 } else {
-                    sink.add(buf.toString());
+                    enqueue(buf.toString());
                 }
                 buf.setLength(0);
             }
         }
 
+        /**
+         * Enqueue one whole (in-ceiling) message under the cumulative cap. Only
+         * {@code sink.size() < maxInboxMessages} admits it; the last physical slot of
+         * {@code sink} (capacity {@code maxInboxMessages + 1}) is left free so the
+         * sentinel in {@link #signalClosed()} always has a home. Runs only on the
+         * serialized WebSocket callback thread, so the size-check / offer pair is not
+         * a race. FIFO order is preserved (sentinel goes to the tail like today), so a
+         * closed socket still flushes already-queued events before the poison.
+         */
+        private void enqueue(String msg) {
+            if (sink.size() >= maxInboxMessages) {
+                inboxDropped++;
+                if (!inboxDropAnnounced) {
+                    inboxDropAnnounced = true;
+                    System.err.println("brewshot: CDP inbox full at " + maxInboxMessages
+                        + " queued messages — dropping newer messages (brewshot.maxInboxMessages)."
+                        + " Further drops are counted, not re-announced.");
+                }
+                return;
+            }
+            sink.offer(msg); // reserved-slot invariant guarantees room; offer never blocks
+        }
+
+        /** Enqueue the poison sentinel into the reserved slot — never dropped even
+         *  when the regular inbox is full. */
+        private void signalClosed() {
+            // Regular messages never exceed maxInboxMessages, so with capacity
+            // maxInboxMessages + 1 this offer always succeeds.
+            sink.offer(SOCKET_CLOSED);
+        }
+
         /** Count of CDP messages dropped for exceeding the per-message byte ceiling. */
         long dropped() { return dropped; }
+
+        /** Count of whole messages dropped for exceeding the cumulative inbox cap. */
+        long inboxDropped() { return inboxDropped; }
 
         @Override
         public CompletionStage<?> onText(WebSocket webSocket, CharSequence data, boolean last) {
@@ -1889,13 +1954,13 @@ public final class BrewShot implements AutoCloseable {
 
         @Override
         public CompletionStage<?> onClose(WebSocket webSocket, int statusCode, String reason) {
-            sink.add(SOCKET_CLOSED);
+            signalClosed();
             return null;
         }
 
         @Override
         public void onError(WebSocket webSocket, Throwable error) {
-            sink.add(SOCKET_CLOSED);
+            signalClosed();
         }
     }
 }

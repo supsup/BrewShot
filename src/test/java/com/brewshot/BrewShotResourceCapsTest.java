@@ -188,7 +188,7 @@ class BrewShotResourceCapsTest {
     @Test
     void anOversizedCdpMessageIsDroppedNotBuffered() {
         LinkedBlockingQueue<String> q = new LinkedBlockingQueue<>();
-        BrewShot.Accumulator acc = new BrewShot.Accumulator(q, 100);
+        BrewShot.Accumulator acc = new BrewShot.Accumulator(q, 100, 4096);
 
         // One 250-char message split across partials: crosses the 100-char ceiling → dropped.
         acc.accept("x".repeat(60), false);
@@ -204,16 +204,46 @@ class BrewShotResourceCapsTest {
     }
 
     @Test
-    void manyCdpMessagesStayBoundedPerMessageNotCumulative() {
-        // The ceiling is PER MESSAGE — a stream of in-ceiling messages all pass; only the
-        // individual oversized one is dropped. Pins that the bound doesn't wedge normal traffic.
-        LinkedBlockingQueue<String> q = new LinkedBlockingQueue<>();
-        BrewShot.Accumulator acc = new BrewShot.Accumulator(q, 50);
-        for (int i = 0; i < 20; i++) { acc.accept("msg" + i, true); }        // all small
-        acc.accept("BIG".repeat(100), true);                                  // 300 > 50 → drop
-        for (int i = 0; i < 20; i++) { acc.accept("post" + i, true); }        // all small
-        assertEquals(1, acc.dropped(), "exactly the one oversized message dropped");
-        assertEquals(40, q.size(), "every in-ceiling message still enqueued");
+    void aFloodOfSmallCdpMessagesIsBoundedCumulatively() {
+        // The DEFECT this replaces: the per-message ceiling let an arbitrary NUMBER of
+        // individually-small messages pile up in a default-unbounded inbox (Marlow's repro:
+        // 20000 one-char messages → queued=20000). The cumulative cap now bounds the whole
+        // queue. Mirror production: capacity is cap + 1 (one slot reserved for the sentinel).
+        int cap = 8;
+        LinkedBlockingQueue<String> q = new LinkedBlockingQueue<>(cap + 1);
+        BrewShot.Accumulator acc = new BrewShot.Accumulator(q, 1_000, cap);
+
+        int flood = 20_000;
+        for (int i = 0; i < flood; i++) { acc.accept("m", true); } // each well under the byte ceiling
+
+        assertEquals(cap, q.size(), "the inbox is bounded to the cumulative cap, not the flood size");
+        assertEquals(0, acc.dropped(), "no per-MESSAGE (byte-ceiling) drops — every message was small");
+        assertEquals(flood - cap, acc.inboxDropped(),
+            "every message past the cap is dropped and counted (loud, not silent)");
+    }
+
+    @Test
+    void theCloseSignalSurvivesAFullInbox() {
+        // The reserved-slot guarantee: even when the regular inbox is saturated and further
+        // messages are being DROPPED, the close/error poison still gets a home — a blocked
+        // caller fails fast instead of sleeping out the timeout.
+        int cap = 4;
+        LinkedBlockingQueue<String> q = new LinkedBlockingQueue<>(cap + 1);
+        BrewShot.Accumulator acc = new BrewShot.Accumulator(q, 1_000, cap);
+
+        for (int i = 0; i < cap + 50; i++) { acc.accept("m", true); } // saturate + overflow
+        assertEquals(cap, q.size(), "regular messages are capped");
+        assertTrue(acc.inboxDropped() > 0, "and the overflow is being dropped");
+
+        // Socket closes while the inbox is full — the sentinel must NOT be lost.
+        acc.onClose(null, 1000, "bye");
+        assertEquals(cap + 1, q.size(), "the reserved slot admits the close sentinel");
+
+        // Drain: the last element is the poison signal, intact.
+        String last = null;
+        for (String s = q.poll(); s != null; s = q.poll()) { last = s; }
+        assertTrue(last != null && last.contains("brewshotSocketClosed"),
+            "the close signal arrived even though the inbox was full: " + last);
     }
 
     // ================= F-01: console/error retained-byte bound =================
