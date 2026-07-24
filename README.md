@@ -22,13 +22,37 @@ Or from the shell:
 
 ```
 brewshot https://example.com -o page.png
+brewshot https://example.com -o page.jpg --jpeg-quality 82
 cat report.html | brewshot - -o report.png
 brewshot ./fx.html --gif 40 --gif-element ".lx-math" -o fx.gif   # film an element (jar path)
 ```
 
+In the CLI, still-image extensions are truthful and case-insensitive: `.png` uses PNG;
+`.jpg`/`.jpeg` use Chrome's JPEG encoder (`--jpeg-quality 1..100`, default 90);
+`.pdf` selects `Page.printToPDF`. Other output extensions are rejected rather
+than receiving misnamed PNG bytes. Every path-based screenshot, PDF, GIF,
+manifest, diff JSON, and heatmap is completed in a sibling temporary file and
+then moved into place (atomic move when supported, complete-temp
+same-directory replace otherwise), so a failed encode/write cannot leave a
+plausible partial target; temporary residue is cleaned best-effort. The
+fallback preserves the complete-before-replace rule but cannot guarantee
+atomic replacement on a filesystem that does not support `ATOMIC_MOVE`.
+Replacing an existing POSIX target retains its mode bits. A valid output
+symlink remains a symlink and its referent is replaced; broken or cyclic
+output symlinks fail before temporary-file creation.
+When `--json` accompanies `--eval`, the manifest's `eval` field preserves the
+JSON value itself — null, boolean, number, string, array, or object — instead
+of flattening it through `String.valueOf`.
+Direct stdin HTML is capped at 16 MiB and `--eval-file` at 1 MiB (byte caps,
+UTF-8); inputs at the exact cap are accepted and cap+1 is refused before
+decoding.
+
 The `--gif N` lane records N frames as a looping GIF instead of a still —
 `--gif-delay` sets the per-frame cadence (capture == playback, default 40 ms) and
 `--gif-element CSS` films just that element's box (composes with `--scale`).
+GIF stores centiseconds: delays round to the nearest 10 ms (half up), with the
+existing 20 ms minimum; `BrewShot.effectiveGifDelayMs(requested)` reports the
+exact value, and CLI manifests disclose both requested and encoded delay.
 **Jar path only**: GIF assembly rides ImageIO, which the macOS native binary
 doesn't have — the CLI reports this loudly instead of half-working.
 
@@ -46,10 +70,10 @@ WebSocket client since 11. BrewShot is those messages, wrapped well:
 | --- | --- |
 | `Page.navigate` | `open(url)` |
 | `Page.setDocumentContent` | `html(source)` — scripts execute, load fires |
-| `Runtime.evaluate` | `eval(js)` → String/Double/Boolean/Map/List · `waitFor(predicate, ms)` |
+| `Runtime.evaluate` | `eval(js)` → null/String/Double/Boolean/Map/List · `waitFor(predicate, ms)` |
 | `Network` + lifecycle | `waitReady()` · `waitForNetworkIdle(quietMs, timeoutMs)` · `waitForFontsReady()` — render-settled waits instead of a blind `settle(ms)` |
 | `Runtime.consoleAPICalled` / `exceptionThrown` | `console()` / `errors()` — the page's voice, one-line health asserts |
-| `Page.captureScreenshot` | `screenshot(path)` / `screenshotClip(x,y,w,h)` · `screenshotElement("css")` |
+| `Page.captureScreenshot` | PNG/JPEG `screenshot(path, format, quality)` / `screenshotClip(x,y,w,h)` · `screenshotElement("css")` |
 | `Page.printToPDF` | `pdf(path)` / `pdf(path, PdfOptions)` — the page as a paged, print-fidelity PDF |
 | `Emulation.setEmulatedMedia` | `colorScheme("dark"\|"light")` · `media("print"\|"screen")` · `reducedMotion("reduce")` |
 | `Input.dispatchMouseEvent` | `mouse(x,y)` · `click(x,y)` / `click("css")` · `hover("css")` — real trusted input |
@@ -61,6 +85,9 @@ capture *just that element* — no hand-computing `getBoundingClientRect()`. Tri
 animation first (`open`/`eval`), then film it: `recordGifElement` resolves the box once and
 films that fixed region, so motion *within* the element (glyph jitter, a spinner) is captured
 cleanly. Built for exactly this — recording one card's effect out of a page full of them.
+All selector-taking surfaces use one JavaScript-string quoting path, including
+quotes, backslashes, CR/LF, U+2028, and U+2029; selector data cannot escape
+into executable source.
 
 **Poke the page with real input.** `click("css")` / `hover("css")` hit an element's center;
 `mouse(x, y)` / `click(x, y)` take *document* coordinates (the same space `elementBox` speaks —
@@ -74,6 +101,9 @@ the capture shows the hovered state, because the mouse genuinely stays there.
 trigger the animation at `i == 0`, advance deterministic state (`eval("step()")`), or perturb
 mid-recording (`click(...)`, `hover(...)`). The hook runs on the recording thread against the
 same instance, so it composes with the whole surface; an exception aborts the recording.
+Counts and capture/playback delays are positive contracts and fail before any
+capture; clip origins are finite (negative page coordinates remain valid),
+while width/height/scale are finite and positive.
 
 **Scale is a re-raster, not an upscale.** The `scale` on `screenshotClip`/`screenshotElement`
 makes Chrome **re-render** the clip region at that factor — `screenshotElement("svg", 3.0)`
@@ -110,19 +140,21 @@ The per-frame **playback** delay is the speed knob, independent of how densely y
 Every recorder takes a single `frameDelayMs` (capture == playback, ≈ real time); the `recordGif`
 and `recordGifElement` overloads split it into `(captureDelayMs, playbackDelayMs)` so you can
 **sample a fast effect densely and replay it slowly**: `recordGifElement(".fx", 60, 25, 75, s, out)`
-shoots 60 frames ~25 ms apart, played back at 75 ms/frame. **FPS = `1000 / playbackDelayMs`** —
-so a *bigger* delay is a *lower* fps is a *slower* GIF (a slower scroll, a slower effect).
+shoots 60 frames ~25 ms apart; requested 75 ms rounds to an encoded 80 ms/frame.
+**FPS = `1000 / effectiveGifDelayMs(playbackDelayMs)`** — so a *bigger*
+effective delay is a lower fps and a slower GIF (a slower scroll, a slower effect).
 
-| playbackDelayMs | ≈ fps | good for |
-|---|---|---|
-| 33 ms | ~30 | real-time smoothness — UI motion, a spinner, "does it feel right" |
-| 50 ms | ~20 | lively but legible — hover/click micro-interactions |
-| 75 ms | ~13 | **catalogue/showcase default** — an effect or a scroll you can actually read |
-| 100 ms | ~10 | study pace — walk someone through each step |
-| 150 ms | ~7 | slow-mo — a fast effect (glitch, a shatter) frame-by-frame; a leisurely scroll |
+| requested | encoded | ≈ fps | good for |
+|---|---|---|---|
+| 33 ms | 30 ms | ~33 | real-time smoothness — UI motion, a spinner, "does it feel right" |
+| 50 ms | 50 ms | ~20 | lively but legible — hover/click micro-interactions |
+| 75 ms | 80 ms | ~12.5 | **catalogue/showcase default** — an effect or a scroll you can actually read |
+| 100 ms | 100 ms | ~10 | study pace — walk someone through each step |
+| 150 ms | 150 ms | ~7 | slow-mo — a fast effect (glitch, a shatter) frame-by-frame; a leisurely scroll |
 
 Chrome's shot time floors real capture cadence at ≈20-30 ms, so `captureDelayMs` below that just
-samples as fast as it can; `playbackDelayMs` has no floor — set it purely for the speed you want.
+samples as fast as it can. GIF playback has 10 ms granularity and a 20 ms
+minimum; use `effectiveGifDelayMs` when exact duration/fps matters.
 
 **Stream instead of polling — `recordGifStream`.** The poll recorders shoot, wait, shoot; Chrome's
 per-shot cost floors that cadence at ≈20-30 ms. `recordGifStream(durationMs, playbackDelayMs, out)`
@@ -139,7 +171,7 @@ page has nothing to film.
 first frame is held that long before the animation runs, so the viewer registers the *before* state
 (an intact equation, a button at rest) then watches it change:
 `recordGifElement(".fx", 60, 25, 75, 900, s, out)` holds frame 0 for 900 ms, then plays the rest at
-75 ms. (GIF stores a per-frame delay, so this is one file — no repeated frames.)
+80 ms (75 ms requested, rounded). The per-frame delay lives in one file — no repeated frames.
 
 ### Recording a triggered animation — recipe
 
@@ -173,7 +205,8 @@ print-fidelity PDF, not a raster. The default is deliberately *not* the
 browser's print dialog (which drops backgrounds and adds margins): US Letter,
 portrait, zero margins, backgrounds **on**, scale 1.0 — the page as a print
 artifact. `PdfOptions` withers tune it per call, and a bad envelope
-(non-positive paper, negative margin, scale outside CDP's 0.1–2.0) throws
+(non-finite/non-positive paper, non-finite/negative margin, non-finite scale
+or scale outside CDP's 0.1–2.0) throws
 `IllegalArgumentException` instead of an opaque Chrome reject:
 
 ```java
@@ -254,9 +287,13 @@ largest cluster at 173,203 (43x17, 20% of the change) — in the body.
   `--pixel-exact` opts out for byte-faithful comparison.
 - **Threshold gate**: `--fail-over 0.5` (percent) / `--fail-pixels 100` →
   **exit 4 with the verdict and artifacts still written** — the same
-  evidence-first contract as `--fail-js`.
+  evidence-first contract as `--fail-js`. Percent thresholds are bounded to
+  0–100, and per-channel tolerance is bounded to 0–254 so even a maximum
+  255-channel delta remains observable.
 - **Mask dynamic regions** (`--mask x,y,w,h`, repeatable): zero a clock or
-  spinner on both images so the numbers stay stable and citable.
+  spinner on both images so the numbers stay stable and citable. Masks require
+  positive extents, are clipped to the image, and a wholly outside mask is an
+  intentional no-op. Library `Options` owns deep copies of masks.
 - **Heatmap** (`--diff-out diff.png`): the base image dimmed, changed pixels
   magenta — the eyes-artifact companion when someone does want to look.
 - **Localization**: connected-component analysis names the largest changed
@@ -269,6 +306,8 @@ No Chrome involved — `diff` is pure JDK image work, so it runs anywhere the
 jar runs (it rides ImageIO, the same JVM-path caveat as GIF recording; not
 the macOS native binary). Library callers get the same engine as
 `BrewShotDiff.diff(imgA, imgB, options)` → a `Verdict` record.
+`Options.masks()` and `Verdict.changedBounds()` return defensive copies, so
+mutating caller arrays cannot rewrite a later comparison or sidecar.
 
 ## What it's good for
 

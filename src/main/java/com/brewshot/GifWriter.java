@@ -23,7 +23,8 @@ import javax.imageio.stream.ImageOutputStream;
 /**
  * Animated-GIF assembly from PNG frames using only the JDK's ImageIO GIF
  * writer — no dependency (the BrewShot discipline: everything rides what the
- * JDK already ships). Loops forever; per-frame delay in milliseconds.
+ * JDK already ships). Loops forever; requested per-frame milliseconds round
+ * to the nearest centisecond with a 20ms encoded minimum.
  *
  * <p>Frames share ONE stable global palette. ImageIO's default GIF writer
  * re-quantizes each RGB frame independently, so a gradient lands on a slightly
@@ -58,7 +59,10 @@ final class GifWriter {
      */
     static void write(List<byte[]> pngFrames, int frameDelayMs, int firstFrameDelayMs, Path out)
             throws IOException {
+        if (pngFrames == null) { throw new IllegalArgumentException("frames must not be null"); }
         if (pngFrames.isEmpty()) { throw new IllegalArgumentException("no frames"); }
+        BrewShot.effectiveGifDelayMs(frameDelayMs);
+        BrewShot.effectiveGifDelayMs(firstFrameDelayMs);
 
         // Decode every frame once, up front — we need all of them both to build
         // the shared palette and to index each against it. ImageIO.read returns
@@ -77,9 +81,18 @@ final class GifWriter {
         }
 
         IndexColorModel palette = buildGlobalPalette(frames);
+        ArtifactWriter.write(out,
+            temporary -> writeSequence(frames, palette, frameDelayMs, firstFrameDelayMs, temporary));
+    }
 
+    private static void writeSequence(List<BufferedImage> frames, IndexColorModel palette,
+                                      int frameDelayMs, int firstFrameDelayMs, Path out)
+            throws IOException {
         ImageWriter writer = ImageIO.getImageWritersByFormatName("gif").next();
         try (ImageOutputStream os = ImageIO.createImageOutputStream(out.toFile())) {
+            if (os == null) {
+                throw new IOException("could not create GIF output stream for " + out);
+            }
             writer.setOutput(os);
             writer.prepareWriteSequence(null);
             for (int i = 0; i < frames.size(); i++) {
@@ -91,12 +104,6 @@ final class GifWriter {
                 writer.writeToSequence(new IIOImage(indexed, null, meta), null);
             }
             writer.endWriteSequence();
-        } catch (IOException | RuntimeException e) {
-            // The try-with-resources closes the stream on the way out, leaving a PARTIAL
-            // out file (N-1 frames) that reads as a plausible truncated GIF. Delete it so a
-            // broken recording never masquerades as a finished artifact.
-            try { java.nio.file.Files.deleteIfExists(out); } catch (IOException ignored) { }
-            throw e;
         } finally {
             writer.dispose();
         }
@@ -362,7 +369,8 @@ final class GifWriter {
         gce.setAttribute("userInputFlag", "FALSE");
         gce.setAttribute("transparentColorFlag", "FALSE");
         gce.setAttribute("transparentColorIndex", "0");
-        gce.setAttribute("delayTime", String.valueOf(Math.max(2, delayMs / 10))); // centiseconds
+        gce.setAttribute("delayTime",
+            String.valueOf(BrewShot.effectiveGifDelayMs(delayMs) / 10)); // centiseconds
 
         IIOMetadataNode apps = child(root, "ApplicationExtensions");
         IIOMetadataNode app = new IIOMetadataNode("ApplicationExtension");

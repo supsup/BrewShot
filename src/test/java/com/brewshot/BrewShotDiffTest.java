@@ -1,9 +1,11 @@
 package com.brewshot;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.awt.Color;
@@ -12,6 +14,7 @@ import java.awt.image.BufferedImage;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import javax.imageio.ImageIO;
 import org.junit.jupiter.api.Test;
@@ -151,6 +154,18 @@ class BrewShotDiffTest {
     }
 
     @Test
+    void maximumUsefulToleranceStillDetectsCompletelyDifferentImages() {
+        BufferedImage black = solid(20, 15, Color.BLACK);
+        BufferedImage white = solid(20, 15, Color.WHITE);
+
+        BrewShotDiff.Verdict verdict = BrewShotDiff.diff(black, white,
+            new BrewShotDiff.Options(254, true, List.of()));
+
+        assertEquals(300, verdict.changedPixels(),
+            "a maximum 255 channel delta must remain observable at tolerance 254");
+    }
+
+    @Test
     void sizeMismatchIsAnExplicitVerdictNotACrash() {
         BrewShotDiff.Verdict v = BrewShotDiff.diff(
             solid(100, 80, Color.WHITE), solid(120, 80, Color.WHITE),
@@ -188,6 +203,83 @@ class BrewShotDiffTest {
         assertEquals(masked.changedPixels(), unmasked.changedPixels());
         assertEquals(100.0 * masked.changedPixels() / (10_000 - 2_500), masked.pctChanged(), 1e-9);
         assertTrue(masked.prose().contains("of 7500"), "prose N-of-M uses comparable pixels: " + masked.prose());
+    }
+
+    @Test
+    void optionsOwnDeepCopiesAndAccessorsCannotMutateThem() {
+        int[] sourceMask = {2, 3, 4, 5};
+        List<int[]> sourceList = new ArrayList<>();
+        sourceList.add(sourceMask);
+        BrewShotDiff.Options options = new BrewShotDiff.Options(7, true, sourceList);
+
+        sourceMask[0] = 99;
+        sourceList.clear();
+        assertEquals(1, options.masks().size());
+        assertEquals(2, options.masks().get(0)[0]);
+
+        List<int[]> returned = options.masks();
+        returned.get(0)[0] = 88;
+        assertThrows(UnsupportedOperationException.class,
+            () -> returned.add(new int[] {0, 0, 1, 1}));
+        assertEquals(2, options.masks().get(0)[0],
+            "mutating an accessor-returned array must not reach the record");
+    }
+
+    @Test
+    void optionsRejectInvalidToleranceAndMaskContracts() {
+        assertThrows(IllegalArgumentException.class,
+            () -> new BrewShotDiff.Options(-1, true, List.of()));
+        assertThrows(IllegalArgumentException.class,
+            () -> new BrewShotDiff.Options(255, true, List.of()));
+        assertThrows(IllegalArgumentException.class,
+            () -> new BrewShotDiff.Options(1, true, null));
+        assertThrows(IllegalArgumentException.class,
+            () -> new BrewShotDiff.Options(1, true, java.util.Arrays.asList((int[]) null)));
+        assertThrows(IllegalArgumentException.class,
+            () -> new BrewShotDiff.Options(1, true, List.of(new int[] {1, 2, 3})));
+        assertThrows(IllegalArgumentException.class,
+            () -> new BrewShotDiff.Options(1, true, List.of(new int[] {1, 2, 0, 3})));
+        assertThrows(IllegalArgumentException.class,
+            () -> new BrewShotDiff.Options(1, true, List.of(new int[] {1, 2, 3, -1})));
+        assertThrows(IllegalArgumentException.class,
+            () -> new BrewShotDiff.Options(1, true,
+                List.of(new int[] {Integer.MAX_VALUE, 0, 1, 1})));
+        assertThrows(IllegalArgumentException.class,
+            () -> new BrewShotDiff.Options(1, true,
+                List.of(new int[] {0, Integer.MAX_VALUE, 1, 1})));
+    }
+
+    @Test
+    void entirelyOutOfImageMaskIsAnIntentionalDocumentedNoOp() {
+        BufferedImage a = solid(10, 10, Color.WHITE);
+        BufferedImage b = solid(10, 10, Color.WHITE);
+        b.setRGB(5, 5, Color.RED.getRGB());
+        BrewShotDiff.Options outside = new BrewShotDiff.Options(
+            BrewShotDiff.DEFAULT_TOLERANCE, false,
+            List.of(new int[] {-10, -10, 5, 5}, new int[] {20, 20, 5, 5}));
+
+        BrewShotDiff.Verdict verdict = BrewShotDiff.diff(a, b, outside);
+        assertEquals(0, verdict.maskedPixels());
+        assertEquals(1, verdict.changedPixels(),
+            "masks are clipped to the image; a wholly outside mask changes nothing");
+    }
+
+    @Test
+    void verdictOwnsChangedBoundsAndAccessorReturnsCopies() {
+        int[] source = {1, 2, 3, 4};
+        BrewShotDiff.Verdict verdict = new BrewShotDiff.Verdict(
+            10, 10, 10, 10, false, 100, 12, 12, 0, 0,
+            source, null, "verdict");
+
+        source[0] = 99;
+        assertEquals(1, verdict.changedBounds()[0]);
+        int[] returned = verdict.changedBounds();
+        returned[1] = 88;
+        assertEquals(2, verdict.changedBounds()[1],
+            "mutating an accessor-returned bounds array must not reach the record");
+        assertThrows(IllegalArgumentException.class, () -> new BrewShotDiff.Verdict(
+            1, 1, 1, 1, false, 1, 1, 100, 0, 0,
+            new int[] {0, 0, 1}, null, "bad"));
     }
 
     // ---- CLI: `brewshot diff` (Main.run dispatch, gate contract, sidecars) ----
@@ -272,6 +364,52 @@ class BrewShotDiffTest {
     }
 
     @Test
+    void diffOutputsCannotAliasEachOtherOrEitherBaseline(@TempDir Path tmp)
+            throws Exception {
+        Path a = write(tmp, "a.png", solid(10, 10, Color.BLACK));
+        Path b = write(tmp, "b.png", solid(10, 10, Color.WHITE));
+        byte[] originalA = Files.readAllBytes(a);
+        byte[] originalB = Files.readAllBytes(b);
+
+        Path heat = tmp.resolve("heat.png");
+        Path normalizedHeatAlias =
+            tmp.resolve("not-created").resolve("..").resolve("heat.png");
+        assertEquals(2, Main.run(new String[] {"diff", a.toString(), b.toString(),
+            "--diff-out", heat.toString(), "--json", normalizedHeatAlias.toString()}));
+
+        for (String[] aliasedOutput : new String[][] {
+            {"--diff-out", a.toString()},
+            {"--diff-out", b.toString()},
+            {"--json", a.toString()},
+            {"--json", b.toString()},
+        }) {
+            assertEquals(2, Main.run(new String[] {"diff", a.toString(), b.toString(),
+                aliasedOutput[0], aliasedOutput[1]}));
+        }
+
+        Path linkedHeat = tmp.resolve("linked-heat.png");
+        Files.createLink(linkedHeat, a);
+        assertEquals(2, Main.run(new String[] {"diff", a.toString(), b.toString(),
+            "--diff-out", linkedHeat.toString()}));
+
+        Path linkedJson = tmp.resolve("linked-verdict.json");
+        Files.createLink(linkedJson, b);
+        assertEquals(2, Main.run(new String[] {"diff", a.toString(), b.toString(),
+            "--json", linkedJson.toString()}));
+
+        Path sharedHeat = tmp.resolve("shared-output.png");
+        Path sharedJson = tmp.resolve("shared-output.json");
+        Files.writeString(sharedHeat, "existing sidecar evidence");
+        Files.createLink(sharedJson, sharedHeat);
+        assertEquals(2, Main.run(new String[] {"diff", a.toString(), b.toString(),
+            "--diff-out", sharedHeat.toString(), "--json", sharedJson.toString()}));
+        assertEquals("existing sidecar evidence", Files.readString(sharedHeat));
+
+        assertArrayEquals(originalA, Files.readAllBytes(a));
+        assertArrayEquals(originalB, Files.readAllBytes(b));
+    }
+
+    @Test
     void heatmapIoFailureCannotSuppressTheJsonSidecar(@TempDir Path tmp) throws Exception {
         // F1 (consumer review brewshot #45): --diff-out pointing into a nonexistent directory
         // must not eat the --json sidecar — the machine artifact writes first, independently.
@@ -305,5 +443,24 @@ class BrewShotDiffTest {
         assertEquals(4, code);
         assertTrue(Files.readString(json1).contains("\"exceeded\": false"));
         assertTrue(Files.readString(json2).contains("\"exceeded\": true"));
+    }
+
+    @Test
+    void listOfJobsPreflightsAllAliasesBeforeTheFirstWrite(@TempDir Path tmp)
+            throws Exception {
+        Path baseline = write(tmp, "baseline.png", solid(10, 10, Color.WHITE));
+        Path futureSidecar = tmp.resolve("future.json");
+        Path secondSidecar = tmp.resolve("second.json");
+
+        int code = Main.runDiffJobs(List.of(
+            new Main.DiffJob(baseline, baseline, BrewShotDiff.Options.defaults(),
+                null, null, null, futureSidecar),
+            new Main.DiffJob(futureSidecar, baseline, BrewShotDiff.Options.defaults(),
+                null, null, null, secondSidecar)));
+
+        assertEquals(2, code);
+        assertFalse(Files.exists(futureSidecar),
+            "the complete batch must be alias-checked before job one writes");
+        assertFalse(Files.exists(secondSidecar));
     }
 }

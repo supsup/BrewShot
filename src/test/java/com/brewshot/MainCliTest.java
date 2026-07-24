@@ -2,7 +2,15 @@ package com.brewshot;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
+import java.io.PrintStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 /** CLI arg handling — no Chrome needed: every case exits before launch. */
 class MainCliTest {
@@ -115,5 +123,167 @@ class MainCliTest {
         assertEquals(2, Main.run(new String[] {"https://example.com", "--settle", "nope"}));
         assertEquals(2, Main.run(new String[] {"https://example.com", "--wait-timeout", "nope"}));
         assertEquals(2, Main.run(new String[] {"--eval-file", "no-such-file.js", "https://example.com"}));
+    }
+
+    @Test
+    void positiveParserNamesActuallyRejectZeroAndNegativeValues() throws Exception {
+        assertEquals(2, Main.run(new String[] {"--size", "0x100", "https://example.com"}));
+        assertEquals(2, Main.run(new String[] {"--size", "100x-1", "https://example.com"}));
+        assertEquals(2, Main.run(new String[] {"--settle", "0", "https://example.com"}));
+        assertEquals(2, Main.run(new String[] {"--wait-timeout", "-1", "https://example.com"}));
+        assertEquals(2, Main.run(new String[] {
+            "diff", "a.png", "b.png", "--mask", "0,0,0,1"}));
+        assertEquals(2, Main.run(new String[] {
+            "diff", "a.png", "b.png", "--fail-pixels", "-1"}));
+        assertEquals(2, Main.run(new String[] {
+            "diff", "a.png", "b.png", "--tolerance", "-1"}));
+        assertEquals(2, Main.run(new String[] {
+            "diff", "a.png", "b.png", "--tolerance", "255"}));
+        assertEquals(2, Main.run(new String[] {
+            "diff", "a.png", "b.png", "--fail-over", "100.0001"}));
+        assertEquals(2, Main.run(new String[] {
+            "diff", "a.png", "b.png", "--mask", "2147483647,0,1,1"}));
+
+        // Zero is intentionally valid for non-negative diff thresholds and
+        // coordinates; these parse and reach image IO (exit 1), not usage (2).
+        assertEquals(1, Main.run(new String[] {
+            "diff", "no-a.png", "no-b.png", "--mask", "0,0,1,1",
+            "--fail-pixels", "0", "--tolerance", "0"}));
+        assertEquals(1, Main.run(new String[] {
+            "diff", "no-a.png", "no-b.png", "--fail-over", "100"}));
+    }
+
+    @Test
+    void captureOutputAndManifestMustNotAlias(@TempDir Path directory) throws Exception {
+        Path output = directory.resolve("capture.png");
+        Path normalizedAlias =
+            directory.resolve("not-created").resolve("..").resolve("capture.png");
+        assertEquals(2, Main.run(new String[] {
+            "https://example.com", "-o", output.toString(),
+            "--json", normalizedAlias.toString()}));
+
+        Path linkedOutput = directory.resolve("linked-capture.png");
+        Path linkedManifest = directory.resolve("linked-manifest.json");
+        Files.writeString(linkedOutput, "existing evidence");
+        Files.createLink(linkedManifest, linkedOutput);
+        org.junit.jupiter.api.Assertions.assertTrue(
+            Files.isSameFile(linkedOutput, linkedManifest));
+
+        assertEquals(2, Main.run(new String[] {
+            "https://example.com", "-o", linkedOutput.toString(),
+            "--json", linkedManifest.toString()}));
+        assertEquals("existing evidence", Files.readString(linkedOutput));
+        assertEquals("existing evidence", Files.readString(linkedManifest));
+    }
+
+    @Test
+    void brokenManifestSymlinkCannotBecomeAnAliasAfterCaptureWrites(
+            @TempDir Path directory) throws Exception {
+        Path output = directory.resolve("future-capture.png");
+        Path manifest = directory.resolve("future-manifest.json");
+        try {
+            Files.createSymbolicLink(manifest, output.getFileName());
+        } catch (UnsupportedOperationException | SecurityException
+                | java.io.IOException unavailable) {
+            Assumptions.assumeTrue(false,
+                "symbolic links unavailable for this test: " + unavailable);
+        }
+        org.junit.jupiter.api.Assertions.assertFalse(Files.exists(manifest),
+            "the setup link must be broken until the capture path is created");
+
+        assertEquals(2, Main.run(new String[] {
+            "https://example.com", "-o", output.toString(),
+            "--json", manifest.toString()}));
+        org.junit.jupiter.api.Assertions.assertFalse(Files.exists(output),
+            "alias rejection must happen before the capture can make the link valid");
+        org.junit.jupiter.api.Assertions.assertTrue(Files.isSymbolicLink(manifest));
+    }
+
+    @Test
+    void nonexistentOutputsUnderSymlinkedParentStillAlias(
+            @TempDir Path directory) throws Exception {
+        Path realDirectory = Files.createDirectory(directory.resolve("real"));
+        Path linkedDirectory = directory.resolve("linked");
+        try {
+            Files.createSymbolicLink(linkedDirectory, realDirectory.getFileName());
+        } catch (UnsupportedOperationException | SecurityException
+                | java.io.IOException unavailable) {
+            Assumptions.assumeTrue(false,
+                "symbolic links unavailable for this test: " + unavailable);
+        }
+        Path output = realDirectory.resolve("future.png");
+        Path manifest = linkedDirectory.resolve("future.png");
+
+        assertEquals(2, Main.run(new String[] {
+            "https://example.com", "-o", output.toString(),
+            "--json", manifest.toString()}));
+        org.junit.jupiter.api.Assertions.assertFalse(Files.exists(output));
+    }
+
+    @Test
+    void jpegExtensionsMatchCaseInsensitively() {
+        org.junit.jupiter.api.Assertions.assertTrue(
+            Main.isJpegOutput(java.nio.file.Path.of("x.jpg")));
+        org.junit.jupiter.api.Assertions.assertTrue(
+            Main.isJpegOutput(java.nio.file.Path.of("x.JPEG")));
+        org.junit.jupiter.api.Assertions.assertTrue(
+            Main.isJpegOutput(java.nio.file.Path.of("x.JpEg")));
+        org.junit.jupiter.api.Assertions.assertFalse(
+            Main.isJpegOutput(java.nio.file.Path.of("x.png")));
+        org.junit.jupiter.api.Assertions.assertFalse(
+            Main.isJpegOutput(java.nio.file.Path.of("jpg.png")));
+        org.junit.jupiter.api.Assertions.assertTrue(
+            Main.isPngOutput(java.nio.file.Path.of("x.PNG")));
+    }
+
+    @Test
+    void jpegQualityIsBoundedAndOnlyAcceptedForJpegStills() throws Exception {
+        assertEquals(2, Main.run(new String[] {
+            "--jpeg-quality", "0", "-o", "out.jpg", "https://example.com"}));
+        assertEquals(2, Main.run(new String[] {
+            "--jpeg-quality", "101", "-o", "out.jpeg", "https://example.com"}));
+        assertEquals(2, Main.run(new String[] {
+            "--jpeg-quality", "80", "-o", "out.png", "https://example.com"}));
+        assertEquals(2, Main.run(new String[] {
+            "--jpeg-quality", "80", "-o", "out.pdf", "https://example.com"}));
+        assertEquals(2, Main.run(new String[] {
+            "--jpeg-quality", "80", "--gif", "2", "-o", "out.gif",
+            "https://example.com"}));
+    }
+
+    @Test
+    void unknownOutputAndMisnamedHeatmapExtensionsRefuseBeforeIo() throws Exception {
+        ByteArrayOutputStream errors = new ByteArrayOutputStream();
+        PrintStream original = System.err;
+        int webp;
+        try {
+            System.setErr(new PrintStream(errors));
+            webp = Main.run(new String[] {
+                "-o", "out.webp", "https://example.com"});
+        } finally {
+            System.setErr(original);
+        }
+        assertEquals(2, webp);
+        org.junit.jupiter.api.Assertions.assertTrue(
+            errors.toString().contains("unsupported output extension"), errors.toString());
+        assertEquals(2, Main.run(new String[] {
+            "diff", "a.png", "b.png", "--diff-out", "heat.bmp"}));
+    }
+
+    @Test
+    void evalFileAndStdinCapsAreWiredIntoCli(@TempDir Path directory) throws Exception {
+        Path oversizedEval = directory.resolve("large.js");
+        Files.write(oversizedEval, new byte[Main.MAX_EVAL_FILE_BYTES + 1]);
+        assertEquals(2, Main.run(new String[] {
+            "--eval-file", oversizedEval.toString(), "https://example.com"}));
+
+        byte[] oversizedHtml = new byte[Main.MAX_STDIN_HTML_BYTES + 1];
+        InputStream original = System.in;
+        try {
+            System.setIn(new ByteArrayInputStream(oversizedHtml));
+            assertEquals(2, Main.run(new String[] {"-"}));
+        } finally {
+            System.setIn(original);
+        }
     }
 }
