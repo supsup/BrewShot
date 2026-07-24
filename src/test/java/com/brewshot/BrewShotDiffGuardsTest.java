@@ -49,17 +49,23 @@ class BrewShotDiffGuardsTest {
         return p;
     }
 
-    // ---- F-03: tolerance range validation (boundaries -1, 0, 255, 256) --------------------
+    // ---- F-03 / brewshot/153: tolerance range validation (boundaries -1, 0, 254, 255, 256) --
 
     @Test
     void toleranceBoundariesValidateInTheCanonicalConstructor() {
-        // 0 and 255 are the inclusive limits; -1 and 256 are rejected LOUD at construction.
+        // The valid range is 0..254 INCLUSIVE. 255 is rejected too (Fix, review brewshot/153):
+        // the compare is max > tolerance and an 8-bit channel delta maxes at 255, so tolerance
+        // 255 makes EVERY same-size diff report zero change — a gate that can never fail.
         assertThrows(IllegalArgumentException.class,
             () -> new BrewShotDiff.Options(-1, false, List.of()), "tolerance -1 must be rejected");
         assertThrows(IllegalArgumentException.class,
+            () -> new BrewShotDiff.Options(255, false, List.of()),
+            "tolerance 255 must be rejected — it disables the gate");
+        assertThrows(IllegalArgumentException.class,
             () -> new BrewShotDiff.Options(256, false, List.of()), "tolerance 256 must be rejected");
         assertDoesNotThrow(() -> new BrewShotDiff.Options(0, false, List.of()));
-        assertDoesNotThrow(() -> new BrewShotDiff.Options(255, false, List.of()));
+        assertDoesNotThrow(() -> new BrewShotDiff.Options(254, false, List.of()),
+            "254 is the top valid floor (max delta 255 > 254 still counts)");
     }
 
     @Test
@@ -68,10 +74,37 @@ class BrewShotDiffGuardsTest {
         Path b = write(tmp, "b.png", solid(20, 20, Color.WHITE));
         // out-of-range -> exit 2 (usage error), never a stack trace / exit 1
         assertEquals(2, Main.run(new String[] {"diff", a.toString(), b.toString(), "--tolerance", "-1"}));
+        // 255 is now out-of-range too — it would neuter the gate, so the CLI refuses it (exit 2)
+        assertEquals(2, Main.run(new String[] {"diff", a.toString(), b.toString(), "--tolerance", "255"}));
         assertEquals(2, Main.run(new String[] {"diff", a.toString(), b.toString(), "--tolerance", "256"}));
         // in-range boundaries parse and run clean (identical pair -> exit 0)
         assertEquals(0, Main.run(new String[] {"diff", a.toString(), b.toString(), "--tolerance", "0"}));
-        assertEquals(0, Main.run(new String[] {"diff", a.toString(), b.toString(), "--tolerance", "255"}));
+        assertEquals(0, Main.run(new String[] {"diff", a.toString(), b.toString(), "--tolerance", "254"}));
+    }
+
+    @Test
+    void maximalDeltaIsCountedNotSuppressedAtTheTopValidTolerance() {
+        // The defect's teeth (repro at ba27f7c): 1x1 black vs 1x1 white — a maximal per-channel
+        // delta of 255 — must be COUNTED, never suppressed. At the top valid tolerance 254 the
+        // compare 255 > 254 holds, so the change is reported (engine level, no Chrome).
+        BufferedImage black = solid(1, 1, Color.BLACK);
+        BufferedImage white = solid(1, 1, Color.WHITE);
+        BrewShotDiff.Verdict v = BrewShotDiff.diff(black, white,
+            new BrewShotDiff.Options(254, false, List.of()));
+        assertEquals(1, v.changedPixels(), "a maximal black/white delta must count at tolerance 254");
+        assertTrue(v.anyChange(), "the maximal-delta verdict must report a change");
+    }
+
+    @Test
+    void cliCountsMaximalDeltaAtTopValidTolerance(@TempDir Path tmp) throws Exception {
+        // The CLI companion: the same maximal black/white pair trips a zero-pixel gate at
+        // tolerance 254 (exit 4) instead of being silently green. Before the fix, tolerance 255
+        // (now refused) would have reported zero change and passed.
+        Path black = write(tmp, "black.png", solid(4, 4, Color.BLACK));
+        Path white = write(tmp, "white.png", solid(4, 4, Color.WHITE));
+        assertEquals(4, Main.run(new String[] {"diff", black.toString(), white.toString(),
+            "--tolerance", "254", "--fail-pixels", "0"}),
+            "a maximal-delta pair must be counted (gate trips) at the top valid tolerance 254");
     }
 
     // ---- F-04: strict-by-default; AA-forgiveness is opt-in --------------------------------

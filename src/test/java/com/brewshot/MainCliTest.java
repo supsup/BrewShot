@@ -1,7 +1,10 @@
 package com.brewshot;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 
+import java.nio.file.Path;
 import org.junit.jupiter.api.Test;
 
 /** CLI arg handling — no Chrome needed: every case exits before launch. */
@@ -104,6 +107,39 @@ class MainCliTest {
         org.junit.jupiter.api.Assertions.assertTrue(Main.isGifOutput(java.nio.file.Path.of("x.GIF")));
         org.junit.jupiter.api.Assertions.assertFalse(Main.isGifOutput(java.nio.file.Path.of("x.png")));
         org.junit.jupiter.api.Assertions.assertFalse(Main.isGifOutput(java.nio.file.Path.of("gif")));
+    }
+
+    @Test
+    void captureLaneRejectsAliasedPrimaryAndJsonPathBeforeLaunch() throws Exception {
+        // Fix (review brewshot/153, F2): `-o page.png --json page.png` used to write the
+        // screenshot then overwrite it with the JSON manifest and exit 0 — a silent,
+        // destructive alias. The shared preflight now rejects it as a usage error (exit 2)
+        // BEFORE Chrome is ever launched. A URL input is used so nothing but the preflight
+        // decides the exit; the guard runs before BrewShot.available(), so no browser starts.
+        assertEquals(2, Main.run(new String[] {
+            "-o", "brewshot-alias.png", "--json", "brewshot-alias.png", "https://example.com"}),
+            "-o and --json aliasing the same path must be refused, exit 2, before launch");
+        // the = form aliases identically (it is normalized to the same token pair)
+        assertEquals(2, Main.run(new String[] {
+            "--out=brewshot-alias.png", "--json=brewshot-alias.png", "https://example.com"}));
+    }
+
+    @Test
+    void outputAliasPreflightIsABrowserFreeSharedSeam() {
+        // The extracted pairwise-distinctness helper both lanes call — pure, no Chrome. An
+        // aliased pair is flagged (message names both slots); a distinct pair and a null slot
+        // pass clean. This is the browser-free seam the capture lane rejects the alias through.
+        Path p = Path.of("same.png");
+        assertNotNull(Main.outputAliasError(new Path[] {p, p}, new String[] {"-o", "--json"}),
+            "identical -o/--json paths must be flagged");
+        assertNotNull(Main.outputAliasError(
+            new Path[] {Path.of("x.png"), Path.of("./x.png")}, new String[] {"-o", "--json"}),
+            "the same file via a different spelling (./x.png) must still be flagged");
+        assertNull(Main.outputAliasError(
+            new Path[] {Path.of("a.png"), Path.of("b.json")}, new String[] {"-o", "--json"}),
+            "distinct paths pass clean");
+        assertNull(Main.outputAliasError(new Path[] {Path.of("a.png"), null},
+            new String[] {"-o", "--json"}), "a null (absent) slot never collides");
     }
 
     @Test

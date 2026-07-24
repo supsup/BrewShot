@@ -196,6 +196,18 @@ public final class Main {
                 + "or write a raster format (.png/.jpg)");
         }
 
+        // Fix (review brewshot/153): the capture lane is destructively aliasable too — the
+        // primary -o artifact and the --json manifest were written to their paths with no
+        // pre-launch distinctness check, so `-o page.png --json page.png` replaced the
+        // screenshot with JSON and still exited 0. Share the diff lane's pairwise preflight:
+        // reject an aliased -o/--json HERE, BEFORE decode / Chrome launch (before
+        // BrewShot.available()), so the alias never costs a browser start.
+        String captureAliasErr = outputAliasError(
+            new Path[] {out, jsonManifest}, new String[] {"-o", "--json"});
+        if (captureAliasErr != null) {
+            return err(captureAliasErr);
+        }
+
         // Resolve the input MODE before touching Chrome, so arg mistakes fail
         // fast with a clear message.
         String mode; // "stdin" | "url" | "file"
@@ -268,7 +280,7 @@ public final class Main {
                     System.err.println("brewshot: " + e.getMessage());
                     return 1;
                 }
-                Files.write(out, shot.screenshotClip(
+                atomicWriteBytes(out, shot.screenshotClip(
                     Math.max(0, b[0] - clipPadding), Math.max(0, b[1] - clipPadding),
                     b[2] + 2 * clipPadding, b[3] + 2 * clipPadding, scale));
             } else if (clipJs != null) {
@@ -279,7 +291,7 @@ public final class Main {
                         || !(w instanceof Double) || !(h instanceof Double)) {
                     return err("--clip-js must return {x,y,w,h} (page coordinates), got: " + r);
                 }
-                Files.write(out, shot.screenshotClip(
+                atomicWriteBytes(out, shot.screenshotClip(
                     Math.max(0, (Double) x - clipPadding), Math.max(0, (Double) y - clipPadding),
                     (Double) w + 2 * clipPadding, (Double) h + 2 * clipPadding, scale));
             } else if (scale != 1.0) {
@@ -289,7 +301,7 @@ public final class Main {
                 Object dims = shot.eval("[document.documentElement.scrollWidth,"
                     + "document.documentElement.scrollHeight].join(',')");
                 String[] wh = String.valueOf(dims).split(",");
-                Files.write(out, shot.screenshotClip(0, 0,
+                atomicWriteBytes(out, shot.screenshotClip(0, 0,
                     Double.parseDouble(wh[0]), Double.parseDouble(wh[1]), scale));
             } else {
                 shot.screenshot(out);
@@ -529,9 +541,36 @@ public final class Main {
             return "--diff-out would overwrite a diff INPUT (" + diffOut + ") — writing the heatmap"
                 + " there destroys the image being compared; choose a distinct path";
         }
-        if (nj != null && nd != null && nj.equals(nd)) {
-            return "--json and --diff-out point at the same file (" + jsonOut + ") — the JSON and"
-                + " the heatmap would clobber each other; choose distinct paths";
+        // The OUTPUT↔OUTPUT distinctness (json vs heatmap) is the same pairwise check the capture
+        // lane needs, so it routes through the shared helper — one preflight, two lanes.
+        return outputAliasError(new Path[] {jsonOut, diffOut}, new String[] {"--json", "--diff-out"});
+    }
+
+    /**
+     * Fix (review brewshot/153): the pairwise OUTPUT-distinctness preflight SHARED by both lanes.
+     * Every non-null path in {@code outputs} must canonicalize distinct; the first collision is
+     * reported by its slot labels. Browser-free and package-visible so the capture lane can reject
+     * an aliased {@code -o}/{@code --json} BEFORE decode / Chrome launch — the same seam the diff
+     * lane already uses for {@code --json}↔{@code --diff-out}. Returns an error message, or
+     * {@code null} when every declared output is distinct. Inputs are NOT included here (a diff
+     * self-compare legitimately passes the same image twice; that lane guards inputs separately).
+     */
+    static String outputAliasError(Path[] outputs, String[] labels) {
+        for (int i = 0; i < outputs.length; i++) {
+            if (outputs[i] == null) {
+                continue;
+            }
+            Path ci = canonicalForAlias(outputs[i]);
+            for (int j = i + 1; j < outputs.length; j++) {
+                if (outputs[j] == null) {
+                    continue;
+                }
+                if (ci.equals(canonicalForAlias(outputs[j]))) {
+                    return labels[i] + " and " + labels[j] + " point at the same file ("
+                        + outputs[i] + ") — the second write would clobber the first; choose"
+                        + " distinct paths";
+                }
+            }
         }
         return null;
     }
@@ -551,6 +590,22 @@ public final class Main {
         Path tmp = Files.createTempFile(dir, ".brewshot-", ".tmp");
         try {
             Files.writeString(tmp, body);
+            moveIntoPlace(tmp, target);
+        } finally {
+            Files.deleteIfExists(tmp);
+        }
+    }
+
+    /**
+     * Write raw bytes to a sibling temp file, then ATOMIC_MOVE into place — the capture-lane
+     * clip artifacts (Fix, review brewshot/153) share the diff lane's temp-then-atomic policy,
+     * so a crash or concurrent reader never sees a half-written -o output.
+     */
+    private static void atomicWriteBytes(Path target, byte[] body) throws java.io.IOException {
+        Path dir = target.toAbsolutePath().getParent();
+        Path tmp = Files.createTempFile(dir, ".brewshot-", ".tmp");
+        try {
+            Files.write(tmp, body);
             moveIntoPlace(tmp, target);
         } finally {
             Files.deleteIfExists(tmp);
@@ -650,7 +705,8 @@ public final class Main {
                                  [--pixel-exact] [--mask x,y,w,h]... [--fail-over PCT]
                                  [--fail-pixels N] [--diff-out diff.png] [--json verdict.json]
 
-              --tolerance    per-channel delta floor 0..255; at/below never counts (default 16)
+              --tolerance    per-channel delta floor 0..254; at/below never counts (default 16;
+                             255 is refused — it would suppress every change, exit 2)
               --ignore-antialiasing
                              OPT IN to anti-aliasing forgiveness (a 3x3 shifted-edge
                              heuristic; default OFF / strict so a 1-pixel layout move is
@@ -696,7 +752,9 @@ public final class Main {
          .append("  \"elapsedMs\": ").append(elapsedMs).append(",\n")
          .append("  \"brewshot\": \"").append(BrewShot.VERSION).append("\"\n")
          .append("}\n");
-        Files.writeString(manifest, j.toString());
+        // Temp-then-atomic, matching the diff lane (Fix, review brewshot/153): the manifest
+        // lands whole or not at all, never a half-written sidecar beside the screenshot.
+        atomicWriteString(manifest, j.toString());
     }
 
     private static int posInt(String flag, String v) {

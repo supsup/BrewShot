@@ -253,13 +253,17 @@ largest cluster at 173,203 (43x17, 20% of the change) — in the body.
   edge a pixel) is **opt-in** via `--ignore-antialiasing`; when enabled,
   everything it forgives is **counted and printed** in the verdict, never
   silently eaten. `--pixel-exact` is the byte-exact shorthand (tolerance 0 **and**
-  no AA forgiveness). `--tolerance N` sets the per-channel delta floor (0..255).
-- **Distinct paths enforced** — the two inputs and any `--json` / `--diff-out`
-  target must be different files; an alias that would overwrite an input is
-  refused (exit 2) *before* anything is read, and each sidecar is written to a
-  sibling temp file and atomically moved into place. Input dimensions are also
-  capped (`brewshot.maxImageDimension`=16384 px/axis, `brewshot.maxImagePixels`
-  =67108864 total; raise either with `-D`).
+  no AA forgiveness). `--tolerance N` sets the per-channel delta floor (0..254);
+  255 is refused (exit 2) — an 8-bit channel delta maxes at 255, so a floor of 255
+  would suppress every change and make the gate impossible to fail.
+- **Distinct paths enforced** — across **both** the capture and diff lanes: the
+  screenshot `-o`, the `--json` manifest, and any `--diff-out` heatmap must be
+  different files (and, for `diff`, distinct from the two inputs). An alias that
+  would clobber another artifact or overwrite an input is refused (exit 2)
+  *before* anything is decoded or Chrome is launched, and each artifact the CLI
+  writes is landed to a sibling temp file and atomically moved into place. Input
+  dimensions are also capped (`brewshot.maxImageDimension`=16384 px/axis,
+  `brewshot.maxImagePixels`=67108864 total; raise either with `-D`).
 - **Threshold gate**: `--fail-over 0.5` (percent) / `--fail-pixels 100` →
   **exit 4 with the verdict and artifacts still written** — the same
   evidence-first contract as `--fail-js`.

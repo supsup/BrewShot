@@ -40,7 +40,7 @@ public final class BrewShotDiff {
 
     /**
      * Diff knobs. {@code tolerance} is the per-channel floor (a pixel changes only when
-     * {@code max(|dr|,|dg|,|db|) > tolerance}, valid range 0..255); {@code ignoreAntialiasing} enables the
+     * {@code max(|dr|,|dg|,|db|) > tolerance}, valid range 0..254); {@code ignoreAntialiasing} enables the
      * 3×3 shifted-edge forgiveness (OPT-IN at the CLI via {@code --ignore-antialiasing};
      * everything it ignores is still counted in {@link Verdict#antialiasedIgnored}); {@code masks} are
      * {@code {x,y,w,h}} regions excluded from comparison on BOTH images (dynamic
@@ -48,17 +48,20 @@ public final class BrewShotDiff {
      */
     public record Options(int tolerance, boolean ignoreAntialiasing, List<int[]> masks) {
         /**
-         * F-03 (audit): {@code tolerance} is a per-channel 8-bit delta floor, so only 0..255
-         * is meaningful. The compare is {@code max > tolerance}; a tolerance of 255 (or more)
-         * makes that unsatisfiable — EVERY diff reports zero change, a "green" gate that can
-         * never fail. Out-of-range values are almost always a mistake (a typo, or a percent
-         * mistaken for a channel delta); reject them LOUD at construction rather than silently
-         * neutering the gate. This is the single validation point — the CLI surfaces it as exit 2.
+         * F-03 (audit) + Fix (review brewshot/153): {@code tolerance} is a per-channel 8-bit
+         * delta floor and the compare is {@code max > tolerance}. An 8-bit channel delta maxes
+         * at 255, so a tolerance of 255 (or more) is unsatisfiable — EVERY same-size diff reports
+         * zero change, a "green" gate that can never fail (even a maximal black-vs-white pair
+         * passes). 255 is therefore NOT a valid floor: the meaningful range is 0..254, and the
+         * maximal delta (255) is always counted at the top valid tolerance 254. Reject anything
+         * outside 0..254 LOUD at construction rather than silently neutering the gate. This is the
+         * single validation point — the CLI surfaces it as exit 2.
          */
         public Options {
-            if (tolerance < 0 || tolerance > 255) {
+            if (tolerance < 0 || tolerance >= 255) {
                 throw new IllegalArgumentException(
-                    "tolerance must be 0..255 (per-channel 8-bit delta floor), got: " + tolerance);
+                    "tolerance must be 0..254 (per-channel 8-bit delta floor; 255 would suppress "
+                        + "every change since the max delta is 255), got: " + tolerance);
             }
         }
 
