@@ -20,6 +20,24 @@ the end of the macOS crash-dialog spam.
   0.11.0-release lineage (the in-review seam-patch branch) still vendors **0.2.0**,
   which has no env hook — suite runs on that lineage cannot take the workaround and
   will keep spawning dialogs until the fixed jar exists.
+- **Bounded, continuously-owned DevTools transport lifecycle.** Command timeouts now
+  cover WebSocket send plus response on one monotonic deadline; connect is bounded
+  both natively and at the Future boundary, and close has a timed abort fallback. A
+  shutdown admission fence atomically joins Chrome start to its process/profile lease;
+  retained pre-exit handles let cleanup terminate every helper it actually observed.
+  A JDK `ProcessHandle` snapshot cannot prove that a helper created during teardown
+  did not reparent after the final snapshot, however, so the zero-dependency launcher
+  now conservatively retains the temp profile and its in-memory lease unless an
+  external process-tree containment owner proves membership closed and fully reaped.
+  Even then, deregistration requires `Files.notExists(..., NOFOLLOW_LINKS)` to
+  positively establish that no entry remains at the profile pathname; provider
+  uncertainty, probe failure, or a dangling symlink keeps the lease live and
+  retryable. The lease remains retryable only while that JVM lives; JVM exit
+  reclaims the registry but deliberately leaves an unproven profile on disk. This
+  corrects the older “no leaked temp dirs” overclaim. One JVM-hook reconciliation
+  loop shares a five-second
+  process-wait/retry-admission budget; synchronous profile deletion and waiting for an
+  already-admitted OS start remain outside it.
 - **`--gif N` records a looping GIF from the CLI** (plan 6cc2d9ec, roadmap B4): the
   whole `recordGif*` family was library-only, so `java -jar` users had GIFs in the
   engine and zero access from the shell. `--gif N` flips the shoot to a recording
