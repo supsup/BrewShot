@@ -122,7 +122,7 @@ class BrewShotTransportDeadlineTest {
         long started = System.nanoTime();
         IOException failure = assertThrows(IOException.class, () ->
             BrewShot.finishLaunch(process, profile, "ws://127.0.0.1:1/devtools/browser/fake",
-                (uri, listener) -> stuckConnect, 40));
+                (uri, listener, timeout) -> stuckConnect, 40));
         long elapsedMs = elapsedMillis(started);
 
         assertTrue(failure.getMessage().contains("connect timed out"), failure.getMessage());
@@ -162,6 +162,24 @@ class BrewShotTransportDeadlineTest {
         shot.close();
         assertEquals(1, socket.closeCalls.get(), "close must send at most one close frame");
         assertEquals(1, process.destroyCalls.get(), "close must tear down the process once");
+    }
+
+    @Test
+    void closeKeepsResourcesRegisteredUntilCleanupCompletes(@TempDir Path temp)
+            throws Exception {
+        FakeWebSocket socket = new FakeWebSocket();
+        FakeProcess process = new FakeProcess(true);
+        Path profile = profile(temp, "owned-close");
+        AtomicBoolean ownedWhileCloseFrameWasSent = new AtomicBoolean();
+        socket.onClose = () -> ownedWhileCloseFrameWasSent.set(
+            BrewShot.ownsResources(process, profile));
+        BrewShot shot = new BrewShot(
+            process, profile, socket, new LinkedBlockingQueue<>(), 40);
+
+        shot.close();
+
+        assertTrue(ownedWhileCloseFrameWasSent.get(),
+            "shutdown cleanup must retain ownership until process/profile cleanup completes");
     }
 
     @Test
@@ -232,6 +250,7 @@ class BrewShotTransportDeadlineTest {
             ignored -> CompletableFuture.completedFuture(this);
         private CompletableFuture<WebSocket> closeFuture =
             CompletableFuture.completedFuture(this);
+        private Runnable onClose = () -> { };
         private final AtomicInteger sendCalls = new AtomicInteger();
         private final AtomicInteger closeCalls = new AtomicInteger();
         private final AtomicInteger abortCalls = new AtomicInteger();
@@ -260,6 +279,7 @@ class BrewShotTransportDeadlineTest {
         @Override
         public CompletableFuture<WebSocket> sendClose(int statusCode, String reason) {
             closeCalls.incrementAndGet();
+            onClose.run();
             return closeFuture;
         }
 

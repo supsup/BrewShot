@@ -11,6 +11,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.SimpleFileVisitor;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Base64;
@@ -66,44 +67,24 @@ public final class BrewShot implements AutoCloseable {
     /** One shared client for all launches — no selector-thread accumulation per launch. */
     private static final HttpClient HTTP = HttpClient.newHttpClient();
 
-    // Live instances, so ONE JVM-wide shutdown hook can force-clean any that never reached
-    // close(). On SIGINT/SIGTERM the JVM runs hooks but does NOT unwind stacks, so a
-    // try-with-resources/close() around a BrewShot never fires — Ctrl+C mid-capture is
-    // precisely the case close() misses, and Java never reaps a child process on exit while
-    // headless Chrome doesn't watch its parent, so the child + its brewshot-* temp profile
-    // would leak. The hook is force-clean (destroyForcibly + delete), not the polite close():
-    // a hook must be fast and the websocket may be wedged. SCOPE: this covers SIGINT/SIGTERM
-    // and normal exit, NOT SIGKILL or a hard JVM crash (no hook runs then) — leaks are
-    // reduced, not eliminated.
-    private static final java.util.Set<BrewShot> LIVE =
+    // Process/profile ownership begins immediately after ProcessBuilder.start(), before
+    // stderr discovery or WebSocket connect. The SAME lease remains registered through
+    // bootstrap and close, so shutdown can always find resources; successful cleanup is
+    // the only operation allowed to deregister it. The lock closes the last registration
+    // race with JVM shutdown: a lease registered after shutdown's snapshot sees
+    // shutdownStarted and force-cleans itself.
+    private static final Object OWNERSHIP_LOCK = new Object();
+    private static final Set<ResourceLease> LIVE =
         java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<>());
+    private static boolean shutdownStarted;
     static {
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            for (BrewShot b : LIVE) {
-                // Kill-then-WAIT-then-delete: the ordering is load-bearing (F1-r2). The Chrome
-                // Helper children are the late writers — destroyForcibly() returns immediately
-                // and signals only the parent, so deleting while the tree is still flushing its
-                // shutdown state loses the delete race and the profile dir survives. Descendants
-                // first, then the parent, then a bounded reap (SIGKILL'd processes die in ms;
-                // the bound only guards a wedged kernel), THEN delete — with one retry as the
-                // belt for a helper that outlived the parent's wait.
-                try {
-                    b.chrome.toHandle().descendants().forEach(ProcessHandle::destroyForcibly);
-                    b.chrome.destroyForcibly();
-                    b.chrome.waitFor(2, TimeUnit.SECONDS);
-                } catch (RuntimeException ignored) {
-                } catch (InterruptedException ignored) {
-                    Thread.currentThread().interrupt();
-                }
-                deleteRecursively(b.profileDir);
-                if (java.nio.file.Files.exists(b.profileDir)) {
-                    deleteRecursively(b.profileDir);
-                }
-            }
-        }, "brewshot-shutdown-cleanup"));
+        Runtime.getRuntime().addShutdownHook(new Thread(
+            () -> cleanupOwnedResources(true), "brewshot-shutdown-cleanup"));
     }
 
+    private final ResourceLease lease;
     private final Process chrome;
+    // Kept as a direct field for ShutdownHookProbeMain's stable reflection contract.
     private final Path profileDir;
     private final WebSocket ws;
     private final LinkedBlockingQueue<String> inbox;
@@ -342,21 +323,153 @@ public final class BrewShot implements AutoCloseable {
     /** Package-private timeout seam for pure transport tests (no Chrome process). */
     BrewShot(Process chrome, Path profileDir, WebSocket ws,
              LinkedBlockingQueue<String> inbox, long closeTimeoutMs) {
-        this.chrome = chrome;
-        this.profileDir = profileDir;
+        this(registerLaunchLease(chrome, profileDir, BrewShot::deleteRecursively),
+            ws, inbox, closeTimeoutMs);
+    }
+
+    BrewShot(ResourceLease lease, WebSocket ws,
+             LinkedBlockingQueue<String> inbox, long closeTimeoutMs) {
+        this.lease = lease;
+        this.chrome = lease.process;
+        this.profileDir = lease.profileDir;
         this.ws = ws;
         this.inbox = inbox;
         this.closeTimeoutMs = Math.max(1, closeTimeoutMs);
-        LIVE.add(this); // deregistered in close(); force-cleaned by the shutdown hook otherwise
+        lease.transferToClient();
     }
 
     @FunctionalInterface
     interface WebSocketConnector {
-        CompletableFuture<WebSocket> connect(URI uri, WebSocket.Listener listener);
+        CompletableFuture<WebSocket> connect(URI uri, WebSocket.Listener listener,
+                                             Duration connectTimeout);
     }
 
     private static final WebSocketConnector HTTP_CONNECTOR =
-        (uri, listener) -> HTTP.newWebSocketBuilder().buildAsync(uri, listener);
+        (uri, listener, connectTimeout) -> connectWebSocket(
+            HTTP.newWebSocketBuilder(), uri, listener, connectTimeout);
+
+    static CompletableFuture<WebSocket> connectWebSocket(
+            WebSocket.Builder builder, URI uri, WebSocket.Listener listener,
+            Duration connectTimeout) {
+        return builder.connectTimeout(connectTimeout).buildAsync(uri, listener);
+    }
+
+    @FunctionalInterface
+    interface ProfileDeleter {
+        void delete(Path profileDir);
+    }
+
+    /**
+     * Durable ownership of the process/profile pair. Cleanup passes serialize,
+     * but failed passes do not release ownership: a later close or shutdown pass
+     * can retry a process that ignored SIGKILL or a profile deletion that raced
+     * a late helper writer.
+     */
+    static final class ResourceLease {
+        private enum Owner { LAUNCH, CLIENT, RELEASED }
+
+        private final Process process;
+        private final Path profileDir;
+        private final ProfileDeleter profileDeleter;
+        private Owner owner = Owner.LAUNCH;
+
+        private ResourceLease(Process process, Path profileDir,
+                              ProfileDeleter profileDeleter) {
+            this.process = process;
+            this.profileDir = profileDir;
+            this.profileDeleter = profileDeleter;
+        }
+
+        synchronized void transferToClient() {
+            if (owner != Owner.LAUNCH || !isRegistered(this) || !isAlive(process)) {
+                throw new IllegalStateException(
+                    "Chrome resources were cleaned up while launch was in progress");
+            }
+            owner = Owner.CLIENT;
+        }
+
+        synchronized void requireOwned() {
+            if (owner == Owner.RELEASED || !isRegistered(this) || !isAlive(process)) {
+                throw new IllegalStateException(
+                    "Chrome resources were cleaned up while launch was in progress");
+            }
+        }
+
+        synchronized void cleanup(boolean gracefulFirst) {
+            if (owner == Owner.RELEASED) { return; }
+
+            boolean processReaped = terminateProcess(process, gracefulFirst);
+            if (processReaped) {
+                try { profileDeleter.delete(profileDir); }
+                catch (RuntimeException ignored) {
+                    // Ownership remains registered; a later close/hook retries.
+                }
+            }
+
+            if (!isAlive(process) && !profileExists(profileDir)) {
+                owner = Owner.RELEASED;
+                deregister(this);
+            }
+        }
+
+        synchronized boolean isOwned() {
+            return owner != Owner.RELEASED && isRegistered(this);
+        }
+    }
+
+    static ResourceLease registerLaunchLease(Process process, Path profileDir,
+                                             ProfileDeleter profileDeleter) {
+        ResourceLease lease = new ResourceLease(process, profileDir, profileDeleter);
+        boolean cleanupImmediately;
+        synchronized (OWNERSHIP_LOCK) {
+            LIVE.add(lease);
+            cleanupImmediately = shutdownStarted;
+        }
+        if (cleanupImmediately) { lease.cleanup(false); }
+        return lease;
+    }
+
+    static ResourceLease registerLaunchLease(Process process, Path profileDir) {
+        return registerLaunchLease(process, profileDir, BrewShot::deleteRecursively);
+    }
+
+    private static boolean isRegistered(ResourceLease lease) {
+        synchronized (OWNERSHIP_LOCK) {
+            return LIVE.contains(lease);
+        }
+    }
+
+    private static void deregister(ResourceLease lease) {
+        synchronized (OWNERSHIP_LOCK) {
+            LIVE.remove(lease);
+        }
+    }
+
+    private static void cleanupOwnedResources(boolean beginJvmShutdown) {
+        List<ResourceLease> snapshot;
+        synchronized (OWNERSHIP_LOCK) {
+            if (beginJvmShutdown) { shutdownStarted = true; }
+            snapshot = List.copyOf(LIVE);
+        }
+        for (ResourceLease lease : snapshot) {
+            lease.cleanup(false);
+        }
+    }
+
+    static void runShutdownCleanupForTests() {
+        cleanupOwnedResources(false);
+    }
+
+    static boolean ownsResources(Process process, Path profileDir) {
+        synchronized (OWNERSHIP_LOCK) {
+            for (ResourceLease lease : LIVE) {
+                if (lease.process == process && lease.profileDir.equals(profileDir)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
 
     /** Launch with a sensible default viewport (1280x900). */
     public static BrewShot launch() throws IOException {
@@ -395,20 +508,31 @@ public final class BrewShot implements AutoCloseable {
             args.addAll(List.of(extra.trim().split("\\s+")));
         }
         args.add("about:blank");
-        Process p = new ProcessBuilder(args)
-            // stdout is never read — discard it so a chatty binary can't
-            // deadlock on a full 64KB pipe.
-            .redirectOutput(ProcessBuilder.Redirect.DISCARD)
-            .start();
+        Process p;
+        try {
+            p = new ProcessBuilder(args)
+                // stdout is never read — discard it so a chatty binary can't
+                // deadlock on a full 64KB pipe.
+                .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+                .start();
+        } catch (RuntimeException | IOException | Error e) {
+            deleteRecursively(profile);
+            throw e;
+        }
+        // This is deliberately the first operation after start(): discovery,
+        // connect, bootstrap, and close all share this one continuously
+        // registered owner.
+        ResourceLease lease =
+            registerLaunchLease(p, profile, BrewShot::deleteRecursively);
 
         String wsUrl;
         try {
             wsUrl = awaitDevtoolsUrl(p);
         } catch (RuntimeException | IOException | Error e) {
-            terminateProcess(p, profile, false);
+            lease.cleanup(false);
             throw e;
         }
-        return finishLaunch(p, profile, wsUrl, HTTP_CONNECTOR, envTimeoutMs());
+        return finishLaunch(lease, wsUrl, HTTP_CONNECTOR, envTimeoutMs());
     }
 
     /**
@@ -418,14 +542,26 @@ public final class BrewShot implements AutoCloseable {
     static BrewShot finishLaunch(Process p, Path profile, String wsUrl,
                                  WebSocketConnector connector, long connectTimeoutMs)
             throws IOException {
+        ResourceLease lease =
+            registerLaunchLease(p, profile, BrewShot::deleteRecursively);
+        return finishLaunch(lease, wsUrl, connector, connectTimeoutMs);
+    }
+
+    static BrewShot finishLaunch(ResourceLease lease, String wsUrl,
+                                 WebSocketConnector connector, long connectTimeoutMs)
+            throws IOException {
         LinkedBlockingQueue<String> inbox = new LinkedBlockingQueue<>();
         WebSocket socket = null;
         BrewShot c = null;
+        long boundedConnectTimeoutMs = Math.max(1, connectTimeoutMs);
+        Deadline connectDeadline = Deadline.afterMillis(boundedConnectTimeoutMs);
         try {
             CompletableFuture<WebSocket> connecting =
-                connector.connect(URI.create(wsUrl), new Accumulator(inbox));
-            socket = awaitConnection(connecting, connectTimeoutMs);
-            c = new BrewShot(p, profile, socket, inbox);
+                connector.connect(URI.create(wsUrl), new Accumulator(inbox),
+                    Duration.ofMillis(boundedConnectTimeoutMs));
+            socket = awaitConnection(
+                connecting, connectDeadline, boundedConnectTimeoutMs);
+            c = new BrewShot(lease, socket, inbox, DEFAULT_CLOSE_TIMEOUT_MS);
             // Browser-scope bootstrap (sessionId == null): open a tab, attach flat.
             Map<String, Object> created =
                 c.command("Target.createTarget", "{\"url\":\"about:blank\"}");
@@ -436,18 +572,25 @@ public final class BrewShot implements AutoCloseable {
             c.command("Page.enable", "{}");
             c.command("Runtime.enable", "{}");
             c.command("Network.enable", "{}"); // in-flight tracking for waitForNetworkIdle
+            lease.requireOwned();
             return c;
         } catch (RuntimeException | IOException | Error e) {
-            if (c != null) { LIVE.remove(c); }
             abort(socket);
-            terminateProcess(p, profile, false);
+            lease.cleanup(false);
             throw e;
         }
     }
 
     static WebSocket awaitConnection(CompletableFuture<WebSocket> connecting,
                                      long timeoutMs) throws IOException {
-        Deadline deadline = Deadline.afterMillis(timeoutMs);
+        long boundedTimeoutMs = Math.max(1, timeoutMs);
+        return awaitConnection(
+            connecting, Deadline.afterMillis(boundedTimeoutMs), boundedTimeoutMs);
+    }
+
+    private static WebSocket awaitConnection(CompletableFuture<WebSocket> connecting,
+                                             Deadline deadline, long timeoutMs)
+            throws IOException {
         try {
             return await(connecting, deadline);
         } catch (TimeoutException e) {
@@ -1756,12 +1899,13 @@ public final class BrewShot implements AutoCloseable {
 
     @Override
     public void close() {
-        if (!closed.compareAndSet(false, true)) { return; }
-        LIVE.remove(this); // graceful close owns the teardown now; the hook needn't touch it
+        boolean closeTransport = closed.compareAndSet(false, true);
         try {
-            closeWebSocket();
+            if (closeTransport) { closeWebSocket(); }
         } finally {
-            terminateProcess(chrome, profileDir, true);
+            // Every call retries resource cleanup. sendClose remains once-only,
+            // but a prior SIGKILL/delete failure must not make close() a no-op.
+            lease.cleanup(true);
         }
     }
 
@@ -1794,35 +1938,34 @@ public final class BrewShot implements AutoCloseable {
      * uninterruptible only inside the fixed cleanup budget; the caller's
      * interrupt status is restored before return.
      */
-    private static void terminateProcess(Process process, Path profileDir,
-                                         boolean gracefulFirst) {
+    private static boolean terminateProcess(Process process, boolean gracefulFirst) {
         boolean[] interrupted = { Thread.interrupted() };
         try {
-            boolean exited;
+            if (!isAlive(process)) {
+                // A reaped Chrome parent can still have live helper processes.
+                // Preserve the shutdown hook's descendants-first sweep before
+                // allowing the profile lease to advance to deletion.
+                destroyDescendantsForcibly(process);
+                return true;
+            }
+
             if (gracefulFirst) {
                 try { process.destroy(); }
                 catch (RuntimeException ignored) { }
-                exited = !isAlive(process)
+                boolean exited = !isAlive(process)
                     || waitForProcess(process, PROCESS_CLOSE_TIMEOUT_MS, interrupted);
+                if (!exited && isAlive(process)) {
+                    destroyForcibly(process);
+                    waitForProcess(
+                        process, PROCESS_FORCE_REAP_TIMEOUT_MS, interrupted);
+                }
             } else {
-                destroyForcibly(process);
-                exited = !isAlive(process)
-                    || waitForProcess(process, PROCESS_FORCE_REAP_TIMEOUT_MS, interrupted);
-            }
-
-            if (!exited && isAlive(process)) {
                 destroyForcibly(process);
                 waitForProcess(process, PROCESS_FORCE_REAP_TIMEOUT_MS, interrupted);
             }
+            return !isAlive(process);
         } finally {
-            try {
-                deleteRecursively(profileDir);
-                if (Files.exists(profileDir)) {
-                    deleteRecursively(profileDir);
-                }
-            } finally {
-                if (interrupted[0]) { Thread.currentThread().interrupt(); }
-            }
+            if (interrupted[0]) { Thread.currentThread().interrupt(); }
         }
     }
 
@@ -1848,15 +1991,24 @@ public final class BrewShot implements AutoCloseable {
         catch (RuntimeException ignored) { return true; }
     }
 
+    private static boolean profileExists(Path profileDir) {
+        try { return Files.exists(profileDir); }
+        catch (RuntimeException ignored) { return true; }
+    }
+
     private static void destroyForcibly(Process process) {
+        destroyDescendantsForcibly(process);
+        try { process.destroyForcibly(); }
+        catch (RuntimeException ignored) { }
+    }
+
+    private static void destroyDescendantsForcibly(Process process) {
         try (var descendants = process.toHandle().descendants()) {
             descendants.forEach(handle -> {
                 try { handle.destroyForcibly(); }
                 catch (RuntimeException ignored) { }
             });
         } catch (RuntimeException ignored) { }
-        try { process.destroyForcibly(); }
-        catch (RuntimeException ignored) { }
     }
 
     private static void deleteRecursively(Path dir) {

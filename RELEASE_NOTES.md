@@ -20,6 +20,12 @@ the end of the macOS crash-dialog spam.
   0.11.0-release lineage (the in-review seam-patch branch) still vendors **0.2.0**,
   which has no env hook — suite runs on that lineage cannot take the workaround and
   will keep spawning dialogs until the fixed jar exists.
+- **Bounded, continuously-owned DevTools transport lifecycle.** Command timeouts now
+  cover WebSocket send plus response on one monotonic deadline; connect is bounded
+  both natively and at the Future boundary, and close has a timed abort fallback. A
+  process/profile lease is registered immediately after Chrome starts and remains
+  retryable through discovery, bootstrap, close, forced-reap failure, and
+  profile-delete failure, including JVM shutdown races.
 - **`--gif N` records a looping GIF from the CLI** (plan 6cc2d9ec, roadmap B4): the
   whole `recordGif*` family was library-only, so `java -jar` users had GIFs in the
   engine and zero access from the shell. `--gif N` flips the shoot to a recording
