@@ -242,16 +242,24 @@ straight into a PR review (on private repos a quoted verdict travels where an
 image upload won't):
 
 ```bash
-$ brewshot diff before.png after.png --json verdict.json --diff-out heat.png
-0.55% of pixels changed (1365 of 250400; 771 anti-aliasing px ignored);
+$ brewshot diff before.png after.png --ignore-antialiasing --json verdict.json --diff-out heat.png
+0.55% of comparable pixels changed (1365 of 250400; 771 anti-aliasing px ignored);
 largest cluster at 173,203 (43x17, 20% of the change) — in the body.
 ```
 
-- **Anti-aliasing forgiveness is ON by default** — a raw AA diff of two
-  re-renders is a noise wall (font hinting shifts every glyph edge a pixel).
-  A 3×3 shifted-edge heuristic forgives those, and everything it forgives is
-  **counted and printed** in the verdict — nothing is silently eaten.
-  `--pixel-exact` opts out for byte-faithful comparison.
+- **Strict / pixel-honest by default** — the CLI counts every changed pixel, so
+  a genuine 1-pixel layout move can never pass as "zero changes". Anti-aliasing
+  forgiveness (a 3×3 shifted-edge heuristic — font hinting shifts every glyph
+  edge a pixel) is **opt-in** via `--ignore-antialiasing`; when enabled,
+  everything it forgives is **counted and printed** in the verdict, never
+  silently eaten. `--pixel-exact` is the byte-exact shorthand (tolerance 0 **and**
+  no AA forgiveness). `--tolerance N` sets the per-channel delta floor (0..255).
+- **Distinct paths enforced** — the two inputs and any `--json` / `--diff-out`
+  target must be different files; an alias that would overwrite an input is
+  refused (exit 2) *before* anything is read, and each sidecar is written to a
+  sibling temp file and atomically moved into place. Input dimensions are also
+  capped (`brewshot.maxImageDimension`=16384 px/axis, `brewshot.maxImagePixels`
+  =67108864 total; raise either with `-D`).
 - **Threshold gate**: `--fail-over 0.5` (percent) / `--fail-pixels 100` →
   **exit 4 with the verdict and artifacts still written** — the same
   evidence-first contract as `--fail-js`.

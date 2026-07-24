@@ -329,7 +329,13 @@ public final class Main {
     private static int runDiff(String[] args) {
         java.util.List<Path> images = new java.util.ArrayList<>(2);
         int tolerance = BrewShotDiff.DEFAULT_TOLERANCE;
-        boolean ignoreAntialiasing = true;   // Fix's call (brewshot #25): AA-ignore ON by default
+        boolean toleranceSet = false;
+        // F-04 (audit, Charles's call): the CLI now defaults to STRICT / pixel-honest. AA
+        // forgiveness silently swallowed a real 1-pixel layout move (a genuine regression
+        // passed as zero changes), so it is OPT-IN via --ignore-antialiasing (default OFF).
+        // --pixel-exact stays as the byte-exact shorthand (tolerance 0 AND no AA forgiveness).
+        boolean ignoreAntialiasing = false;
+        boolean pixelExact = false;
         java.util.List<int[]> masks = new java.util.ArrayList<>();
         Double failOverPct = null;
         Long failPixels = null;
@@ -338,10 +344,18 @@ public final class Main {
         try {
             for (int i = 0; i < args.length; i++) {
                 switch (args[i]) {
-                    case "--tolerance" -> tolerance = posInt("--tolerance", requireValue(args, ++i));
-                    // AA forgiveness is ON by default; --pixel-exact is the opt-OUT for
-                    // byte-faithful comparisons (every ignored pixel is counted either way).
-                    case "--pixel-exact" -> ignoreAntialiasing = false;
+                    case "--tolerance" -> {
+                        tolerance = posInt("--tolerance", requireValue(args, ++i));
+                        toleranceSet = true;
+                    }
+                    // F-04: AA forgiveness is OPT-IN now (default strict). This flag turns the
+                    // 3x3 shifted-edge heuristic ON; everything it forgives is still counted and
+                    // printed in the verdict — nothing is silently eaten.
+                    case "--ignore-antialiasing" -> ignoreAntialiasing = true;
+                    // --pixel-exact = byte-exact: tolerance 0 AND no AA forgiveness. Reconciled
+                    // against the strict default below (contradicts --ignore-antialiasing / a
+                    // non-zero --tolerance).
+                    case "--pixel-exact" -> pixelExact = true;
                     case "--mask" -> {
                         String[] p = requireValue(args, ++i).split(",");
                         if (p.length != 4) { return err("--mask wants x,y,w,h"); }
@@ -368,8 +382,35 @@ public final class Main {
             diffUsage();
             return 2;
         }
-        DiffJob job = new DiffJob(images.get(0), images.get(1),
-            new BrewShotDiff.Options(tolerance, ignoreAntialiasing, java.util.List.copyOf(masks)),
+        // F-04 reconciliation: --pixel-exact (byte-exact) means strict AND tolerance 0. It
+        // contradicts --ignore-antialiasing (opt-in forgiveness) and a non-zero --tolerance —
+        // refuse the contradiction LOUD rather than silently picking a winner.
+        if (pixelExact) {
+            if (ignoreAntialiasing) {
+                return err("--pixel-exact (byte-exact) and --ignore-antialiasing are contradictory"
+                    + " (one demands an exact compare, the other forgives shifted edges) — pick one");
+            }
+            if (toleranceSet && tolerance != 0) {
+                return err("--pixel-exact implies tolerance 0 (byte-exact); drop --tolerance or set"
+                    + " it to 0, got: " + tolerance);
+            }
+            tolerance = 0;
+        }
+        // F-05 (audit): artifact-alias preflight. A sidecar (--json / --diff-out) aliasing an
+        // INPUT (or the other sidecar) would overwrite/destroy it and still exit 0. Reject the
+        // collision here, BEFORE any image is decoded.
+        String aliasErr = diffPathAliasError(images.get(0), images.get(1), jsonOut, diffOut);
+        if (aliasErr != null) {
+            return err(aliasErr);
+        }
+        BrewShotDiff.Options options;
+        try {
+            // F-03: the compact constructor range-checks tolerance; surface it as exit 2.
+            options = new BrewShotDiff.Options(tolerance, ignoreAntialiasing, java.util.List.copyOf(masks));
+        } catch (IllegalArgumentException e) {
+            return err(e.getMessage());
+        }
+        DiffJob job = new DiffJob(images.get(0), images.get(1), options,
             failOverPct, failPixels, diffOut, jsonOut);
         return runDiffJobs(java.util.List.of(job));
     }
@@ -384,6 +425,22 @@ public final class Main {
     static int runDiffJobs(java.util.List<DiffJob> jobs) {
         int worst = 0;
         for (DiffJob job : jobs) {
+            // PNG size-limit preflight (audit): inspect each INPUT's DECLARED dimensions via an
+            // ImageIO reader header BEFORE the full decode / pixel-array allocation, so a
+            // decompression-bomb-scale image is a LOUD refusal (exit 2), not an OOM.
+            try {
+                checkImageWithinLimits(job.a());
+                checkImageWithinLimits(job.b());
+            } catch (ImageTooLargeException e) {
+                System.err.println("brewshot: " + e.getMessage());
+                worst = Math.max(worst, 2);
+                continue;
+            } catch (java.io.IOException e) {
+                // A header-read failure is the same class the decode below reports (exit 1).
+                System.err.println("brewshot: " + e.getMessage());
+                worst = Math.max(worst, 1);
+                continue;
+            }
             java.awt.image.BufferedImage a;
             java.awt.image.BufferedImage b;
             try {
@@ -411,7 +468,7 @@ public final class Main {
             // it (each artifact fails independently; the verdict line above always printed).
             if (job.jsonOut() != null) {
                 try {
-                    Files.writeString(job.jsonOut(),
+                    atomicWriteString(job.jsonOut(),
                         BrewShotDiff.toJson(verdict, job.failOverPct(), job.failPixels(), exceeded));
                     System.err.println("brewshot: wrote " + job.jsonOut());
                 } catch (java.io.IOException e) {
@@ -421,8 +478,7 @@ public final class Main {
             }
             if (job.diffOut() != null && !verdict.sizeMismatch()) {
                 try {
-                    javax.imageio.ImageIO.write(
-                        BrewShotDiff.heatmap(a, b, job.options()), "png", job.diffOut().toFile());
+                    atomicWritePng(BrewShotDiff.heatmap(a, b, job.options()), job.diffOut());
                     System.err.println("brewshot: wrote " + job.diffOut());
                 } catch (java.io.IOException e) {
                     System.err.println("brewshot: failed writing diff heatmap: " + e.getMessage());
@@ -451,18 +507,157 @@ public final class Main {
         return img;
     }
 
+    // ---- F-05: artifact-alias preflight + atomic sidecar writes -------------------------
+
+    /**
+     * F-05 (audit): the diff sidecars (--json, --diff-out) are written straight to their
+     * paths, so pointing one at an INPUT (or at the other sidecar) overwrote it and still
+     * exited 0 — a silent, destructive alias. Normalize every KNOWN path to an absolute,
+     * lexically-canonical form and require the aliasable pairs distinct. The two INPUTS may
+     * be equal (self-compare is legitimate); only output↔input and output↔output collisions
+     * are rejected. Returns an error message, or {@code null} when clean.
+     */
+    private static String diffPathAliasError(Path a, Path b, Path jsonOut, Path diffOut) {
+        Path na = canonicalForAlias(a), nb = canonicalForAlias(b);
+        Path nj = jsonOut == null ? null : canonicalForAlias(jsonOut);
+        Path nd = diffOut == null ? null : canonicalForAlias(diffOut);
+        if (nj != null && (nj.equals(na) || nj.equals(nb))) {
+            return "--json would overwrite a diff INPUT (" + jsonOut + ") — writing the verdict"
+                + " there destroys the image being compared; choose a distinct path";
+        }
+        if (nd != null && (nd.equals(na) || nd.equals(nb))) {
+            return "--diff-out would overwrite a diff INPUT (" + diffOut + ") — writing the heatmap"
+                + " there destroys the image being compared; choose a distinct path";
+        }
+        if (nj != null && nd != null && nj.equals(nd)) {
+            return "--json and --diff-out point at the same file (" + jsonOut + ") — the JSON and"
+                + " the heatmap would clobber each other; choose distinct paths";
+        }
+        return null;
+    }
+
+    /** Absolute, normalized path for alias comparison — lexical (the targets need not exist yet). */
+    private static Path canonicalForAlias(Path p) {
+        return p.toAbsolutePath().normalize();
+    }
+
+    /**
+     * Write text to a sibling temp file, then ATOMIC_MOVE it into place (F-05). A crash or a
+     * concurrent reader never sees a half-written sidecar, and the temp lives in the SAME
+     * directory so the move stays on one filesystem (ATOMIC_MOVE's requirement).
+     */
+    private static void atomicWriteString(Path target, String body) throws java.io.IOException {
+        Path dir = target.toAbsolutePath().getParent();
+        Path tmp = Files.createTempFile(dir, ".brewshot-", ".tmp");
+        try {
+            Files.writeString(tmp, body);
+            moveIntoPlace(tmp, target);
+        } finally {
+            Files.deleteIfExists(tmp);
+        }
+    }
+
+    /** Encode a PNG to a sibling temp file, then ATOMIC_MOVE it into place (F-05). */
+    private static void atomicWritePng(java.awt.image.BufferedImage img, Path target)
+            throws java.io.IOException {
+        Path dir = target.toAbsolutePath().getParent();
+        Path tmp = Files.createTempFile(dir, ".brewshot-", ".png");
+        try {
+            if (!javax.imageio.ImageIO.write(img, "png", tmp.toFile())) {
+                throw new java.io.IOException("no PNG writer available");
+            }
+            moveIntoPlace(tmp, target);
+        } finally {
+            Files.deleteIfExists(tmp);
+        }
+    }
+
+    /** ATOMIC_MOVE where the filesystem supports it, else a REPLACE_EXISTING move (best-effort). */
+    private static void moveIntoPlace(Path tmp, Path target) throws java.io.IOException {
+        try {
+            Files.move(tmp, target,
+                java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        } catch (java.nio.file.AtomicMoveNotSupportedException e) {
+            Files.move(tmp, target, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        }
+    }
+
+    // ---- PNG size-limit properties (audit): reject a decompression-bomb input pre-decode ---
+
+    /** An input image whose DECLARED dimensions blow a configured ceiling (rejected exit 2). */
+    private static final class ImageTooLargeException extends Exception {
+        ImageTooLargeException(String message) { super(message); }
+    }
+
+    /** Max px per axis for a diff input; default 16384, override -Dbrewshot.maxImageDimension=N. */
+    private static long maxImageDimension() {
+        return Long.getLong("brewshot.maxImageDimension", 16_384L);
+    }
+
+    /** Max total area (w*h) for a diff input; default 64 MP, override -Dbrewshot.maxImagePixels=N. */
+    private static long maxImagePixels() {
+        return Long.getLong("brewshot.maxImagePixels", 67_108_864L);
+    }
+
+    /**
+     * Reject an oversized diff INPUT BEFORE the full decode. Reads only the header via an
+     * ImageIO {@link javax.imageio.ImageReader} (getWidth/getHeight — no pixel decode, no
+     * {@code w*h} array), so a decompression-bomb-scale image is refused without the
+     * allocation. Properties are read FRESH each call (a test can set them via
+     * System.setProperty). A file with no registered reader is left for {@link #readImage}
+     * to report canonically (exit 1), so the "not an image" path is unchanged.
+     */
+    private static void checkImageWithinLimits(Path p) throws ImageTooLargeException, java.io.IOException {
+        try (javax.imageio.stream.ImageInputStream iis =
+                 javax.imageio.ImageIO.createImageInputStream(p.toFile())) {
+            if (iis == null) {
+                return;
+            }
+            java.util.Iterator<javax.imageio.ImageReader> readers =
+                javax.imageio.ImageIO.getImageReaders(iis);
+            if (!readers.hasNext()) {
+                return;
+            }
+            javax.imageio.ImageReader reader = readers.next();
+            try {
+                reader.setInput(iis, true, true);
+                long w = reader.getWidth(0);
+                long h = reader.getHeight(0);
+                long maxDim = maxImageDimension();
+                long maxPix = maxImagePixels();
+                if (w > maxDim || h > maxDim) {
+                    throw new ImageTooLargeException(p + ": " + w + "x" + h
+                        + " exceeds the per-axis limit brewshot.maxImageDimension=" + maxDim
+                        + " px — raise it with -Dbrewshot.maxImageDimension=N");
+                }
+                if (w * h > maxPix) {
+                    throw new ImageTooLargeException(p + ": " + w + "x" + h + " = " + (w * h)
+                        + " px exceeds the area limit brewshot.maxImagePixels=" + maxPix
+                        + " — raise it with -Dbrewshot.maxImagePixels=N");
+                }
+            } finally {
+                reader.dispose();
+            }
+        }
+    }
+
     private static void diffUsage() {
         System.err.println("""
             brewshot diff — compare two PNGs into a citable textual verdict
 
-            usage: brewshot diff a.png b.png [--tolerance N] [--pixel-exact]
-                                 [--mask x,y,w,h]... [--fail-over PCT] [--fail-pixels N]
-                                 [--diff-out diff.png] [--json verdict.json]
+            usage: brewshot diff a.png b.png [--tolerance N] [--ignore-antialiasing]
+                                 [--pixel-exact] [--mask x,y,w,h]... [--fail-over PCT]
+                                 [--fail-pixels N] [--diff-out diff.png] [--json verdict.json]
 
-              --tolerance    per-channel delta floor; at/below never counts   (default 16)
-              --pixel-exact  DISABLE the default anti-aliasing forgiveness (a 3x3
-                             shifted-edge heuristic; whatever it ignores is counted
-                             and printed in the verdict — nothing is silently eaten)
+              --tolerance    per-channel delta floor 0..255; at/below never counts (default 16)
+              --ignore-antialiasing
+                             OPT IN to anti-aliasing forgiveness (a 3x3 shifted-edge
+                             heuristic; default OFF / strict so a 1-pixel layout move is
+                             never silently swallowed). Whatever it forgives is counted
+                             and printed in the verdict — nothing is silently eaten
+              --pixel-exact  byte-exact compare: tolerance 0 AND no AA forgiveness (the
+                             default is already strict; this also zeroes the delta floor)
               --mask         exclude a region on both images (dynamic content —
                              clocks, spinners); repeatable
               --fail-over    exit 4 when changed%% exceeds PCT (verdict still written)
@@ -470,8 +665,11 @@ public final class Main {
               --diff-out     write a heatmap PNG (base dimmed, changes magenta)
               --json         write the machine-readable verdict sidecar
 
-            A size mismatch renders an explicit sizeMismatch verdict (never a crash);
-            under any --fail-* gate it exits 4. Uses ImageIO (JVM/jar path — the same
+            The two inputs and any --json/--diff-out target must be distinct paths (an alias
+            that would overwrite an input is refused, exit 2). Input dimensions are capped
+            (brewshot.maxImageDimension=16384 px/axis, brewshot.maxImagePixels=67108864 area;
+            raise via -D). A size mismatch renders an explicit sizeMismatch verdict (never a
+            crash); under any --fail-* gate it exits 4. Uses ImageIO (JVM/jar path — the same
             caveat as GIF recording; not the macOS native binary).""");
     }
 

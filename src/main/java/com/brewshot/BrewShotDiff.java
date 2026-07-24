@@ -17,8 +17,11 @@ import java.util.List;
  * changed mask.
  *
  * <p>Design decisions folded from the consumer review (brewshot #25):
- * anti-aliasing forgiveness is ON by default (a raw AA diff is a noise wall and the
- * verdict would be untrustworthy) and everything it eats is COUNTED and printed —
+ * anti-aliasing forgiveness is OPT-IN at the CLI ({@code --ignore-antialiasing}) and
+ * the CLI defaults to strict / pixel-honest, so a genuine 1-pixel layout move can
+ * never be silently swallowed by the heuristic; the library {@link Options#defaults()}
+ * convenience keeps AA-on for callers who want the noise-tolerant primitive. When
+ * forgiveness IS enabled everything it eats is COUNTED and printed —
  * nothing is silently ignored. This is the diff PRIMITIVE only: no baseline store
  * (that's a fast-follow once diff semantics settle over deterministic captures).
  *
@@ -37,13 +40,28 @@ public final class BrewShotDiff {
 
     /**
      * Diff knobs. {@code tolerance} is the per-channel floor (a pixel changes only when
-     * {@code max(|dr|,|dg|,|db|) > tolerance}); {@code ignoreAntialiasing} enables the
-     * 3×3 shifted-edge forgiveness (ON by default at the CLI — everything it ignores is
-     * still counted in {@link Verdict#antialiasedIgnored}); {@code masks} are
+     * {@code max(|dr|,|dg|,|db|) > tolerance}, valid range 0..255); {@code ignoreAntialiasing} enables the
+     * 3×3 shifted-edge forgiveness (OPT-IN at the CLI via {@code --ignore-antialiasing};
+     * everything it ignores is still counted in {@link Verdict#antialiasedIgnored}); {@code masks} are
      * {@code {x,y,w,h}} regions excluded from comparison on BOTH images (dynamic
      * regions — clocks, spinners — so the numbers stay stable and citable).
      */
     public record Options(int tolerance, boolean ignoreAntialiasing, List<int[]> masks) {
+        /**
+         * F-03 (audit): {@code tolerance} is a per-channel 8-bit delta floor, so only 0..255
+         * is meaningful. The compare is {@code max > tolerance}; a tolerance of 255 (or more)
+         * makes that unsatisfiable — EVERY diff reports zero change, a "green" gate that can
+         * never fail. Out-of-range values are almost always a mistake (a typo, or a percent
+         * mistaken for a channel delta); reject them LOUD at construction rather than silently
+         * neutering the gate. This is the single validation point — the CLI surfaces it as exit 2.
+         */
+        public Options {
+            if (tolerance < 0 || tolerance > 255) {
+                throw new IllegalArgumentException(
+                    "tolerance must be 0..255 (per-channel 8-bit delta floor), got: " + tolerance);
+            }
+        }
+
         public static Options defaults() {
             return new Options(DEFAULT_TOLERANCE, true, List.of());
         }
