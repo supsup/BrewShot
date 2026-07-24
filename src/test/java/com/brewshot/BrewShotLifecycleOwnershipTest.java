@@ -7,8 +7,10 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.URI;
 import java.net.http.WebSocket;
@@ -60,7 +62,7 @@ class BrewShotLifecycleOwnershipTest {
         FakeProcess process = new FakeProcess(1);
         Path profile = profile(temp, "discovery");
         BrewShot.ResourceLease lease =
-            BrewShot.registerLaunchLease(process, profile);
+            BrewShot.registerContainedLaunchLeaseForTests(process, profile);
 
         assertTrue(lease.isOwned(), "the process must be owned before stderr discovery");
         BrewShot.runShutdownCleanupForTests();
@@ -86,7 +88,7 @@ class BrewShotLifecycleOwnershipTest {
 
         Thread launch = new Thread(() -> {
             try {
-                leaseRef.set(BrewShot.startOwnedProcess(
+                leaseRef.set(BrewShot.startContainedOwnedProcessForTests(
                     profile,
                     () -> process,
                     BrewShotLifecycleOwnershipTest::deleteProfile,
@@ -136,7 +138,8 @@ class BrewShotLifecycleOwnershipTest {
         Path ownedProfile = profile(temp, "shutdown-owner");
         CountDownLatch cleanupEntered = new CountDownLatch(1);
         CountDownLatch allowCleanup = new CountDownLatch(1);
-        BrewShot.registerLaunchLease(ownedProcess, ownedProfile, path -> {
+        BrewShot.registerContainedLaunchLeaseForTests(
+            ownedProcess, ownedProfile, path -> {
             cleanupEntered.countDown();
             awaitUnchecked(allowCleanup);
             deleteProfile(path);
@@ -185,7 +188,7 @@ class BrewShotLifecycleOwnershipTest {
         Path profile = profile(temp, "post-start-failure");
 
         IllegalStateException failure = assertThrows(IllegalStateException.class, () ->
-            BrewShot.startLaunchProcess(
+            BrewShot.startContainedLaunchProcessForTests(
                 profile,
                 () -> process,
                 () -> {
@@ -198,7 +201,8 @@ class BrewShotLifecycleOwnershipTest {
         assertTrue(Files.exists(profile),
             "a still-owned live process must retain its profile");
         assertTrue(BrewShot.ownsResources(process, profile),
-            "post-start failure must remain durably registered when reap fails");
+            "post-start failure must remain registered for retry in this JVM"
+                + " when reap fails");
 
         process.exitParentAndOrphanChildren();
         BrewShot.runShutdownCleanupForTests();
@@ -337,12 +341,13 @@ class BrewShotLifecycleOwnershipTest {
         FakeProcess process = new FakeProcess(2);
         Path profile = profile(temp, "forced-reap");
         BrewShot.ResourceLease lease =
-            BrewShot.registerLaunchLease(process, profile);
+            BrewShot.registerContainedLaunchLeaseForTests(process, profile);
 
         BrewShot.runShutdownCleanupForTests();
         assertTrue(process.isAlive(), "the fake ignores the first destroyForcibly");
         assertTrue(Files.exists(profile), "a live process still owns its profile");
-        assertTrue(lease.isOwned(), "failed reap must remain durably registered");
+        assertTrue(lease.isOwned(),
+            "failed reap must remain registered for retry in this JVM");
 
         BrewShot.runShutdownCleanupForTests();
         assertFalse(process.isAlive());
@@ -357,7 +362,7 @@ class BrewShotLifecycleOwnershipTest {
         FakeProcess process = new FakeProcess(Integer.MAX_VALUE);
         Path profile = profile(temp, "shutdown-exhausted");
         BrewShot.ResourceLease lease =
-            BrewShot.registerLaunchLease(process, profile);
+            BrewShot.registerContainedLaunchLeaseForTests(process, profile);
 
         long started = System.nanoTime();
         BrewShot.runJvmShutdownCleanupForTests();
@@ -370,7 +375,7 @@ class BrewShotLifecycleOwnershipTest {
         assertTrue(process.isAlive());
         assertTrue(Files.exists(profile));
         assertTrue(lease.isOwned(),
-            "exhausted cleanup must retain a durable owner for later reconciliation");
+            "exhausted cleanup must retain its in-memory owner for this JVM");
 
         process.exitParentAndOrphanChildren();
         BrewShot.runShutdownCleanupForTests();
@@ -389,7 +394,8 @@ class BrewShotLifecycleOwnershipTest {
             Path profile = profile(temp, "global-bound-" + i);
             processes.add(process);
             profiles.add(profile);
-            leases.add(BrewShot.registerLaunchLease(process, profile));
+            leases.add(
+                BrewShot.registerContainedLaunchLeaseForTests(process, profile));
         }
 
         long started = System.nanoTime();
@@ -420,51 +426,53 @@ class BrewShotLifecycleOwnershipTest {
     }
 
     @Test
-    void deadRegistrationWithoutLiveSnapshotCannotAuthorizeRelease(@TempDir Path temp)
+    void deadRegistrationWithoutContainmentProofCannotAuthorizeRelease(
+            @TempDir Path temp)
             throws Exception {
         FakeHandle parentHandle = new FakeHandle(31, false, List.of());
         FakeProcess process = new FakeProcess(1, false, parentHandle);
         Path profile = profile(temp, "no-live-snapshot");
+        AtomicBoolean containmentClosed = new AtomicBoolean();
         BrewShot.ResourceLease lease =
-            BrewShot.registerLaunchLease(process, profile);
+            BrewShot.registerLaunchLeaseWithReleaseProofForTests(
+                process, profile, BrewShotLifecycleOwnershipTest::deleteProfile,
+                containmentClosed::get);
 
         BrewShot.runShutdownCleanupForTests();
 
         assertTrue(Files.exists(profile),
-            "empty descendants observed only after death cannot prove tree reap");
+            "a dead parent does not prove that no reparented helper survives");
         assertTrue(lease.isOwned());
 
-        // Test-only recovery so this deliberately unresolved lease does not
-        // pollute the shared JVM after the assertion.
-        process.reviveParent();
-        lease.refreshOwnershipCheckpoint();
-        process.exitParentAndOrphanChildren();
+        containmentClosed.set(true);
         BrewShot.runShutdownCleanupForTests();
         assertFalse(Files.exists(profile));
         assertFalse(lease.isOwned());
     }
 
     @Test
-    void unstableLiveDescendantEnumerationCannotAuthorizeRelease(@TempDir Path temp)
+    void unstableEnumerationCannotBypassContainmentProof(
+            @TempDir Path temp)
             throws Exception {
         FakeHandle parentHandle = new FakeHandle(32, true, List.of());
         parentHandle.failDescendantEnumeration();
         FakeProcess process = new FakeProcess(1, true, parentHandle);
         Path profile = profile(temp, "unstable-live-snapshot");
+        AtomicBoolean containmentClosed = new AtomicBoolean();
         BrewShot.ResourceLease lease =
-            BrewShot.registerLaunchLease(process, profile);
+            BrewShot.registerLaunchLeaseWithReleaseProofForTests(
+                process, profile, BrewShotLifecycleOwnershipTest::deleteProfile,
+                containmentClosed::get);
 
         process.exitParentAndOrphanChildren();
         BrewShot.runShutdownCleanupForTests();
 
         assertTrue(Files.exists(profile),
-            "a failed live enumeration cannot prove an empty process tree");
+            "a failed JDK enumeration cannot substitute for containment proof");
         assertTrue(lease.isOwned());
 
         parentHandle.allowDescendantEnumeration();
-        process.reviveParent();
-        lease.refreshOwnershipCheckpoint();
-        process.exitParentAndOrphanChildren();
+        containmentClosed.set(true);
         BrewShot.runShutdownCleanupForTests();
         assertFalse(Files.exists(profile));
         assertFalse(lease.isOwned());
@@ -478,7 +486,7 @@ class BrewShotLifecycleOwnershipTest {
         FakeProcess process = new FakeProcess(1, true, parentHandle);
         Path profile = profile(temp, "reaped-parent-helper");
         AtomicBoolean sweptBeforeDelete = new AtomicBoolean();
-        BrewShot.ResourceLease lease = BrewShot.registerLaunchLease(
+        BrewShot.ResourceLease lease = BrewShot.registerContainedLaunchLeaseForTests(
             process, profile, path -> {
                 sweptBeforeDelete.set(helper.destroyForciblyCalls.get() == 1);
                 deleteProfile(path);
@@ -506,7 +514,7 @@ class BrewShotLifecycleOwnershipTest {
         FakeProcess process = new FakeProcess(1, true, parentHandle, true);
         Path profile = profile(temp, "graceful-async-helper");
         BrewShot.ResourceLease lease =
-            BrewShot.registerLaunchLease(process, profile);
+            BrewShot.registerContainedLaunchLeaseForTests(process, profile);
         BrewShot shot = new BrewShot(
             lease, new FakeWebSocket(),
             new java.util.concurrent.LinkedBlockingQueue<>(), 40);
@@ -538,7 +546,137 @@ class BrewShotLifecycleOwnershipTest {
     }
 
     @Test
-    void actualJvmShutdownHookRetriesReapAndDeleteWithinOneInvocation(
+    void childSpawnedDuringDestroyBlocksUnprovenProfileRelease(@TempDir Path temp)
+            throws Exception {
+        FakeHandle capturedHelper = new FakeHandle(62, true, List.of());
+        FakeHandle lateHelper = new FakeHandle(63, true, List.of());
+        FakeHandle parentHandle =
+            new FakeHandle(61, true, List.of(capturedHelper));
+        AtomicBoolean containmentClosed = new AtomicBoolean();
+        FakeProcess process = new FakeProcess(
+            1, true, parentHandle, true,
+            () -> parentHandle.replaceDescendants(
+                List.of(capturedHelper, lateHelper)));
+        Path profile = profile(temp, "late-destroy-helper");
+        BrewShot.ResourceLease lease =
+            BrewShot.registerLaunchLeaseWithReleaseProofForTests(
+                process, profile, BrewShotLifecycleOwnershipTest::deleteProfile,
+                containmentClosed::get);
+        BrewShot shot = new BrewShot(
+            lease, new FakeWebSocket(),
+            new java.util.concurrent.LinkedBlockingQueue<>(), 40);
+
+        shot.close();
+
+        assertFalse(process.isAlive());
+        assertFalse(capturedHelper.isAlive(),
+            "known handles must still be terminated before release is considered");
+        assertEquals(1, capturedHelper.destroyForciblyCalls.get());
+        assertTrue(lateHelper.isAlive(),
+            "the post-snapshot child escaped the dead parent's descendants view");
+        assertEquals(0, lateHelper.destroyForciblyCalls.get(),
+            "an unobserved reparented child cannot be targeted by a stale snapshot");
+        assertTrue(Files.exists(profile),
+            "without closed tree membership the profile must not be deleted");
+        assertTrue(lease.isOwned(),
+            "without closed tree membership the lease must remain owned in this JVM");
+
+        // Supply the proof only after the discriminator's external owner has
+        // terminated the previously-unobservable helper.
+        lateHelper.exitNow();
+        containmentClosed.set(true);
+        BrewShot.runShutdownCleanupForTests();
+        assertFalse(Files.exists(profile));
+        assertFalse(lease.isOwned());
+    }
+
+    @Test
+    void realReparentedShutdownChildBlocksUnprovenProfileRelease(@TempDir Path temp)
+            throws Exception {
+        Path profile = profile(temp, "real-late-shutdown-helper");
+        Path receipt = temp.resolve("late-helper-pid.txt");
+        Path helperReady = temp.resolve("late-helper-ready.txt");
+        String javaBin =
+            Path.of(System.getProperty("java.home"), "bin", "java").toString();
+        Process parent = new NormalExitProcess(new ProcessBuilder(
+            javaBin,
+            "-Djava.awt.headless=true",
+            "-cp", System.getProperty("java.class.path"),
+            LateSpawnOnShutdownProbeMain.class.getName(),
+            "parent", receipt.toString(), helperReady.toString())
+            .redirectErrorStream(true)
+            .start());
+        long parentPid = parent.pid();
+        AtomicBoolean containmentClosed = new AtomicBoolean();
+        BrewShot.ResourceLease lease = null;
+        ProcessHandle helper = null;
+        try {
+            try (BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(
+                        parent.getInputStream(), StandardCharsets.UTF_8))) {
+                String line;
+                do {
+                    line = reader.readLine();
+                } while (line != null && !"READY".equals(line));
+                assertEquals("READY", line,
+                    "real parent probe did not become ready");
+                lease = BrewShot.registerLaunchLeaseWithReleaseProofForTests(
+                    parent, profile, BrewShotLifecycleOwnershipTest::deleteProfile,
+                    containmentClosed::get);
+                lease.cleanup(true);
+            }
+
+            assertTrue(parent.waitFor(5, TimeUnit.SECONDS),
+                "real parent did not exit after graceful destroy");
+            assertTrue(Files.exists(receipt),
+                "the shutdown hook did not record its late child");
+            long helperPid = Long.parseLong(Files.readString(receipt).trim());
+            helper = ProcessHandle.of(helperPid).orElseThrow(
+                () -> new AssertionError("late helper process disappeared"));
+            assertTrue(helper.isAlive(),
+                "the late child must outlive the parent discriminator");
+            assertTrue(helper.parent().map(p -> p.pid() != parentPid).orElse(true),
+                "the late child must have reparented away from the dead parent");
+            assertTrue(Files.exists(profile),
+                "an unobservable real child must block profile deletion");
+            assertTrue(lease.isOwned(),
+                "an unobservable real child must retain JVM-lifetime ownership");
+        } finally {
+            if (parent.isAlive()) {
+                parent.destroyForcibly();
+                parent.waitFor(5, TimeUnit.SECONDS);
+            }
+            if (helper == null && Files.exists(receipt)) {
+                try {
+                    helper = ProcessHandle.of(
+                        Long.parseLong(Files.readString(receipt).trim()))
+                        .orElse(null);
+                } catch (RuntimeException ignored) { }
+            }
+            if (helper != null && helper.isAlive()) {
+                helper.destroyForcibly();
+                try { helper.onExit().get(5, TimeUnit.SECONDS); }
+                catch (java.util.concurrent.ExecutionException
+                        | java.util.concurrent.TimeoutException ignored) { }
+            }
+            if (lease != null) {
+                assertFalse(parent.isAlive(),
+                    "the discriminator parent must be dead before test reclamation");
+                assertTrue(helper == null || !helper.isAlive(),
+                    "the discriminator child must be dead before test reclamation");
+                containmentClosed.set(true);
+                lease.cleanup(false);
+            } else if (Files.exists(profile)) {
+                deleteProfile(profile);
+            }
+        }
+
+        assertFalse(Files.exists(profile));
+        assertFalse(lease.isOwned());
+    }
+
+    @Test
+    void actualJvmShutdownHookRetriesContainedReapAndDeleteWithinOneInvocation(
             @TempDir Path temp) throws Exception {
         Path profile = temp.resolve("hook-profile");
         Path receipt = temp.resolve("hook-receipt.txt");
@@ -560,10 +698,45 @@ class BrewShotLifecycleOwnershipTest {
             probe.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
         assertEquals(0, probe.exitValue(), output);
         assertFalse(Files.exists(profile),
-            "one real JVM hook invocation must finish both retryable stages");
+            "the controlled fake supplies containment proof, so one real JVM hook"
+                + " invocation must finish both retryable stages");
         assertEquals(List.of("force=1", "force=2", "delete=1", "delete=2"),
             Files.readAllLines(receipt),
             "the actual hook must reconcile reap, then delete, without a second invocation");
+    }
+
+    @Test
+    void actualJvmExitReclaimsUnprovenLeaseButLeavesProfileOnDisk(
+            @TempDir Path temp) throws Exception {
+        Path profile = temp.resolve("unproven-hook-profile");
+        Path receipt = temp.resolve("unproven-hook-receipt.txt");
+        String javaBin =
+            Path.of(System.getProperty("java.home"), "bin", "java").toString();
+        Process probe = new ProcessBuilder(
+            javaBin,
+            "-Djava.awt.headless=true",
+            "-cp", System.getProperty("java.class.path"),
+            "com.brewshot.ShutdownLifecycleRetryProbeMain",
+            profile.toString(),
+            receipt.toString(),
+            "unproven")
+            .redirectErrorStream(true)
+            .start();
+
+        assertTrue(probe.waitFor(10, TimeUnit.SECONDS),
+            "unproven pure-Java shutdown-hook probe did not exit");
+        String output = new String(
+            probe.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+        assertEquals(0, probe.exitValue(), output);
+        assertTrue(Files.exists(profile),
+            "JVM exit reclaims only the in-memory registry; without release proof"
+                + " the profile must remain on disk");
+        assertEquals(List.of("force=1", "force=2"),
+            Files.readAllLines(receipt),
+            "known handles must still be reaped, but deletion must not run");
+
+        // Controlled fake has no unobserved child; the outer test owns cleanup.
+        deleteProfile(profile);
     }
 
     @Test
@@ -574,7 +747,7 @@ class BrewShotLifecycleOwnershipTest {
         AtomicInteger deleteCalls = new AtomicInteger();
         CountDownLatch firstDeleteStarted = new CountDownLatch(1);
         CountDownLatch releaseFirstDelete = new CountDownLatch(1);
-        BrewShot.ResourceLease lease = BrewShot.registerLaunchLease(
+        BrewShot.ResourceLease lease = BrewShot.registerContainedLaunchLeaseForTests(
             process, profile, path -> {
                 if (deleteCalls.incrementAndGet() == 1) {
                     firstDeleteStarted.countDown();
@@ -606,7 +779,7 @@ class BrewShotLifecycleOwnershipTest {
         assertFalse(process.isAlive());
         assertTrue(Files.exists(profile));
         assertTrue(BrewShot.ownsResources(process, profile),
-            "a surviving profile must keep its durable cleanup owner");
+            "a surviving profile must keep its JVM-lifetime cleanup owner");
 
         Thread shutdown = new Thread(() -> {
             try { BrewShot.runShutdownCleanupForTests(); }
@@ -798,6 +971,7 @@ class BrewShotLifecycleOwnershipTest {
         private final AtomicBoolean alive;
         private final ProcessHandle handle;
         private final boolean gracefulKillsParent;
+        private final Runnable beforeGracefulExit;
         private final AtomicInteger destroyForciblyCalls = new AtomicInteger();
 
         FakeProcess(int forceKillsAfter) {
@@ -812,10 +986,18 @@ class BrewShotLifecycleOwnershipTest {
 
         FakeProcess(int forceKillsAfter, boolean initiallyAlive,
                     ProcessHandle handle, boolean gracefulKillsParent) {
+            this(forceKillsAfter, initiallyAlive, handle, gracefulKillsParent,
+                () -> { });
+        }
+
+        FakeProcess(int forceKillsAfter, boolean initiallyAlive,
+                    ProcessHandle handle, boolean gracefulKillsParent,
+                    Runnable beforeGracefulExit) {
             this.forceKillsAfter = forceKillsAfter;
             this.alive = new AtomicBoolean(initiallyAlive);
             this.handle = handle;
             this.gracefulKillsParent = gracefulKillsParent;
+            this.beforeGracefulExit = beforeGracefulExit;
         }
 
         @Override
@@ -846,7 +1028,10 @@ class BrewShotLifecycleOwnershipTest {
 
         @Override
         public void destroy() {
-            if (gracefulKillsParent) { exitParentAndOrphanChildren(); }
+            if (gracefulKillsParent) {
+                beforeGracefulExit.run();
+                exitParentAndOrphanChildren();
+            }
         }
 
         @Override
@@ -874,10 +1059,77 @@ class BrewShotLifecycleOwnershipTest {
                 fake.clearDescendants();
             }
         }
+    }
 
-        void reviveParent() {
-            alive.set(true);
-            if (handle instanceof FakeHandle fake) { fake.revive(); }
+    /**
+     * Real subprocess with a portable graceful-destroy seam. Java's direct
+     * {@code Process.destroy()} does not promise that shutdown hooks run on
+     * every OS; this wrapper makes destroy request a normal exit over stdin,
+     * while every other lifecycle operation delegates to the real process.
+     */
+    private static final class NormalExitProcess extends Process {
+        private final Process delegate;
+
+        NormalExitProcess(Process delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public OutputStream getOutputStream() {
+            return delegate.getOutputStream();
+        }
+
+        @Override
+        public InputStream getInputStream() {
+            return delegate.getInputStream();
+        }
+
+        @Override
+        public InputStream getErrorStream() {
+            return delegate.getErrorStream();
+        }
+
+        @Override
+        public int waitFor() throws InterruptedException {
+            return delegate.waitFor();
+        }
+
+        @Override
+        public boolean waitFor(long timeout, TimeUnit unit)
+                throws InterruptedException {
+            return delegate.waitFor(timeout, unit);
+        }
+
+        @Override
+        public int exitValue() {
+            return delegate.exitValue();
+        }
+
+        @Override
+        public void destroy() {
+            try {
+                delegate.getOutputStream().write(1);
+                delegate.getOutputStream().flush();
+            } catch (IOException e) {
+                throw new IllegalStateException(
+                    "could not request normal probe exit", e);
+            }
+        }
+
+        @Override
+        public Process destroyForcibly() {
+            delegate.destroyForcibly();
+            return this;
+        }
+
+        @Override
+        public boolean isAlive() {
+            return delegate.isAlive();
+        }
+
+        @Override
+        public ProcessHandle toHandle() {
+            return delegate.toHandle();
         }
     }
 
@@ -976,8 +1228,8 @@ class BrewShotLifecycleOwnershipTest {
             descendants.set(List.of());
         }
 
-        void revive() {
-            alive.set(true);
+        void replaceDescendants(List<ProcessHandle> replacement) {
+            descendants.set(replacement);
         }
 
         void failDescendantEnumeration() {

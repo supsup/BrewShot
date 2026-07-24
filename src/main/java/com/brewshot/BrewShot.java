@@ -74,8 +74,10 @@ public final class BrewShot implements AutoCloseable {
     // lease registration share one monitor. Once shutdown closes admission and snapshots
     // LIVE under that monitor, it is impossible for an already-admitted process to appear
     // after the hook finishes. The SAME lease remains registered through discovery,
-    // bootstrap, and close; successful process-tree reap + profile deletion is the only
-    // operation allowed to deregister it.
+    // bootstrap, and close. ProcessHandle snapshots cannot prove that a child created
+    // during teardown did not reparent after the final snapshot, so successful cleanup
+    // also requires an independently-owned containment proof before profile deletion or
+    // deregistration.
     private static final Object OWNERSHIP_LOCK = new Object();
     private static final Set<ResourceLease> LIVE =
         java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<>());
@@ -326,7 +328,8 @@ public final class BrewShot implements AutoCloseable {
     /** Package-private timeout seam for pure transport tests (no Chrome process). */
     BrewShot(Process chrome, Path profileDir, WebSocket ws,
              LinkedBlockingQueue<String> inbox, long closeTimeoutMs) {
-        this(registerLaunchLease(chrome, profileDir, BrewShot::deleteRecursively),
+        this(registerContainedLaunchLeaseForTests(
+                chrome, profileDir, BrewShot::deleteRecursively),
             ws, inbox, closeTimeoutMs);
     }
 
@@ -368,10 +371,28 @@ public final class BrewShot implements AutoCloseable {
     }
 
     /**
-     * Durable ownership of the process/profile pair. Cleanup passes serialize,
-     * but failed passes do not release ownership: a later close or shutdown pass
-     * can retry a process that ignored SIGKILL or a profile deletion that raced
-     * a late helper writer.
+     * External proof that process-tree membership is closed and every member
+     * outside the retained JDK handles has exited. A
+     * {@link ProcessHandle#descendants()} snapshot is deliberately not such a
+     * proof: a child can be created after the snapshot and reparent before
+     * another enumeration observes it.
+     */
+    @FunctionalInterface
+    interface ProcessTreeReleaseProof {
+        boolean releaseSafe();
+    }
+
+    private static final ProcessTreeReleaseProof UNPROVEN_PROCESS_TREE_RELEASE =
+        () -> false;
+    private static final ProcessTreeReleaseProof PROVEN_PROCESS_TREE_RELEASE_FOR_TESTS =
+        () -> true;
+
+    /**
+     * JVM-lifetime ownership of the process/profile pair. Cleanup passes
+     * serialize, but failed passes do not release ownership: a later close or
+     * shutdown pass in this JVM can retry a process that ignored SIGKILL or a
+     * profile deletion that raced a late helper writer. The static registry is
+     * reclaimed when the JVM exits; it is not a cross-JVM ownership journal.
      */
     static final class ResourceLease {
         private enum Owner { LAUNCH, CLIENT, RELEASED }
@@ -379,16 +400,18 @@ public final class BrewShot implements AutoCloseable {
         private final Process process;
         private final Path profileDir;
         private final ProfileDeleter profileDeleter;
+        private final ProcessTreeReleaseProof processTreeReleaseProof;
         private ProcessHandle parentHandle;
         private final List<ProcessHandle> descendantHandles = new ArrayList<>();
-        private boolean hasLiveParentSnapshot;
         private Owner owner = Owner.LAUNCH;
 
         private ResourceLease(Process process, Path profileDir,
-                              ProfileDeleter profileDeleter) {
+                              ProfileDeleter profileDeleter,
+                              ProcessTreeReleaseProof processTreeReleaseProof) {
             this.process = process;
             this.profileDir = profileDir;
             this.profileDeleter = profileDeleter;
+            this.processTreeReleaseProof = processTreeReleaseProof;
             refreshProcessTreeSnapshot();
         }
 
@@ -424,15 +447,17 @@ public final class BrewShot implements AutoCloseable {
             refreshProcessTreeSnapshot();
             boolean processTreeReaped = terminateProcess(
                 process, parentHandle, List.copyOf(descendantHandles),
-                hasLiveParentSnapshot, gracefulFirst, deadline);
-            if (processTreeReaped) {
+                gracefulFirst, deadline);
+            boolean releaseProven =
+                processTreeReaped && processTreeReleaseSafe();
+            if (releaseProven) {
                 try { profileDeleter.delete(profileDir); }
                 catch (RuntimeException ignored) {
                     // Ownership remains registered; a later close/hook retries.
                 }
             }
 
-            if (processTreeReaped && !profileExists(profileDir)) {
+            if (releaseProven && !profileExists(profileDir)) {
                 owner = Owner.RELEASED;
                 deregister(this);
             }
@@ -447,24 +472,29 @@ public final class BrewShot implements AutoCloseable {
             if (owner != Owner.RELEASED) { refreshProcessTreeSnapshot(); }
         }
 
+        private boolean processTreeReleaseSafe() {
+            try { return processTreeReleaseProof.releaseSafe(); }
+            catch (RuntimeException ignored) {
+                // A failed proof is no proof. Retain the profile and lease.
+                return false;
+            }
+        }
+
         /**
-         * Capture only becomes authoritative when the parent is observed alive
-         * both before and after enumeration. An empty enumeration obtained only
-         * after parent death must never authorize profile release.
+         * Retain every identity an enumeration exposes so cleanup can still
+         * signal it after reparenting. This snapshot is useful termination input,
+         * never evidence that membership is complete.
          */
         private void refreshProcessTreeSnapshot() {
-            boolean aliveBefore = isAlive(process);
             ProcessHandle observedParent = null;
             List<ProcessHandle> observedDescendants = List.of();
-            boolean enumerationComplete = false;
             try {
                 observedParent = process.toHandle();
                 try (var descendants = observedParent.descendants()) {
                     observedDescendants = descendants.toList();
                 }
-                enumerationComplete = true;
             } catch (RuntimeException ignored) {
-                // Without a complete live-parent snapshot, cleanup remains owned.
+                // Best effort only; the external containment gate stays closed.
             }
 
             if (observedParent != null) {
@@ -475,9 +505,6 @@ public final class BrewShot implements AutoCloseable {
                         descendantHandles.add(handle);
                     }
                 }
-            }
-            if (aliveBefore && enumerationComplete && isAlive(process)) {
-                hasLiveParentSnapshot = true;
             }
         }
     }
@@ -491,6 +518,17 @@ public final class BrewShot implements AutoCloseable {
                                            ProfileDeleter profileDeleter,
                                            Runnable afterStartBeforeRegistration)
             throws IOException {
+        return startOwnedProcess(
+            profileDir, starter, profileDeleter, afterStartBeforeRegistration,
+            UNPROVEN_PROCESS_TREE_RELEASE);
+    }
+
+    private static ResourceLease startOwnedProcess(
+            Path profileDir, ProcessStarter starter,
+            ProfileDeleter profileDeleter,
+            Runnable afterStartBeforeRegistration,
+            ProcessTreeReleaseProof processTreeReleaseProof)
+            throws IOException {
         ResourceLease admitted = null;
         try {
             synchronized (OWNERSHIP_LOCK) {
@@ -500,7 +538,9 @@ public final class BrewShot implements AutoCloseable {
                 }
                 Process process = starter.start();
                 ResourceLease lease =
-                    new ResourceLease(process, profileDir, profileDeleter);
+                    new ResourceLease(
+                        process, profileDir, profileDeleter,
+                        processTreeReleaseProof);
                 admitted = lease;
                 try {
                     afterStartBeforeRegistration.run();
@@ -511,9 +551,10 @@ public final class BrewShot implements AutoCloseable {
             }
         } catch (IOException | RuntimeException | Error e) {
             if (admitted != null) {
-                // A post-start failure already has a durable lease. Its cleanup
-                // alone owns profile deletion; if reap fails, ownership and the
-                // profile must remain intact for a later pass.
+                // A post-start failure already has a JVM-lifetime lease. Its
+                // cleanup alone owns profile deletion; if reap or containment
+                // proof fails, ownership and the profile remain intact for a
+                // later pass in this JVM.
                 admitted.cleanup(false);
             } else {
                 // Shutdown rejection or starter failure created no process
@@ -533,10 +574,39 @@ public final class BrewShot implements AutoCloseable {
             afterStartBeforeRegistration);
     }
 
+    static ResourceLease startContainedOwnedProcessForTests(
+            Path profileDir, ProcessStarter starter,
+            ProfileDeleter profileDeleter,
+            Runnable afterStartBeforeRegistration)
+            throws IOException {
+        return startOwnedProcess(
+            profileDir, starter, profileDeleter, afterStartBeforeRegistration,
+            PROVEN_PROCESS_TREE_RELEASE_FOR_TESTS);
+    }
+
+    static ResourceLease startContainedLaunchProcessForTests(
+            Path profileDir, ProcessStarter starter,
+            Runnable afterStartBeforeRegistration)
+            throws IOException {
+        return startContainedOwnedProcessForTests(
+            profileDir, starter, BrewShot::deleteRecursively,
+            afterStartBeforeRegistration);
+    }
+
     /** Attach an already-started process; production launch uses the admission fence above. */
     static ResourceLease registerLaunchLease(Process process, Path profileDir,
                                              ProfileDeleter profileDeleter) {
-        ResourceLease lease = new ResourceLease(process, profileDir, profileDeleter);
+        return registerLaunchLease(
+            process, profileDir, profileDeleter,
+            UNPROVEN_PROCESS_TREE_RELEASE);
+    }
+
+    private static ResourceLease registerLaunchLease(
+            Process process, Path profileDir,
+            ProfileDeleter profileDeleter,
+            ProcessTreeReleaseProof processTreeReleaseProof) {
+        ResourceLease lease = new ResourceLease(
+            process, profileDir, profileDeleter, processTreeReleaseProof);
         boolean cleanupImmediately;
         synchronized (OWNERSHIP_LOCK) {
             LIVE.add(lease);
@@ -544,6 +614,28 @@ public final class BrewShot implements AutoCloseable {
         }
         if (cleanupImmediately) { lease.cleanup(false); }
         return lease;
+    }
+
+    static ResourceLease registerContainedLaunchLeaseForTests(
+            Process process, Path profileDir,
+            ProfileDeleter profileDeleter) {
+        return registerLaunchLease(
+            process, profileDir, profileDeleter,
+            PROVEN_PROCESS_TREE_RELEASE_FOR_TESTS);
+    }
+
+    static ResourceLease registerContainedLaunchLeaseForTests(
+            Process process, Path profileDir) {
+        return registerContainedLaunchLeaseForTests(
+            process, profileDir, BrewShot::deleteRecursively);
+    }
+
+    static ResourceLease registerLaunchLeaseWithReleaseProofForTests(
+            Process process, Path profileDir,
+            ProfileDeleter profileDeleter,
+            ProcessTreeReleaseProof processTreeReleaseProof) {
+        return registerLaunchLease(
+            process, profileDir, profileDeleter, processTreeReleaseProof);
     }
 
     static ResourceLease registerLaunchLease(Process process, Path profileDir) {
@@ -684,7 +776,8 @@ public final class BrewShot implements AutoCloseable {
                                  WebSocketConnector connector, long connectTimeoutMs)
             throws IOException {
         ResourceLease lease =
-            registerLaunchLease(p, profile, BrewShot::deleteRecursively);
+            registerContainedLaunchLeaseForTests(
+                p, profile, BrewShot::deleteRecursively);
         return finishLaunch(lease, wsUrl, connector, connectTimeoutMs);
     }
 
@@ -2088,8 +2181,7 @@ public final class BrewShot implements AutoCloseable {
     private static boolean terminateProcess(
             Process process, ProcessHandle parentHandle,
             List<ProcessHandle> descendantHandles,
-            boolean hasLiveParentSnapshot, boolean gracefulFirst,
-            Deadline deadline) {
+            boolean gracefulFirst, Deadline deadline) {
         boolean[] interrupted = { Thread.interrupted() };
         try {
             if (gracefulFirst && isAlive(process) && !deadline.expired()) {
@@ -2104,8 +2196,7 @@ public final class BrewShot implements AutoCloseable {
 
             if (!allProcessesDead(process, parentHandle, descendantHandles)
                     && !deadline.expired()) {
-                // Descendants were captured while the parent was alive. Signal
-                // those retained identities even if the parent has since
+                // Signal every retained identity even if the parent has since
                 // exited and descendants() now reports an empty snapshot.
                 for (ProcessHandle handle : descendantHandles) {
                     if (handleAlive(handle)) {
@@ -2125,10 +2216,10 @@ public final class BrewShot implements AutoCloseable {
                 awaitHandles(process, tree, deadline, interrupted);
             }
 
-            // A dead parent whose descendants were first queried only after
-            // death is not evidence that no orphaned helper survives.
-            return hasLiveParentSnapshot
-                && allProcessesDead(process, parentHandle, descendantHandles);
+            // This proves only that the identities Java actually observed are
+            // dead. ResourceLease separately requires external proof that no
+            // unobserved/reparented member survives before releasing a profile.
+            return allProcessesDead(process, parentHandle, descendantHandles);
         } finally {
             if (interrupted[0]) { Thread.currentThread().interrupt(); }
         }

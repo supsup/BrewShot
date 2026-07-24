@@ -16,7 +16,10 @@ import java.util.stream.Stream;
 /**
  * Pure-Java subprocess body proving that one real Runtime shutdown-hook
  * invocation reconciles both a first force-reap failure and a first delete
- * failure. Its receipt is deliberately outside the profile it expects deleted.
+ * failure when the controlled fake supplies external containment proof. An
+ * optional {@code unproven} mode uses the production-default closed release
+ * gate and proves the profile survives JVM exit. Its receipt is deliberately
+ * outside the profile.
  */
 public final class ShutdownLifecycleRetryProbeMain {
 
@@ -30,7 +33,7 @@ public final class ShutdownLifecycleRetryProbeMain {
 
         RetryProcess process = new RetryProcess(receipt);
         AtomicInteger deleteCalls = new AtomicInteger();
-        BrewShot.registerLaunchLease(process, profile, path -> {
+        BrewShot.ProfileDeleter deleter = path -> {
             int call = deleteCalls.incrementAndGet();
             append(receipt, "delete=" + call);
             if (call == 1) {
@@ -42,7 +45,13 @@ public final class ShutdownLifecycleRetryProbeMain {
             } catch (IOException e) {
                 throw new IllegalStateException(e);
             }
-        });
+        };
+        if (args.length > 2 && "unproven".equals(args[2])) {
+            BrewShot.registerLaunchLease(process, profile, deleter);
+        } else {
+            BrewShot.registerContainedLaunchLeaseForTests(
+                process, profile, deleter);
+        }
         // Normal return invokes BrewShot's real Runtime shutdown hook.
     }
 

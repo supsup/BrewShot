@@ -24,11 +24,17 @@ the end of the macOS crash-dialog spam.
   cover WebSocket send plus response on one monotonic deadline; connect is bounded
   both natively and at the Future boundary, and close has a timed abort fallback. A
   shutdown admission fence atomically joins Chrome start to its process/profile lease;
-  retained pre-exit process-tree handles prevent reparented helpers from escaping
-  cleanup. Ownership remains retryable through discovery, bootstrap, close,
-  forced-reap failure, and profile-delete failure. One JVM-hook reconciliation
-  loop shares a five-second process-wait/retry-admission budget; synchronous
-  profile deletion and waiting for an already-admitted OS start remain outside it.
+  retained pre-exit handles let cleanup terminate every helper it actually observed.
+  A JDK `ProcessHandle` snapshot cannot prove that a helper created during teardown
+  did not reparent after the final snapshot, however, so the zero-dependency launcher
+  now conservatively retains the temp profile and its in-memory lease unless an
+  external process-tree containment owner proves membership closed and fully reaped.
+  The lease remains retryable only while that JVM lives; JVM exit reclaims the registry
+  but deliberately leaves an unproven profile on disk. This corrects the older
+  “no leaked temp dirs”
+  overclaim. One JVM-hook reconciliation loop shares a five-second
+  process-wait/retry-admission budget; synchronous profile deletion and waiting for an
+  already-admitted OS start remain outside it.
 - **`--gif N` records a looping GIF from the CLI** (plan 6cc2d9ec, roadmap B4): the
   whole `recordGif*` family was library-only, so `java -jar` users had GIFs in the
   engine and zero access from the shell. `--gif N` flips the shoot to a recording
