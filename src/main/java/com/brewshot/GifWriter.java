@@ -10,14 +10,17 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import javax.imageio.IIOImage;
 import javax.imageio.ImageIO;
+import javax.imageio.ImageReader;
 import javax.imageio.ImageTypeSpecifier;
 import javax.imageio.ImageWriter;
 import javax.imageio.metadata.IIOMetadata;
 import javax.imageio.metadata.IIOMetadataNode;
+import javax.imageio.stream.ImageInputStream;
 import javax.imageio.stream.ImageOutputStream;
 
 /**
@@ -42,6 +45,108 @@ final class GifWriter {
     /** Cap on pixels sampled for palette building, so histogram cost stays bounded. */
     private static final int PALETTE_SAMPLE_BUDGET = 250_000;
 
+    // ----- pre-decode resource bounds (F-02) --------------------------------
+    // The honest accounting: the recorders' FrameBudget sums COMPRESSED PNG
+    // byte[].length, but write() below retains EVERY frame DECODED (w*h*4 bytes)
+    // to build the shared palette and index each — a modest set of compressed
+    // PNGs can decode to a multi-GB working set and OOM. And the static
+    // BrewShot.gif() entry point fed arbitrary caller frames with no budget at
+    // all. So this precheck bounds the DECODED working set — frame count, per-
+    // frame axis, and Σ w*h*4 — reading only each PNG's HEADER (never a full
+    // pixel array) so an over-budget input fails LOUD and cheap BEFORE the decode
+    // loop. Every GIF path (poll recorders, screencast recorder, static gif())
+    // funnels through write(), so enforcing here closes them all, the static
+    // gif() bypass included. Limits are read FRESH from system properties on each
+    // call (so a -D override — or a test's System.setProperty — takes effect).
+
+    /** Default max px per axis for any single GIF frame. -Dbrewshot.gif.maxFrameDimension. */
+    static final int DEFAULT_MAX_FRAME_DIMENSION = 4096;
+    /** Default max number of frames in one GIF. -Dbrewshot.gif.maxFrames. */
+    static final int DEFAULT_MAX_FRAMES = 1000;
+    /** Default decoded working-set budget (bytes = Σ w*h*4), 512 MB. -Dbrewshot.gif.maxDecodedBytes. */
+    static final long DEFAULT_MAX_DECODED_BYTES = 536_870_912L;
+
+    private static int maxFrameDimension() {
+        return intProp("brewshot.gif.maxFrameDimension", DEFAULT_MAX_FRAME_DIMENSION);
+    }
+
+    private static int maxFrames() {
+        return intProp("brewshot.gif.maxFrames", DEFAULT_MAX_FRAMES);
+    }
+
+    private static long maxDecodedBytes() {
+        return longProp("brewshot.gif.maxDecodedBytes", DEFAULT_MAX_DECODED_BYTES);
+    }
+
+    private static int intProp(String key, int dflt) {
+        String v = System.getProperty(key);
+        if (v != null) {
+            try { int n = Integer.parseInt(v.trim()); if (n > 0) { return n; } }
+            catch (NumberFormatException ignored) { /* fall through to default */ }
+        }
+        return dflt;
+    }
+
+    private static long longProp(String key, long dflt) {
+        String v = System.getProperty(key);
+        if (v != null) {
+            try { long n = Long.parseLong(v.trim()); if (n > 0) { return n; } }
+            catch (NumberFormatException ignored) { /* fall through to default */ }
+        }
+        return dflt;
+    }
+
+    /**
+     * Reject a frame set whose DECODED working set would blow the budget, BEFORE
+     * any full decode. Reads only each PNG's header dimensions via an
+     * {@link ImageReader} (no pixel array is allocated), so an over-dimension /
+     * over-frame-count / over-decoded-budget input fails loud and cheap instead
+     * of OOMing in {@link #write}'s decode loop. Package-private so it is unit-
+     * testable browser-free.
+     */
+    static void enforceDecodeBounds(List<byte[]> pngFrames) throws IOException {
+        int frameLimit = maxFrames();
+        if (pngFrames.size() > frameLimit) {
+            throw new IOException("gif refused: " + pngFrames.size()
+                + " frames exceeds the limit " + frameLimit + " (brewshot.gif.maxFrames)");
+        }
+        int maxDim = maxFrameDimension();
+        long maxDecoded = maxDecodedBytes();
+        long decoded = 0;
+        for (int i = 0; i < pngFrames.size(); i++) {
+            byte[] png = pngFrames.get(i);
+            int w;
+            int h;
+            try (ImageInputStream iis =
+                     ImageIO.createImageInputStream(new ByteArrayInputStream(png))) {
+                Iterator<ImageReader> readers =
+                    iis == null ? null : ImageIO.getImageReaders(iis);
+                if (readers == null || !readers.hasNext()) {
+                    throw new IOException("frame " + i + " of " + pngFrames.size()
+                        + " is not a decodable image (" + png.length + " bytes)");
+                }
+                ImageReader reader = readers.next();
+                try {
+                    reader.setInput(iis, true, true);
+                    w = reader.getWidth(0);
+                    h = reader.getHeight(0);
+                } finally {
+                    reader.dispose();
+                }
+            }
+            if (w > maxDim || h > maxDim) {
+                throw new IOException("gif refused: frame " + i + " is " + w + "x" + h
+                    + ", exceeds max axis " + maxDim + " (brewshot.gif.maxFrameDimension)");
+            }
+            decoded += (long) w * h * 4;
+            if (decoded > maxDecoded) {
+                throw new IOException("gif refused: decoded working set reaches " + decoded
+                    + " bytes by frame " + i + " of " + pngFrames.size() + ", exceeds "
+                    + maxDecoded + " (brewshot.gif.maxDecodedBytes)");
+            }
+        }
+    }
+
     private GifWriter() { }
 
     /** Write {@code pngFrames} as a looping animated GIF at {@code out}. */
@@ -59,6 +164,12 @@ final class GifWriter {
     static void write(List<byte[]> pngFrames, int frameDelayMs, int firstFrameDelayMs, Path out)
             throws IOException {
         if (pngFrames.isEmpty()) { throw new IllegalArgumentException("no frames"); }
+
+        // Bound the DECODED working set BEFORE the decode loop below — header-only
+        // inspection, loud on breach. This is the single chokepoint every GIF path
+        // (poll recorders, screencast, and the static BrewShot.gif() entry point)
+        // funnels through, so it closes the gif() budget-bypass too.
+        enforceDecodeBounds(pngFrames);
 
         // Decode every frame once, up front — we need all of them both to build
         // the shared palette and to index each against it. ImageIO.read returns

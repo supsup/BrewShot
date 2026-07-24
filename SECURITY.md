@@ -14,13 +14,39 @@ WebSocket, and consumes exactly three things back from the page:
 | --- | --- | --- |
 | screenshot | `Base64.decode` → `Files.write` | opaque bytes, never decoded/parsed by us |
 | `eval` result | `MiniJson.parse` → typed value | the one place page **data** enters Java — see below |
-| CDP events | routed by method name; console/errors kept as text | bounded, never executed |
+| CDP events | routed by method name; console/errors kept as text | bounded by entry count **and** a retained-byte ceiling; CDP ingress itself is byte-bounded; never executed |
 
 The Java code and the page's HTML/JS **never touch**. There is no place where
 page markup or scripts are interpreted, `eval`'d, deserialized into objects, or
 reflected into class loading on the Java side. A `.html` crafted to compromise
 the *Java process* would first have to break **Chromium's renderer sandbox** —
 a browser-exploit-chain problem entirely inside Chrome's threat model.
+
+### Resource bounds (memory)
+
+A page BrewShot drives can push a lot of bytes back — a firehose of console
+output, a huge `eval` result, a giant screenshot, a long recording. Those paths
+are bounded so a chatty or hostile page degrades loudly instead of OOMing the
+harness:
+
+- **CDP ingress** is byte-bounded per message (`brewshot.maxCdpMessageBytes`,
+  default 32 MB): a message that would exceed the ceiling is dropped — its
+  reassembly buffer released, never materialized as a giant `String` — and the
+  drop is announced once and counted.
+- **Console/error retention** is bounded on **two** axes: entry count (1000)
+  **and** a retained-byte budget (`brewshot.maxConsoleBytes`, default 1 MB), so
+  a single multi-MB console entry can no longer be kept whole. Over-budget
+  entries are truncated/dropped and the dropped count is exposed.
+- **Screenshot capture** is refused, header-only and before any full-pixel
+  allocation, above `brewshot.maxImageDimension` (16384 px/axis) or
+  `brewshot.maxImagePixels` (64 MP).
+- **GIF assembly** is refused, before decode, above `brewshot.gif.maxFrames`
+  (1000), `brewshot.gif.maxFrameDimension` (4096 px/axis), or
+  `brewshot.gif.maxDecodedBytes` (512 MB of decoded working set = Σ w·h·4).
+
+All limits are `-D` overridable and enforced BEFORE the large allocation, and a
+breach is loud (a thrown error or an announced+counted drop) — never a silent
+truncation.
 
 ### The one ingestion point: `MiniJson`
 

@@ -1,5 +1,6 @@
 package com.brewshot;
 
+import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.IOException;
 import java.net.URI;
@@ -16,6 +17,7 @@ import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Deque;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -27,6 +29,9 @@ import java.util.concurrent.TimeoutException;
 import java.util.function.IntConsumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import javax.imageio.ImageIO;
+import javax.imageio.ImageReader;
+import javax.imageio.stream.ImageInputStream;
 
 /**
  * BrewShot — Java brews screenshots. A self-contained Chrome DevTools Protocol
@@ -103,9 +108,11 @@ public final class BrewShot implements AutoCloseable {
     private final LinkedBlockingQueue<String> inbox;
     /** Only awaitable events are kept here (Page.loadEventFired) — bounded by design. */
     private final Deque<Map<String, Object>> pendingEvents = new ArrayDeque<>();
-    /** Console messages + uncaught exceptions since the last open()/html(). Bounded. */
-    private final List<String> consoleLog = new ArrayList<>();
-    private final List<String> errorLog = new ArrayList<>();
+    /** Console messages + uncaught exceptions since the last open()/html(). Bounded by
+     *  BOTH entry count (CONSOLE_CAP) and an encoded-byte budget (brewshot.maxConsoleBytes),
+     *  so a single multi-MB console entry can no longer be retained whole. */
+    private final BoundedLog consoleLog = new BoundedLog();
+    private final BoundedLog errorLog = new BoundedLog();
     private final Map<String, String> extraHeaders = new java.util.LinkedHashMap<>();
     private boolean captureConsole = true;
     // Emulated media state (plan 02af3a3d) — null means "no override, whatever the browser
@@ -215,6 +222,94 @@ public final class BrewShot implements AutoCloseable {
             catch (NumberFormatException ignored) { /* fall through to default */ }
         }
         return DEFAULT_TIMEOUT_MS;
+    }
+
+    // ---- resource bounds: capture size, CDP ingress, console retention ------
+    // System-property-backed limits, read FRESH at the point of use so a -D
+    // override (or a test's System.setProperty) takes effect. These are read
+    // INDEPENDENTLY here — deliberately NOT sharing a file with the diff side,
+    // which owns its own copies of the same-named screenshot limits.
+
+    /** Default max px per axis for a captured screenshot. -Dbrewshot.maxImageDimension. */
+    static final int DEFAULT_MAX_IMAGE_DIMENSION = 16_384;
+    /** Default max total pixels (w*h) for a captured screenshot, 64 MP. -Dbrewshot.maxImagePixels. */
+    static final long DEFAULT_MAX_IMAGE_PIXELS = 67_108_864L;
+    /** Default per-CDP-message byte/char ceiling, 32 MB. -Dbrewshot.maxCdpMessageBytes. */
+    static final long DEFAULT_MAX_CDP_MESSAGE_BYTES = 33_554_432L;
+    /** Default per-log retained-byte budget for console/error text, 1 MB. -Dbrewshot.maxConsoleBytes. */
+    static final long DEFAULT_MAX_CONSOLE_BYTES = 1_048_576L;
+
+    private static int intProp(String key, int dflt) {
+        String v = System.getProperty(key);
+        if (v != null) {
+            try { int n = Integer.parseInt(v.trim()); if (n > 0) { return n; } }
+            catch (NumberFormatException ignored) { /* fall through to default */ }
+        }
+        return dflt;
+    }
+
+    private static long longProp(String key, long dflt) {
+        String v = System.getProperty(key);
+        if (v != null) {
+            try { long n = Long.parseLong(v.trim()); if (n > 0) { return n; } }
+            catch (NumberFormatException ignored) { /* fall through to default */ }
+        }
+        return dflt;
+    }
+
+    private static int maxImageDimension() {
+        return intProp("brewshot.maxImageDimension", DEFAULT_MAX_IMAGE_DIMENSION);
+    }
+
+    private static long maxImagePixels() {
+        return longProp("brewshot.maxImagePixels", DEFAULT_MAX_IMAGE_PIXELS);
+    }
+
+    private static long maxCdpMessageBytes() {
+        return longProp("brewshot.maxCdpMessageBytes", DEFAULT_MAX_CDP_MESSAGE_BYTES);
+    }
+
+    private static long maxConsoleBytes() {
+        return longProp("brewshot.maxConsoleBytes", DEFAULT_MAX_CONSOLE_BYTES);
+    }
+
+    /**
+     * Reject a captured image whose DECODED dimensions exceed the configured
+     * ceiling, inspected via an {@link ImageReader} on the RETURNED bytes — only
+     * the header is read, no full pixel array is allocated — so the refusal is
+     * loud and cheap and lands BEFORE any downstream full-pixel decode. Enforced
+     * on the {@code screenshot}/{@code screenshotClip} capture paths. Bytes whose
+     * header is unreadable are left alone (decodability is a different concern,
+     * handled by the consumer). Package-private for browser-free unit testing.
+     */
+    static void enforceCaptureBounds(byte[] imageBytes) {
+        int maxDim = maxImageDimension();
+        long maxPixels = maxImagePixels();
+        int w;
+        int h;
+        try (ImageInputStream iis =
+                 ImageIO.createImageInputStream(new ByteArrayInputStream(imageBytes))) {
+            Iterator<ImageReader> readers = iis == null ? null : ImageIO.getImageReaders(iis);
+            if (readers == null || !readers.hasNext()) { return; }
+            ImageReader reader = readers.next();
+            try {
+                reader.setInput(iis, true, true);
+                w = reader.getWidth(0);
+                h = reader.getHeight(0);
+            } finally {
+                reader.dispose();
+            }
+        } catch (IOException unreadable) {
+            return; // not a size problem; leave decode errors to the consumer
+        }
+        if (w > maxDim || h > maxDim) {
+            throw new IllegalStateException("capture refused: image is " + w + "x" + h
+                + ", exceeds max axis " + maxDim + " (brewshot.maxImageDimension)");
+        }
+        if ((long) w * h > maxPixels) {
+            throw new IllegalStateException("capture refused: image is " + w + "x" + h + " = "
+                + ((long) w * h) + " px, exceeds " + maxPixels + " (brewshot.maxImagePixels)");
+        }
     }
 
     // ---- discovery ---------------------------------------------------------
@@ -384,7 +479,7 @@ public final class BrewShot implements AutoCloseable {
             String wsUrl = awaitDevtoolsUrl(p);
             LinkedBlockingQueue<String> inbox = new LinkedBlockingQueue<>();
             WebSocket socket = HTTP.newWebSocketBuilder()
-                .buildAsync(URI.create(wsUrl), new Accumulator(inbox))
+                .buildAsync(URI.create(wsUrl), new Accumulator(inbox, maxCdpMessageBytes()))
                 .join();
             BrewShot c = new BrewShot(p, profile, socket, inbox);
             // Browser-scope bootstrap (sessionId == null): open a tab, attach flat.
@@ -527,15 +622,15 @@ public final class BrewShot implements AutoCloseable {
                 if (!captureConsole) { return; }
                 String type = String.valueOf(MiniJson.get(m, "params.type"));
                 String text = consoleArgsText(m);
-                bounded(consoleLog, type + ": " + text);
-                if ("error".equals(type)) { bounded(errorLog, "console.error: " + text); }
+                consoleLog.record(type + ": " + text);
+                if ("error".equals(type)) { errorLog.record("console.error: " + text); }
             }
             case "Runtime.exceptionThrown" -> {
                 if (!captureConsole) { return; }
                 Object desc = MiniJson.get(m,
                     "params.exceptionDetails.exception.description");
                 if (desc == null) { desc = MiniJson.get(m, "params.exceptionDetails.text"); }
-                bounded(errorLog, "uncaught: " + desc);
+                errorLog.record("uncaught: " + desc);
             }
             case "Page.loadEventFired" -> pendingEvents.add(m);
             case "Network.requestWillBeSent" -> {
@@ -574,9 +669,71 @@ public final class BrewShot implements AutoCloseable {
         return b.toString();
     }
 
-    private static void bounded(List<String> log, String entry) {
-        if (log.size() < CONSOLE_CAP) { log.add(entry); }
-        else if (log.size() == CONSOLE_CAP) { log.add("... (capped at " + CONSOLE_CAP + ")"); }
+    /**
+     * A console/error buffer bounded on TWO axes: the entry count (CONSOLE_CAP)
+     * AND the retained encoded-byte total (brewshot.maxConsoleBytes). The
+     * byte-axis is the F-01 fix — the old entry-only cap retained a single
+     * multi-MB console string whole, so 1000 huge entries was a gigabyte. A
+     * too-large entry is truncated to the remaining byte budget on a character
+     * boundary and stamped with a marker; once either axis trips, further entries
+     * are dropped and counted. {@code dropped} is exposed via
+     * {@link #consoleDropped()}/{@link #errorsDropped()}.
+     */
+    static final class BoundedLog {
+        private final List<String> entries = new ArrayList<>();
+        private long bytes;
+        private boolean truncated;
+        private long dropped;
+
+        void record(String entry) {
+            long maxBytes = maxConsoleBytes();
+            if (truncated || entries.size() >= CONSOLE_CAP) {
+                if (!truncated) {
+                    entries.add("... (capped at " + CONSOLE_CAP + " entries)");
+                    truncated = true;
+                }
+                dropped++;
+                return;
+            }
+            long entryBytes = entry.getBytes(StandardCharsets.UTF_8).length;
+            if (bytes + entryBytes > maxBytes) {
+                long remaining = Math.max(0, maxBytes - bytes);
+                String clamped = truncateToBytes(entry, remaining);
+                entries.add(clamped + "... (console byte budget " + maxBytes + " reached)");
+                bytes = maxBytes;
+                truncated = true;
+                dropped++;
+                return;
+            }
+            entries.add(entry);
+            bytes += entryBytes;
+        }
+
+        void clear() {
+            entries.clear();
+            bytes = 0;
+            truncated = false;
+            dropped = 0;
+        }
+
+        List<String> view() { return List.copyOf(entries); }
+
+        long dropped() { return dropped; }
+    }
+
+    /** Longest prefix of {@code s} whose UTF-8 encoding is {@code <= maxBytes}, on a char boundary. */
+    private static String truncateToBytes(String s, long maxBytes) {
+        long acc = 0;
+        int i = 0;
+        while (i < s.length()) {
+            int cp = s.codePointAt(i);
+            int cw = Character.charCount(cp);
+            long cb = s.substring(i, i + cw).getBytes(StandardCharsets.UTF_8).length;
+            if (acc + cb > maxBytes) { break; }
+            acc += cb;
+            i += cw;
+        }
+        return s.substring(0, i);
     }
 
     @SuppressWarnings("unchecked")
@@ -812,7 +969,13 @@ public final class BrewShot implements AutoCloseable {
      */
     public List<String> console() {
         drainInboxNonBlocking();
-        return List.copyOf(consoleLog);
+        return consoleLog.view();
+    }
+
+    /** Count of console entries dropped/truncated by the entry+byte bounds since the last navigation. */
+    public long consoleDropped() {
+        drainInboxNonBlocking();
+        return consoleLog.dropped();
     }
 
     /**
@@ -822,7 +985,13 @@ public final class BrewShot implements AutoCloseable {
      */
     public List<String> errors() {
         drainInboxNonBlocking();
-        return List.copyOf(errorLog);
+        return errorLog.view();
+    }
+
+    /** Count of error entries dropped/truncated by the entry+byte bounds since the last navigation. */
+    public long errorsDropped() {
+        drainInboxNonBlocking();
+        return errorLog.dropped();
     }
 
     /** Pull any already-arrived messages through the router without blocking. */
@@ -977,7 +1146,9 @@ public final class BrewShot implements AutoCloseable {
         Map<String, Object> r = command("Page.captureScreenshot",
             "{" + captureFormatParams(fmt, quality) + ",\"captureBeyondViewport\":true}");
         String b64 = (String) r.get("data");
-        Files.write(out, Base64.getDecoder().decode(b64));
+        byte[] bytes = Base64.getDecoder().decode(b64);
+        enforceCaptureBounds(bytes); // loud, header-only, before writing the file
+        Files.write(out, bytes);
     }
 
     /**
@@ -1117,7 +1288,9 @@ public final class BrewShot implements AutoCloseable {
                 + "\"x\":" + x + ",\"y\":" + y
                 + ",\"width\":" + width + ",\"height\":" + height
                 + ",\"scale\":" + scale + "}}");
-        return Base64.getDecoder().decode((String) r.get("data"));
+        byte[] bytes = Base64.getDecoder().decode((String) r.get("data"));
+        enforceCaptureBounds(bytes); // loud, header-only, before the frame enters any GIF buffer
+        return bytes;
     }
 
     /**
@@ -1657,19 +1830,59 @@ public final class BrewShot implements AutoCloseable {
      * On close/error it enqueues a poison message so a blocked caller fails
      * fast ("Chrome exited") instead of sleeping out the full timeout.
      */
-    private static final class Accumulator implements WebSocket.Listener {
+    static final class Accumulator implements WebSocket.Listener {
         private final LinkedBlockingQueue<String> sink;
+        // Per-message ceiling on the reassembly buffer (chars ≈ bytes for the ASCII
+        // JSON/base64 CDP traffic). F-01: the buffer used to append partial frames
+        // UNBOUNDED before enqueuing the whole message, so one pathological multi-GB
+        // CDP message could OOM the harness before it ever reached the (also uncapped)
+        // inbox queue. Now a message that would cross the ceiling is DROPPED — the
+        // partial buffer is released the moment it overflows, never materialized as a
+        // giant String — and the drop is announced once + counted, never silent.
+        private final long maxMessageBytes;
         private final StringBuilder buf = new StringBuilder();
+        private boolean overflowed;
+        private long dropped;
 
-        Accumulator(LinkedBlockingQueue<String> sink) { this.sink = sink; }
+        Accumulator(LinkedBlockingQueue<String> sink, long maxMessageBytes) {
+            this.sink = sink;
+            this.maxMessageBytes = maxMessageBytes;
+        }
+
+        /**
+         * The accumulation seam, split out from {@link #onText} so it is testable
+         * without a live WebSocket. Appends {@code data}; on {@code last}, enqueues
+         * the whole message — UNLESS the buffer crossed {@link #maxMessageBytes},
+         * in which case the message is dropped (buffer already released) and counted.
+         */
+        void accept(CharSequence data, boolean last) {
+            if (!overflowed && buf.length() + (long) data.length() > maxMessageBytes) {
+                overflowed = true;
+                buf.setLength(0); // release the partial NOW — this is the whole point
+            }
+            if (!overflowed) { buf.append(data); }
+            if (last) {
+                if (overflowed) {
+                    dropped++;
+                    if (dropped == 1) {
+                        System.err.println("brewshot: dropped an oversized CDP message (exceeds "
+                            + maxMessageBytes + "-char ceiling; brewshot.maxCdpMessageBytes)."
+                            + " Further such drops are counted, not re-announced.");
+                    }
+                    overflowed = false;
+                } else {
+                    sink.add(buf.toString());
+                }
+                buf.setLength(0);
+            }
+        }
+
+        /** Count of CDP messages dropped for exceeding the per-message byte ceiling. */
+        long dropped() { return dropped; }
 
         @Override
         public CompletionStage<?> onText(WebSocket webSocket, CharSequence data, boolean last) {
-            buf.append(data);
-            if (last) {
-                sink.add(buf.toString());
-                buf.setLength(0);
-            }
+            accept(data, last);
             webSocket.request(1);
             return null;
         }
