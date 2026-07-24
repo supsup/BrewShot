@@ -3,9 +3,14 @@ package com.brewshot;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Locale;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 /** CLI arg handling — no Chrome needed: every case exits before launch. */
 class MainCliTest {
@@ -140,6 +145,51 @@ class MainCliTest {
             "distinct paths pass clean");
         assertNull(Main.outputAliasError(new Path[] {Path.of("a.png"), null},
             new String[] {"-o", "--json"}), "a null (absent) slot never collides");
+    }
+
+    /**
+     * Regression for review brewshot/157: the guard was LEXICAL-only, so a filesystem alias
+     * slipped past it and the second write still clobbered the primary capture. These are the
+     * two aliases Marlow's probe actually destroyed a capture through — asserted here as the
+     * exact cases named, not as "some guard exists".
+     */
+    @Test
+    void filesystemAliasesAreRefusedNotJustLexicalOnes(@TempDir Path dir) throws Exception {
+        // (1) Case variants where BOTH targets are initially ABSENT — the case that defeated
+        // the lexical guard, since there is no file yet for isSameFile to compare. Only
+        // meaningful where the filesystem actually folds case, so probe it the same way the
+        // guard does rather than assuming the host's default.
+        Path probe = Files.createTempFile(dir, "CaseProbe", ".Tmp");
+        boolean caseInsensitive = Files.exists(
+            probe.resolveSibling(probe.getFileName().toString().toLowerCase(Locale.ROOT)));
+        Files.deleteIfExists(probe);
+        if (caseInsensitive) {
+            assertNotNull(Main.outputAliasError(
+                new Path[] {dir.resolve("FreshArtifact.png"), dir.resolve("freshartifact.png")},
+                new String[] {"-o", "--json"}),
+                "on a case-insensitive filesystem two absent case variants are ONE file —"
+                    + " the manifest write would destroy the capture");
+        }
+
+        // (2) -o naming a symlink to the --json target: two spellings, one inode.
+        Path target = dir.resolve("sym-target");
+        Files.writeString(target, "primary");
+        Path link = dir.resolve("sym-link");
+        try {
+            Files.createSymbolicLink(link, target);
+        } catch (UnsupportedOperationException | IOException e) {
+            return; // filesystem/permissions forbid symlinks; case (1) still asserted above
+        }
+        assertTrue(Files.isSameFile(link, target), "probe sanity: the link aliases the target");
+        assertNotNull(Main.outputAliasError(new Path[] {link, target},
+            new String[] {"-o", "--json"}),
+            "a symlinked -o and its --json target are the same file and must be refused");
+
+        // A genuinely distinct pair in the same directory still passes — the guard tightened
+        // without becoming a blanket refusal.
+        assertNull(Main.outputAliasError(
+            new Path[] {dir.resolve("shot.png"), dir.resolve("meta.json")},
+            new String[] {"-o", "--json"}), "distinct targets in one directory still pass");
     }
 
     @Test

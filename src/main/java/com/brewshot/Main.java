@@ -530,14 +530,11 @@ public final class Main {
      * are rejected. Returns an error message, or {@code null} when clean.
      */
     private static String diffPathAliasError(Path a, Path b, Path jsonOut, Path diffOut) {
-        Path na = canonicalForAlias(a), nb = canonicalForAlias(b);
-        Path nj = jsonOut == null ? null : canonicalForAlias(jsonOut);
-        Path nd = diffOut == null ? null : canonicalForAlias(diffOut);
-        if (nj != null && (nj.equals(na) || nj.equals(nb))) {
+        if (jsonOut != null && (sameOutputTarget(jsonOut, a) || sameOutputTarget(jsonOut, b))) {
             return "--json would overwrite a diff INPUT (" + jsonOut + ") — writing the verdict"
                 + " there destroys the image being compared; choose a distinct path";
         }
-        if (nd != null && (nd.equals(na) || nd.equals(nb))) {
+        if (diffOut != null && (sameOutputTarget(diffOut, a) || sameOutputTarget(diffOut, b))) {
             return "--diff-out would overwrite a diff INPUT (" + diffOut + ") — writing the heatmap"
                 + " there destroys the image being compared; choose a distinct path";
         }
@@ -560,12 +557,11 @@ public final class Main {
             if (outputs[i] == null) {
                 continue;
             }
-            Path ci = canonicalForAlias(outputs[i]);
             for (int j = i + 1; j < outputs.length; j++) {
                 if (outputs[j] == null) {
                     continue;
                 }
-                if (ci.equals(canonicalForAlias(outputs[j]))) {
+                if (sameOutputTarget(outputs[i], outputs[j])) {
                     return labels[i] + " and " + labels[j] + " point at the same file ("
                         + outputs[i] + ") — the second write would clobber the first; choose"
                         + " distinct paths";
@@ -575,9 +571,113 @@ public final class Main {
         return null;
     }
 
-    /** Absolute, normalized path for alias comparison — lexical (the targets need not exist yet). */
-    private static Path canonicalForAlias(Path p) {
-        return p.toAbsolutePath().normalize();
+    /**
+     * True when two declared outputs would land on the SAME file. Lexical comparison is not
+     * enough (review brewshot/157): a case variant on a case-insensitive filesystem and a
+     * symlink both denote one file under two spellings, so the second write still clobbers
+     * the first. Three channels, cheapest first:
+     *
+     * <ol>
+     *   <li>both targets already exist — {@link Files#isSameFile} settles it for symlinks,
+     *       hard links, and case-insensitive filesystems in one syscall;</li>
+     *   <li>otherwise compare PROSPECTIVE keys: the deepest existing ancestor resolved with
+     *       {@code toRealPath()} (which collapses symlinked parent directories) plus the
+     *       not-yet-created trailing names;</li>
+     *   <li>if those keys differ only by case, ask the filesystem that will actually hold
+     *       them whether it is case-insensitive — the case Marlow's probe hit, where BOTH
+     *       targets are absent so channel 1 cannot fire.</li>
+     * </ol>
+     */
+    private static boolean sameOutputTarget(Path a, Path b) {
+        try {
+            if (Files.exists(a) && Files.exists(b)) {
+                return Files.isSameFile(a, b);
+            }
+        } catch (java.io.IOException ignored) {
+            // Unreadable target — fall through to the prospective comparison below.
+        }
+        Path ka = prospectiveKey(a);
+        Path kb = prospectiveKey(b);
+        if (ka.equals(kb)) {
+            return true;
+        }
+        if (ka.toString().equalsIgnoreCase(kb.toString())) {
+            return caseInsensitiveAt(deepestExistingAncestor(ka));
+        }
+        return false;
+    }
+
+    /**
+     * Absolute key for a target that need not exist yet: the deepest EXISTING ancestor with
+     * symlinks resolved, plus the residual names appended lexically. A symlink standing in
+     * for the file itself is followed first (one bounded hop chain), so {@code -o link} and
+     * {@code --json target} key alike.
+     */
+    private static Path prospectiveKey(Path p) {
+        Path abs = p.toAbsolutePath().normalize();
+        for (int hop = 0; hop < 16 && Files.isSymbolicLink(abs); hop++) {
+            try {
+                Path t = Files.readSymbolicLink(abs);
+                abs = (t.isAbsolute() ? t : abs.getParent().resolve(t)).normalize();
+            } catch (java.io.IOException e) {
+                break;
+            }
+        }
+        Path existing = deepestExistingAncestor(abs);
+        if (existing == null) {
+            return abs;
+        }
+        try {
+            return existing.toRealPath().resolve(existing.relativize(abs)).normalize();
+        } catch (java.io.IOException e) {
+            return abs;
+        }
+    }
+
+    /** The nearest ancestor of {@code abs} (inclusive) that exists on disk, or null. */
+    private static Path deepestExistingAncestor(Path abs) {
+        for (Path c = abs; c != null; c = c.getParent()) {
+            if (Files.exists(c)) {
+                return c;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Probe whether the filesystem holding {@code dir} folds case, by creating a mixed-case
+     * temp file and asking whether its lower-cased spelling resolves to the same file. This is
+     * a real probe rather than an OS guess because case sensitivity is a per-MOUNT property —
+     * a case-sensitive volume can be mounted on a case-insensitive host and vice versa.
+     * Fails CLOSED (reports "insensitive", so the pair is rejected as an alias) when the probe
+     * cannot run: a spurious "choose distinct paths" is a nuisance, while a missed alias
+     * destroys the primary capture, which is the whole defect this guard exists to prevent.
+     */
+    private static boolean caseInsensitiveAt(Path dir) {
+        Path probeDir = (dir != null && Files.isDirectory(dir)) ? dir : null;
+        if (probeDir == null && dir != null) {
+            probeDir = dir.getParent();
+        }
+        if (probeDir == null || !Files.isDirectory(probeDir)) {
+            return true;
+        }
+        Path probe = null;
+        try {
+            probe = Files.createTempFile(probeDir, "BrewShotCase", ".Tmp");
+            Path lowered = probe.resolveSibling(
+                probe.getFileName().toString().toLowerCase(java.util.Locale.ROOT));
+            return Files.exists(lowered);
+        } catch (java.io.IOException | RuntimeException e) {
+            return true;
+        } finally {
+            if (probe != null) {
+                try {
+                    Files.deleteIfExists(probe);
+                } catch (java.io.IOException ignored) {
+                    // Best effort; a stray probe file never affects correctness.
+                }
+            }
+        }
     }
 
     /**
