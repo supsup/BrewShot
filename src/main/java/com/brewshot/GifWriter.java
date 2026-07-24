@@ -79,24 +79,27 @@ final class GifWriter {
         IndexColorModel palette = buildGlobalPalette(frames);
 
         ImageWriter writer = ImageIO.getImageWritersByFormatName("gif").next();
-        try (ImageOutputStream os = ImageIO.createImageOutputStream(out.toFile())) {
-            writer.setOutput(os);
-            writer.prepareWriteSequence(null);
-            for (int i = 0; i < frames.size(); i++) {
-                BufferedImage indexed = ditherToPalette(frames.get(i), palette);
-                IIOMetadata meta = writer.getDefaultImageMetadata(
-                    ImageTypeSpecifier.createFromRenderedImage(indexed),
-                    writer.getDefaultWriteParam());
-                applyFrameMetadata(meta, i == 0 ? firstFrameDelayMs : frameDelayMs);
-                writer.writeToSequence(new IIOImage(indexed, null, meta), null);
-            }
-            writer.endWriteSequence();
-        } catch (IOException | RuntimeException e) {
-            // The try-with-resources closes the stream on the way out, leaving a PARTIAL
-            // out file (N-1 frames) that reads as a plausible truncated GIF. Delete it so a
-            // broken recording never masquerades as a finished artifact.
-            try { java.nio.file.Files.deleteIfExists(out); } catch (IOException ignored) { }
-            throw e;
+        try {
+            // Review brewshot/157: the frame sequence is encoded into a sibling temp and moved
+            // into place by the shared artifact policy, so a mid-sequence failure can no longer
+            // leave a PARTIAL out file (N-1 frames) that reads as a plausible truncated GIF.
+            // This also removes the old failure path's delete of `out` itself, which destroyed
+            // a previously-good recording whenever a re-record failed.
+            ArtifactWriter.write(out, ".gif", tmp -> {
+                try (ImageOutputStream os = ImageIO.createImageOutputStream(tmp.toFile())) {
+                    writer.setOutput(os);
+                    writer.prepareWriteSequence(null);
+                    for (int i = 0; i < frames.size(); i++) {
+                        BufferedImage indexed = ditherToPalette(frames.get(i), palette);
+                        IIOMetadata meta = writer.getDefaultImageMetadata(
+                            ImageTypeSpecifier.createFromRenderedImage(indexed),
+                            writer.getDefaultWriteParam());
+                        applyFrameMetadata(meta, i == 0 ? firstFrameDelayMs : frameDelayMs);
+                        writer.writeToSequence(new IIOImage(indexed, null, meta), null);
+                    }
+                    writer.endWriteSequence();
+                }
+            });
         } finally {
             writer.dispose();
         }

@@ -977,7 +977,7 @@ public final class BrewShot implements AutoCloseable {
         Map<String, Object> r = command("Page.captureScreenshot",
             "{" + captureFormatParams(fmt, quality) + ",\"captureBeyondViewport\":true}");
         String b64 = (String) r.get("data");
-        Files.write(out, Base64.getDecoder().decode(b64));
+        ArtifactWriter.writeBytes(out, Base64.getDecoder().decode(b64));
     }
 
     /**
@@ -1075,7 +1075,7 @@ public final class BrewShot implements AutoCloseable {
     public void pdf(Path out, PdfOptions opts) throws IOException {
         Map<String, Object> r = command("Page.printToPDF", "{" + printPdfParams(opts) + "}");
         String b64 = (String) r.get("data");
-        Files.write(out, Base64.getDecoder().decode(b64));
+        ArtifactWriter.writeBytes(out, Base64.getDecoder().decode(b64));
     }
 
     /**

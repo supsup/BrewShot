@@ -680,62 +680,20 @@ public final class Main {
         }
     }
 
-    /**
-     * Write text to a sibling temp file, then ATOMIC_MOVE it into place (F-05). A crash or a
-     * concurrent reader never sees a half-written sidecar, and the temp lives in the SAME
-     * directory so the move stays on one filesystem (ATOMIC_MOVE's requirement).
-     */
+    // Artifact writes route through ArtifactWriter -- ONE temp-then-atomic policy shared with
+    // the capture lane (BrewShot screenshot/PDF) and GifWriter, per review brewshot/157.
+
     private static void atomicWriteString(Path target, String body) throws java.io.IOException {
-        Path dir = target.toAbsolutePath().getParent();
-        Path tmp = Files.createTempFile(dir, ".brewshot-", ".tmp");
-        try {
-            Files.writeString(tmp, body);
-            moveIntoPlace(tmp, target);
-        } finally {
-            Files.deleteIfExists(tmp);
-        }
+        ArtifactWriter.writeString(target, body);
     }
 
-    /**
-     * Write raw bytes to a sibling temp file, then ATOMIC_MOVE into place — the capture-lane
-     * clip artifacts (Fix, review brewshot/153) share the diff lane's temp-then-atomic policy,
-     * so a crash or concurrent reader never sees a half-written -o output.
-     */
     private static void atomicWriteBytes(Path target, byte[] body) throws java.io.IOException {
-        Path dir = target.toAbsolutePath().getParent();
-        Path tmp = Files.createTempFile(dir, ".brewshot-", ".tmp");
-        try {
-            Files.write(tmp, body);
-            moveIntoPlace(tmp, target);
-        } finally {
-            Files.deleteIfExists(tmp);
-        }
+        ArtifactWriter.writeBytes(target, body);
     }
 
-    /** Encode a PNG to a sibling temp file, then ATOMIC_MOVE it into place (F-05). */
     private static void atomicWritePng(java.awt.image.BufferedImage img, Path target)
             throws java.io.IOException {
-        Path dir = target.toAbsolutePath().getParent();
-        Path tmp = Files.createTempFile(dir, ".brewshot-", ".png");
-        try {
-            if (!javax.imageio.ImageIO.write(img, "png", tmp.toFile())) {
-                throw new java.io.IOException("no PNG writer available");
-            }
-            moveIntoPlace(tmp, target);
-        } finally {
-            Files.deleteIfExists(tmp);
-        }
-    }
-
-    /** ATOMIC_MOVE where the filesystem supports it, else a REPLACE_EXISTING move (best-effort). */
-    private static void moveIntoPlace(Path tmp, Path target) throws java.io.IOException {
-        try {
-            Files.move(tmp, target,
-                java.nio.file.StandardCopyOption.ATOMIC_MOVE,
-                java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-        } catch (java.nio.file.AtomicMoveNotSupportedException e) {
-            Files.move(tmp, target, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-        }
+        ArtifactWriter.writePng(img, target);
     }
 
     // ---- PNG size-limit properties (audit): reject a decompression-bomb input pre-decode ---
