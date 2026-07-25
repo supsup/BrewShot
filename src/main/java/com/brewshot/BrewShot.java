@@ -20,6 +20,7 @@ import java.util.Deque;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
@@ -121,7 +122,7 @@ public final class BrewShot implements AutoCloseable {
     // events. Mutated only in routeEvent on the single draining thread, so a
     // plain HashSet is safe. Cleared per navigation.
     private final Set<String> inFlightRequestIds = new HashSet<>();
-    private long lastNetChangeMs;
+    private long lastNetChangeNanos = System.nanoTime();
     // Load/navigation wait budget (ms). Defaults from BREWSHOT_TIMEOUT_MS or the
     // 15s constant; override per-instance with navTimeout(). Governs open()/html()
     // and the ready-waits, so a slow page on a loaded CI runner isn't unraisable.
@@ -756,6 +757,8 @@ public final class BrewShot implements AutoCloseable {
 
     /** Launch headless Chrome with the given viewport and attach to a fresh tab. */
     public static BrewShot launch(int width, int height) throws IOException {
+        Validation.positiveInt("viewport width", width);
+        Validation.positiveInt("viewport height", height);
         String bin = findChrome();
         if (bin == null) { throw new IllegalStateException("no Chrome binary found"); }
         Path profile = Files.createTempDirectory("brewshot-");
@@ -1103,12 +1106,12 @@ public final class BrewShot implements AutoCloseable {
                 // genuinely new request grows the set. Either way it is activity.
                 Object rid = MiniJson.get(m, "params.requestId");
                 if (rid != null) { inFlightRequestIds.add(String.valueOf(rid)); }
-                lastNetChangeMs = System.currentTimeMillis();
+                lastNetChangeNanos = System.nanoTime();
             }
             case "Network.loadingFinished", "Network.loadingFailed" -> {
                 Object rid = MiniJson.get(m, "params.requestId");
                 if (rid != null) { inFlightRequestIds.remove(String.valueOf(rid)); }
-                lastNetChangeMs = System.currentTimeMillis();
+                lastNetChangeNanos = System.nanoTime();
             }
             default -> { /* drop: nothing awaits it, nothing reads it */ }
         }
@@ -1225,7 +1228,7 @@ public final class BrewShot implements AutoCloseable {
         consoleLog.clear();
         errorLog.clear();
         inFlightRequestIds.clear();
-        lastNetChangeMs = System.currentTimeMillis();
+        lastNetChangeNanos = System.nanoTime();
         // Re-send any active colorScheme/media/reducedMotion override BEFORE the navigation
         // command below, so the new document paints under it from the first frame — a no-op
         // when none was ever set (plan 02af3a3d: emulation must survive "any new page/navigation
@@ -1239,11 +1242,12 @@ public final class BrewShot implements AutoCloseable {
      * Fails loud with the predicate text on timeout.
      */
     public void waitFor(String jsPredicate, long timeoutMs) {
-        long deadline = System.currentTimeMillis() + timeoutMs;
+        Validation.positiveLong("waitFor timeoutMs", timeoutMs);
+        Deadline deadline = Deadline.afterMillis(timeoutMs);
         while (true) {
             Object v = eval("!!(" + jsPredicate + ")");
             if (Boolean.TRUE.equals(v)) { return; }
-            if (System.currentTimeMillis() > deadline) {
+            if (deadline.expired()) {
                 throw new IllegalStateException(
                     "waitFor timed out after " + timeoutMs + "ms: " + jsPredicate);
             }
@@ -1429,7 +1433,7 @@ public final class BrewShot implements AutoCloseable {
      * dashboard on a loaded CI runner that needs &gt;15s is no longer unraisable.
      */
     public BrewShot navTimeout(long millis) {
-        if (millis > 0) { this.navTimeoutMs = millis; }
+        this.navTimeoutMs = Validation.positiveLong("navTimeout millis", millis);
         return this;
     }
 
@@ -1445,7 +1449,7 @@ public final class BrewShot implements AutoCloseable {
      * itself was fast, and raising the navigation budget would not have helped it.
      */
     public BrewShot commandTimeout(long millis) {
-        if (millis > 0) { this.commandTimeoutMs = millis; }
+        this.commandTimeoutMs = Validation.positiveLong("commandTimeout millis", millis);
         return this;
     }
 
@@ -1460,7 +1464,7 @@ public final class BrewShot implements AutoCloseable {
      * announces itself beats both an OOM and a silently short one.
      */
     public BrewShot recordingHeapBudget(long bytes) {
-        if (bytes > 0) { this.maxRecordingBytes = bytes; }
+        this.maxRecordingBytes = Validation.positiveLong("recordingHeapBudget bytes", bytes);
         return this;
     }
 
@@ -1470,13 +1474,20 @@ public final class BrewShot implements AutoCloseable {
      * hard gate). {@link #open}/{@link #html} return on {@code loadEventFired},
      * which fires BEFORE async XHR/fetch settle; this bridges that gap. Network
      * is tracked from launch and the in-flight count resets per navigation.
+     * A zero timeout is an intentional no-op; negative values are rejected.
      */
     public void waitForNetworkIdle(long quietMillis, long timeoutMillis) {
-        long deadline = System.currentTimeMillis() + timeoutMillis;
-        while (System.currentTimeMillis() < deadline) {
+        Validation.nonNegativeLong("network-idle quietMillis", quietMillis);
+        Validation.nonNegativeLong("network-idle timeoutMillis", timeoutMillis);
+        Deadline deadline = Deadline.afterMillis(timeoutMillis);
+        long quietNanos = TimeUnit.MILLISECONDS.toNanos(quietMillis);
+        while (!deadline.expired()) {
             drainInboxNonBlocking();
-            long now = System.currentTimeMillis();
-            if (inFlightRequestIds.isEmpty() && now - lastNetChangeMs >= quietMillis) { return; }
+            long quietForNanos = System.nanoTime() - lastNetChangeNanos;
+            if (inFlightRequestIds.isEmpty()
+                    && quietForNanos >= quietNanos) {
+                return;
+            }
             try { Thread.sleep(15); }
             catch (InterruptedException e) { Thread.currentThread().interrupt(); return; }
         }
@@ -1502,8 +1513,9 @@ public final class BrewShot implements AutoCloseable {
         waitForFontsReady();
     }
 
-    /** Sleep helper for settle waits between eval steps. */
+    /** Sleep helper for settle waits between eval steps. Zero is an intentional no-op. */
     public void settle(long millis) {
+        Validation.nonNegativeLong("settle millis", millis);
         try { Thread.sleep(millis); }
         catch (InterruptedException e) { Thread.currentThread().interrupt(); }
     }
@@ -1523,12 +1535,10 @@ public final class BrewShot implements AutoCloseable {
      * unit-testable without a browser.
      */
     static String captureFormatParams(ImageFormat fmt, int quality) {
+        Objects.requireNonNull(fmt, "fmt");
         if (fmt == ImageFormat.JPEG) {
-            if (quality < 1 || quality > 100) {
-                throw new IllegalArgumentException(
-                    "jpeg quality must be 1-100, got " + quality);
-            }
-            return "\"format\":\"jpeg\",\"quality\":" + quality;
+            return "\"format\":\"jpeg\",\"quality\":"
+                + Validation.intRange("jpeg quality", quality, 1, 100);
         }
         return "\"format\":\"png\"";
     }
@@ -1548,7 +1558,7 @@ public final class BrewShot implements AutoCloseable {
         Map<String, Object> r = command("Page.captureScreenshot",
             "{" + captureFormatParams(fmt, quality) + ",\"captureBeyondViewport\":true}");
         String b64 = (String) r.get("data");
-        Files.write(out, Base64.getDecoder().decode(b64));
+        ArtifactWriter.writeBytes(out, Base64.getDecoder().decode(b64));
     }
 
     /**
@@ -1563,6 +1573,16 @@ public final class BrewShot implements AutoCloseable {
                              double paperWidthIn, double paperHeightIn,
                              double marginTopIn, double marginRightIn,
                              double marginBottomIn, double marginLeftIn) {
+        public PdfOptions {
+            Validation.finiteRange("pdf scale", scale, 0.1, 2.0);
+            Validation.positiveFinite("pdf paper width", paperWidthIn);
+            Validation.positiveFinite("pdf paper height", paperHeightIn);
+            Validation.nonNegativeFinite("pdf top margin", marginTopIn);
+            Validation.nonNegativeFinite("pdf right margin", marginRightIn);
+            Validation.nonNegativeFinite("pdf bottom margin", marginBottomIn);
+            Validation.nonNegativeFinite("pdf left margin", marginLeftIn);
+        }
+
         /** US Letter, portrait, zero-margin, backgrounds on, scale 1.0. */
         public static PdfOptions defaults() {
             return new PdfOptions(false, true, 1.0, 8.5, 11.0, 0, 0, 0, 0);
@@ -1609,18 +1629,7 @@ public final class BrewShot implements AutoCloseable {
      * browser (mirrors {@link #captureFormatParams(ImageFormat, int)}).
      */
     static String printPdfParams(PdfOptions o) {
-        if (o.paperWidthIn() <= 0 || o.paperHeightIn() <= 0) {
-            throw new IllegalArgumentException(
-                "pdf paper size must be positive inches, got "
-                    + o.paperWidthIn() + "x" + o.paperHeightIn());
-        }
-        if (o.marginTopIn() < 0 || o.marginRightIn() < 0
-                || o.marginBottomIn() < 0 || o.marginLeftIn() < 0) {
-            throw new IllegalArgumentException("pdf margins must be non-negative inches");
-        }
-        if (o.scale() < 0.1 || o.scale() > 2.0) {
-            throw new IllegalArgumentException("pdf scale must be 0.1-2.0, got " + o.scale());
-        }
+        Objects.requireNonNull(o, "opts");
         return "\"landscape\":" + o.landscape()
             + ",\"printBackground\":" + o.printBackground()
             + ",\"scale\":" + o.scale()
@@ -1646,7 +1655,7 @@ public final class BrewShot implements AutoCloseable {
     public void pdf(Path out, PdfOptions opts) throws IOException {
         Map<String, Object> r = command("Page.printToPDF", "{" + printPdfParams(opts) + "}");
         String b64 = (String) r.get("data");
-        Files.write(out, Base64.getDecoder().decode(b64));
+        ArtifactWriter.writeBytes(out, Base64.getDecoder().decode(b64));
     }
 
     /**
@@ -1676,12 +1685,7 @@ public final class BrewShot implements AutoCloseable {
      */
     public byte[] screenshotClip(double x, double y, double width, double height,
                                  double scale, ImageFormat fmt, int quality) {
-        if (!Double.isFinite(x) || !Double.isFinite(y)
-                || !Double.isFinite(width) || !Double.isFinite(height)
-                || !Double.isFinite(scale) || scale <= 0) {
-            throw new IllegalArgumentException("non-finite/invalid clip: "
-                + x + "," + y + " " + width + "x" + height + " @" + scale);
-        }
+        validateClipGeometry(x, y, width, height, scale);
         Map<String, Object> r = command("Page.captureScreenshot",
             "{" + captureFormatParams(fmt, quality)
                 + ",\"captureBeyondViewport\":true,\"clip\":{"
@@ -1689,6 +1693,38 @@ public final class BrewShot implements AutoCloseable {
                 + ",\"width\":" + width + ",\"height\":" + height
                 + ",\"scale\":" + scale + "}}");
         return Base64.getDecoder().decode((String) r.get("data"));
+    }
+
+    static void validateClipGeometry(double x, double y, double width,
+                                     double height, double scale) {
+        Validation.finite("clip x", x);
+        Validation.finite("clip y", y);
+        Validation.positiveFinite("clip width", width);
+        Validation.positiveFinite("clip height", height);
+        Validation.positiveFinite("clip scale", scale);
+    }
+
+    static void validateFrameRecorder(int frames, int captureDelayMs,
+                                      int playbackDelayMs) {
+        Validation.positiveInt("frames", frames);
+        Validation.positiveInt("captureDelayMs", captureDelayMs);
+        effectiveGifDelayMs(playbackDelayMs);
+    }
+
+    /**
+     * Effective per-frame delay a GIF can encode. GIF stores centiseconds, so
+     * requested milliseconds are rounded to the nearest 10&nbsp;ms (half up);
+     * the existing 20&nbsp;ms minimum is retained. For example, 75&nbsp;ms
+     * encodes as 80&nbsp;ms. Values beyond the GIF unsigned-16-bit delay field
+     * are rejected instead of wrapping.
+     */
+    public static int effectiveGifDelayMs(int requestedDelayMs) {
+        // 65,535 centiseconds is the largest representable GIF delay.
+        // Requests through 655,354 ms still round to that value; 655,355 ms
+        // would round to the unrepresentable 65,536 centiseconds.
+        Validation.intRange("GIF delayMs", requestedDelayMs, 1, 655_354);
+        long centiseconds = Math.max(2L, (requestedDelayMs + 5L) / 10L);
+        return Math.toIntExact(centiseconds * 10L);
     }
 
     /**
@@ -1714,11 +1750,13 @@ public final class BrewShot implements AutoCloseable {
      *   <li>{@code playbackDelayMs} — the per-frame display duration stamped into
      *       the GIF: this is the SPEED. {@code playbackDelayMs > captureDelayMs}
      *       plays it back in slow motion; {@code <} speeds it up; {@code ==} is
-     *       ≈ real time. FPS = {@code 1000 / playbackDelayMs}.</li>
+     *       ≈ real time. GIF rounds to centiseconds; exact FPS is
+     *       {@code 1000 / effectiveGifDelayMs(playbackDelayMs)}.</li>
      * </ul>
      * Sample a fast effect densely and replay it readably:
      * {@code recordGif(..., 60, 25, 75, out)} — 60 shots ~25ms apart, played at
-     * 75ms/frame (≈13fps slow-mo). See the README "GIF playback speed" table.
+     * 75ms requested (80ms encoded, 12.5fps slow-mo). See the README
+     * "GIF playback speed" table.
      */
     public void recordGif(double x, double y, double width, double height,
                           int frames, int captureDelayMs, int playbackDelayMs, Path out)
@@ -1741,6 +1779,9 @@ public final class BrewShot implements AutoCloseable {
     public void recordGif(double x, double y, double width, double height,
                           int frames, int captureDelayMs, int playbackDelayMs,
                           IntConsumer beforeFrame, Path out) throws IOException {
+        validateFrameRecorder(frames, captureDelayMs, playbackDelayMs);
+        validateClipGeometry(x, y, width, height, 1.0);
+        Objects.requireNonNull(beforeFrame, "beforeFrame");
         // The frame COUNT bounds the loop but not the BYTES — full-page frames at a
         // large count are the same OOM the screencast recorder guards against, so
         // both recorder families ride the ONE FrameBudget (the write-side twin the
@@ -1764,7 +1805,7 @@ public final class BrewShot implements AutoCloseable {
      * matches. The building block for element-targeted capture.
      */
     public double[] elementBox(String cssSelector) {
-        String sel = "'" + cssSelector.replace("\\", "\\\\").replace("'", "\\'") + "'";
+        String sel = jsStringLiteral(cssSelector);
         Object v = eval("(function(){var e=document.querySelector(" + sel + ");"
             + "if(!e)return 'none';var r=e.getBoundingClientRect();"
             + "return [r.left+window.scrollX,r.top+window.scrollY,r.width,r.height].join(',');})()");
@@ -1774,6 +1815,17 @@ public final class BrewShot implements AutoCloseable {
         String[] p = s.split(",");
         return new double[] {Double.parseDouble(p[0]), Double.parseDouble(p[1]),
                              Double.parseDouble(p[2]), Double.parseDouble(p[3])};
+    }
+
+    /**
+     * Quote a Java string as one JavaScript source string literal. JSON string
+     * syntax is also valid here; {@link MiniJson#esc} covers quotes,
+     * backslashes, controls, CR/LF, and the JavaScript line separators U+2028
+     * and U+2029. Package-private for injection-focused tests.
+     */
+    static String jsStringLiteral(String value) {
+        Objects.requireNonNull(value, "value");
+        return '"' + MiniJson.esc(value) + '"';
     }
 
     // ---- input dispatch ----------------------------------------------------
@@ -1836,7 +1888,7 @@ public final class BrewShot implements AutoCloseable {
      * the same eval is already post-scroll.
      */
     private double[] visibleCenter(String cssSelector) {
-        String sel = "'" + cssSelector.replace("\\", "\\\\").replace("'", "\\'") + "'";
+        String sel = jsStringLiteral(cssSelector);
         Object v = eval("(function(){var e=document.querySelector(" + sel + ");"
             + "if(!e)return 'none';e.scrollIntoView({block:'center',inline:'center'});"
             + "var r=e.getBoundingClientRect();"
@@ -1903,9 +1955,8 @@ public final class BrewShot implements AutoCloseable {
      * an element flush against the edge.
      */
     public byte[] screenshotElement(String cssSelector, double scale, double paddingPx) {
-        if (!Double.isFinite(paddingPx) || paddingPx < 0) {
-            throw new IllegalArgumentException("invalid paddingPx: " + paddingPx);
-        }
+        Validation.positiveFinite("clip scale", scale);
+        Validation.nonNegativeFinite("paddingPx", paddingPx);
         double[] b = elementBox(cssSelector);
         return screenshotClip(Math.max(0, b[0] - paddingPx), Math.max(0, b[1] - paddingPx),
             b[2] + 2 * paddingPx, b[3] + 2 * paddingPx, scale);
@@ -1975,6 +2026,10 @@ public final class BrewShot implements AutoCloseable {
     public void recordGifElement(String cssSelector, int frames, int captureDelayMs,
                                  int playbackDelayMs, int firstFrameDelayMs, double scale,
                                  IntConsumer beforeFrame, Path out) throws IOException {
+        validateFrameRecorder(frames, captureDelayMs, playbackDelayMs);
+        effectiveGifDelayMs(firstFrameDelayMs);
+        Validation.positiveFinite("recording scale", scale);
+        Objects.requireNonNull(beforeFrame, "beforeFrame");
         double[] b = elementBox(cssSelector);
         // brewshot 109: EVERY accumulating recorder rides the one FrameBudget.
         FrameBudget budget = new FrameBudget();
@@ -2000,6 +2055,10 @@ public final class BrewShot implements AutoCloseable {
      */
     public void recordGifScroll(int panFrames, int holdFrames, int playbackDelayMs,
                                 double scale, Path out) throws IOException {
+        Validation.positiveInt("panFrames", panFrames);
+        Validation.nonNegativeInt("holdFrames", holdFrames);
+        effectiveGifDelayMs(playbackDelayMs);
+        Validation.positiveFinite("recording scale", scale);
         double w = ((Number) eval("document.documentElement.scrollWidth")).doubleValue();
         double h = ((Number) eval("document.documentElement.scrollHeight")).doubleValue();
         double vh = ((Number) eval("window.innerHeight")).doubleValue();
@@ -2028,6 +2087,8 @@ public final class BrewShot implements AutoCloseable {
      */
     public void recordGifFullPage(int frames, int frameDelayMs, double scale, Path out)
             throws IOException {
+        validateFrameRecorder(frames, frameDelayMs, frameDelayMs);
+        Validation.positiveFinite("recording scale", scale);
         double w = ((Number) eval("document.documentElement.scrollWidth")).doubleValue();
         double h = ((Number) eval("document.documentElement.scrollHeight")).doubleValue();
         FrameBudget budget = new FrameBudget();
@@ -2048,6 +2109,7 @@ public final class BrewShot implements AutoCloseable {
      */
     public byte[] screenshotRegion(double fromFraction, double toFraction, double scale) {
         checkFractions(fromFraction, toFraction);
+        Validation.positiveFinite("region scale", scale);
         double w = ((Number) eval("document.documentElement.scrollWidth")).doubleValue();
         double h = ((Number) eval("document.documentElement.scrollHeight")).doubleValue();
         return screenshotClip(0, h * fromFraction, w, h * (toFraction - fromFraction), scale);
@@ -2062,6 +2124,8 @@ public final class BrewShot implements AutoCloseable {
                                 int frames, int frameDelayMs, double scale, Path out)
             throws IOException {
         checkFractions(fromFraction, toFraction);
+        validateFrameRecorder(frames, frameDelayMs, frameDelayMs);
+        Validation.positiveFinite("recording scale", scale);
         double w = ((Number) eval("document.documentElement.scrollWidth")).doubleValue();
         double h = ((Number) eval("document.documentElement.scrollHeight")).doubleValue();
         double y = h * fromFraction;
@@ -2077,6 +2141,8 @@ public final class BrewShot implements AutoCloseable {
     }
 
     private static void checkFractions(double from, double to) {
+        Validation.finite("region fromFraction", from);
+        Validation.finite("region toFraction", to);
         if (!(from >= 0 && to <= 1 && from < to)) {
             throw new IllegalArgumentException(
                 "region fractions want 0 <= from < to <= 1, got " + from + ".." + to);
@@ -2112,11 +2178,10 @@ public final class BrewShot implements AutoCloseable {
      */
     public int recordGifStream(int durationMs, int playbackDelayMs, int firstFrameDelayMs,
                                int maxWidth, Path out) throws IOException {
-        if (durationMs <= 0 || playbackDelayMs <= 0 || firstFrameDelayMs <= 0 || maxWidth < 0) {
-            throw new IllegalArgumentException("recordGifStream wants durationMs/delays > 0"
-                + " and maxWidth >= 0, got " + durationMs + "/" + playbackDelayMs + "/"
-                + firstFrameDelayMs + "/" + maxWidth);
-        }
+        Validation.positiveInt("durationMs", durationMs);
+        effectiveGifDelayMs(playbackDelayMs);
+        effectiveGifDelayMs(firstFrameDelayMs);
+        Validation.nonNegativeInt("maxWidth", maxWidth);
         FrameBudget budget = new FrameBudget();
         command("Page.startScreencast", maxWidth > 0
             ? "{\"format\":\"png\",\"everyNthFrame\":1,\"maxWidth\":" + maxWidth + "}"

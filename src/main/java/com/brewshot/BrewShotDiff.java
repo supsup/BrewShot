@@ -5,6 +5,7 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
 import java.util.List;
+import java.util.Objects;
 
 /**
  * Pixel diff → a citable textual verdict (plan 84f468d0, roadmap #6257 B-item).
@@ -42,10 +43,57 @@ public final class BrewShotDiff {
      * still counted in {@link Verdict#antialiasedIgnored}); {@code masks} are
      * {@code {x,y,w,h}} regions excluded from comparison on BOTH images (dynamic
      * regions — clocks, spinners — so the numbers stay stable and citable).
+     * Extents must be positive and non-overflowing. Masks are clipped to image
+     * bounds; one wholly outside the image intentionally excludes zero pixels.
+     * Constructor inputs and accessor results are deep-copied.
      */
     public record Options(int tolerance, boolean ignoreAntialiasing, List<int[]> masks) {
+        public Options {
+            // A channel delta is at most 255 and comparison is strictly
+            // `delta > tolerance`; 255 would disable all possible changes.
+            Validation.intRange("diff tolerance", tolerance, 0, 254);
+            masks = copyMasks(masks);
+        }
+
         public static Options defaults() {
             return new Options(DEFAULT_TOLERANCE, true, List.of());
+        }
+
+        /** A fresh deep copy, so callers cannot mutate the stored mask arrays. */
+        @Override
+        public List<int[]> masks() {
+            return copyMasks(masks);
+        }
+
+        private static List<int[]> copyMasks(List<int[]> source) {
+            if (source == null) {
+                throw new IllegalArgumentException("diff masks must not be null");
+            }
+            List<int[]> copy = new ArrayList<>(source.size());
+            for (int index = 0; index < source.size(); index++) {
+                int[] mask = source.get(index);
+                if (mask == null) {
+                    throw new IllegalArgumentException(
+                        "diff mask " + index + " must not be null");
+                }
+                if (mask.length != 4) {
+                    throw new IllegalArgumentException(
+                        "diff mask " + index + " must be {x,y,w,h}, got length "
+                            + mask.length);
+                }
+                Validation.positiveInt("diff mask " + index + " width", mask[2]);
+                Validation.positiveInt("diff mask " + index + " height", mask[3]);
+                try {
+                    Math.addExact(mask[0], mask[2]);
+                    Math.addExact(mask[1], mask[3]);
+                } catch (ArithmeticException overflow) {
+                    throw new IllegalArgumentException(
+                        "diff mask " + index + " extent overflows integer coordinates",
+                        overflow);
+                }
+                copy.add(mask.clone());
+            }
+            return List.copyOf(copy);
         }
     }
 
@@ -63,14 +111,30 @@ public final class BrewShotDiff {
                           long totalPixels, long changedPixels, double pctChanged,
                           long antialiasedIgnored, long maskedPixels,
                           int[] changedBounds, Cluster largestCluster, String prose) {
+        public Verdict {
+            if (changedBounds != null && changedBounds.length != 4) {
+                throw new IllegalArgumentException(
+                    "changedBounds must be {x,y,w,h}, got length " + changedBounds.length);
+            }
+            changedBounds = changedBounds == null ? null : changedBounds.clone();
+        }
 
         public boolean anyChange() {
             return sizeMismatch || changedPixels > 0;
+        }
+
+        /** A fresh copy, so a returned bounds array cannot mutate this verdict. */
+        @Override
+        public int[] changedBounds() {
+            return changedBounds == null ? null : changedBounds.clone();
         }
     }
 
     /** Compare two decoded images under {@code options} and render the verdict. */
     public static Verdict diff(BufferedImage a, BufferedImage b, Options options) {
+        Objects.requireNonNull(a, "a");
+        Objects.requireNonNull(b, "b");
+        Objects.requireNonNull(options, "options");
         int wa = a.getWidth(), ha = a.getHeight();
         int wb = b.getWidth(), hb = b.getHeight();
         if (wa != wb || ha != hb) {
@@ -85,7 +149,8 @@ public final class BrewShotDiff {
 
         boolean[] masked = new boolean[w * h];
         long maskedCount = 0;
-        for (int[] m : options.masks()) {
+        List<int[]> masks = options.masks();
+        for (int[] m : masks) {
             int mx = Math.max(0, m[0]), my = Math.max(0, m[1]);
             int mx2 = Math.min(w, m[0] + m[2]), my2 = Math.min(h, m[1] + m[3]);
             for (int y = my; y < my2; y++) {
@@ -283,12 +348,16 @@ public final class BrewShotDiff {
      * eyes-artifact companion to the textual verdict ({@code --diff-out}).
      */
     public static BufferedImage heatmap(BufferedImage a, BufferedImage b, Options options) {
+        Objects.requireNonNull(a, "a");
+        Objects.requireNonNull(b, "b");
+        Objects.requireNonNull(options, "options");
         int w = a.getWidth(), h = a.getHeight();
         BufferedImage out = new BufferedImage(w, h, BufferedImage.TYPE_INT_RGB);
         int[] pa = a.getRGB(0, 0, w, h, null, 0, w);
         int[] pb = b.getRGB(0, 0, w, h, null, 0, w);
         boolean[] masked = new boolean[w * h];
-        for (int[] m : options.masks()) {
+        List<int[]> masks = options.masks();
+        for (int[] m : masks) {
             int mx = Math.max(0, m[0]), my = Math.max(0, m[1]);
             int mx2 = Math.min(w, m[0] + m[2]), my2 = Math.min(h, m[1] + m[3]);
             for (int y = my; y < my2; y++) {
@@ -316,55 +385,47 @@ public final class BrewShotDiff {
         return out;
     }
 
-    /** The JSON sidecar body ({@code --json}), MiniJson-escaped, stable field order. */
+    /** The JSON sidecar body ({@code --json}), MiniJson-serialized, stable field order. */
     public static String toJson(Verdict v, Double failOverPct, Long failPixels, boolean gateExceeded) {
-        StringBuilder j = new StringBuilder(512);
-        j.append("{\n")
-         .append("  \"sizeMismatch\": ").append(v.sizeMismatch()).append(",\n")
-         .append("  \"width\": ").append(v.widthA()).append(",\n")
-         .append("  \"height\": ").append(v.heightA()).append(",\n");
+        Objects.requireNonNull(v, "verdict");
+        java.util.Map<String, Object> root = new java.util.LinkedHashMap<>();
+        root.put("sizeMismatch", v.sizeMismatch());
+        root.put("width", v.widthA());
+        root.put("height", v.heightA());
         if (v.sizeMismatch()) {
-            j.append("  \"widthB\": ").append(v.widthB()).append(",\n")
-             .append("  \"heightB\": ").append(v.heightB()).append(",\n");
+            root.put("widthB", v.widthB());
+            root.put("heightB", v.heightB());
         }
-        j.append("  \"totalPixels\": ").append(v.totalPixels()).append(",\n")
-         .append("  \"changedPixels\": ").append(v.changedPixels()).append(",\n")
-         .append("  \"pctChanged\": ").append(String.format(java.util.Locale.ROOT, "%.4f", v.pctChanged())).append(",\n")
-         .append("  \"antialiasedIgnored\": ").append(v.antialiasedIgnored()).append(",\n")
-         .append("  \"maskedPixels\": ").append(v.maskedPixels()).append(",\n")
-         .append("  \"bbox\": ").append(rect(v.changedBounds())).append(",\n");
+        root.put("totalPixels", v.totalPixels());
+        root.put("changedPixels", v.changedPixels());
+        root.put("pctChanged", decimal4(v.pctChanged()));
+        root.put("antialiasedIgnored", v.antialiasedIgnored());
+        root.put("maskedPixels", v.maskedPixels());
+        root.put("bbox", v.changedBounds());
         if (v.largestCluster() == null) {
-            j.append("  \"largestCluster\": null,\n");
+            root.put("largestCluster", null);
         } else {
             Cluster c = v.largestCluster();
-            j.append("  \"largestCluster\": {\n")
-             .append("    \"centroid\": [").append(c.centroidX()).append(", ").append(c.centroidY()).append("],\n")
-             .append("    \"bbox\": [").append(c.x()).append(", ").append(c.y()).append(", ")
-             .append(c.width()).append(", ").append(c.height()).append("],\n")
-             .append("    \"pixels\": ").append(c.pixels()).append(",\n")
-             .append("    \"share\": ").append(String.format(java.util.Locale.ROOT, "%.4f", c.shareOfChange())).append(",\n")
-             .append("    \"label\": \"").append(c.label()).append("\"\n")
-             .append("  },\n");
+            java.util.Map<String, Object> cluster = new java.util.LinkedHashMap<>();
+            cluster.put("centroid", new int[] {c.centroidX(), c.centroidY()});
+            cluster.put("bbox", new int[] {c.x(), c.y(), c.width(), c.height()});
+            cluster.put("pixels", c.pixels());
+            cluster.put("share", decimal4(c.shareOfChange()));
+            cluster.put("label", c.label());
+            root.put("largestCluster", cluster);
         }
-        j.append("  \"gate\": {\n")
-         .append("    \"failOverPct\": ").append(failOverPct == null ? "null" : failOverPct).append(",\n")
-         .append("    \"failPixels\": ").append(failPixels == null ? "null" : failPixels).append(",\n")
-         .append("    \"exceeded\": ").append(gateExceeded).append("\n")
-         .append("  },\n")
-         .append("  \"verdict\": \"").append(MiniJson.esc(v.prose())).append("\",\n")
-         .append("  \"brewshot\": \"").append(BrewShot.VERSION).append("\"\n")
-         .append("}\n");
-        return j.toString();
+        java.util.Map<String, Object> gate = new java.util.LinkedHashMap<>();
+        gate.put("failOverPct", failOverPct);
+        gate.put("failPixels", failPixels);
+        gate.put("exceeded", gateExceeded);
+        root.put("gate", gate);
+        root.put("verdict", v.prose());
+        root.put("brewshot", BrewShot.VERSION);
+        return MiniJson.stringifyPretty(root) + "\n";
     }
 
-    private static String rect(int[] r) {
-        if (r == null) {
-            return "null";
-        }
-        List<String> parts = new ArrayList<>(4);
-        for (int v : r) {
-            parts.add(String.valueOf(v));
-        }
-        return "[" + String.join(", ", parts) + "]";
+    private static java.math.BigDecimal decimal4(double value) {
+        return java.math.BigDecimal.valueOf(value).setScale(
+            4, java.math.RoundingMode.HALF_UP);
     }
 }

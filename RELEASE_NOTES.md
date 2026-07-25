@@ -1,5 +1,41 @@
 # BrewShot — Release Notes ☕📸
 
+## Unreleased
+
+- **Contract validation is fail-loud and finite-first.** PDF paper/margins/scale,
+  clipped screenshot geometry, recorder counts/delays, diff options/masks, CLI
+  positive integers/longs, and public timeout/heap knobs now reject invalid
+  inputs before protocol or file work. Documented zero-duration no-ops remain
+  only on `settle(0)` and `waitForNetworkIdle(..., 0)`. Shared bounded UTF-8
+  ingestion accepts stdin HTML through exactly 16 MiB and `--eval-file` through
+  exactly 1 MiB, reading only one sentinel byte before an over-limit refusal.
+- **Truthful, transactional artifacts.** Case-insensitive `.jpg`/`.jpeg` CLI
+  stills use Chrome's JPEG encoder (`--jpeg-quality 1..100`, default 90),
+  including clip/scale paths; unknown shoot extensions and non-PNG
+  `--diff-out` names are refused.
+  Screenshots, PDFs, GIFs, manifests, diff JSON, and heatmaps now write through
+  sibling temporaries and move into place atomically when supported. Encoding
+  or temporary-write failures preserve an existing completed target and clean
+  temporary residue best-effort. The complete-temp fallback cannot promise
+  atomic replacement on filesystems that reject `ATOMIC_MOVE`. Replacement
+  retains existing POSIX mode bits and follows valid output symlinks to their
+  referents; broken/cyclic links fail before temporary-file creation. CLI
+  output paths are preflighted against sibling artifacts and diff baselines.
+  Absent output identities use a fail-closed Unicode-normalized case fold, so
+  case-only future aliases cannot overwrite one another on insensitive mounts.
+- **Typed manifests.** `MiniJson` is now the zero-dependency serializer for the
+  full supported JSON domain; manifest `eval` values remain null/boolean/number/
+  string/array/object, while non-finite, cyclic, and unsupported values fail loud.
+- **Immutable diff inputs/results and safe selectors.** `Options` deep-copies and
+  validates mask shape/extents/overflow; `Verdict` owns and re-copies changed
+  bounds. Tolerance is 0–254 and percentage gates are 0–100. One
+  selector-literal helper escapes quotes, backslashes, CR/LF, U+2028, U+2029,
+  and every UTF-16 surrogate code unit before interpolation or UTF-8 output.
+- **Honest GIF timing.** Millisecond delays round to the nearest centisecond
+  (75 ms → 80 ms) while retaining the 20 ms minimum.
+  `BrewShot.effectiveGifDelayMs` and CLI manifest requested/encoded fields expose
+  the effective value.
+
 ## 0.9.0
 
 CLI GIF parity — the recorder family finally reachable without writing Java — plus

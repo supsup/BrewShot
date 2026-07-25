@@ -134,7 +134,8 @@ animation without writing a line of Java:
 
 ```
 java -jar build/libs/brewshot-0.9.0.jar ./fx-demo.html --gif 40 --gif-element ".fx" -o fx.gif
-# --gif N frames, --gif-delay MS cadence (capture == playback), looping GIF out
+# --gif N frames, --gif-delay MS cadence (GIF playback rounds to nearest 10 ms,
+# minimum 20 ms), looping GIF out
 ```
 
 **The caveat Sam should know:** the PNG/eval path compiles native cleanly (pure
