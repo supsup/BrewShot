@@ -410,6 +410,24 @@ class BrewShotDiffTest {
     }
 
     @Test
+    void absentCaseVariantDiffOutputsRejectBeforeEitherArtifactIsWritten(
+            @TempDir Path tmp) throws Exception {
+        Path a = write(tmp, "a.png", solid(10, 10, Color.BLACK));
+        Path b = write(tmp, "b.png", solid(10, 10, Color.WHITE));
+        Path heatmap = tmp.resolve("Result.png");
+        Path json = tmp.resolve("result.png");
+        assertFalse(Files.exists(heatmap));
+        assertFalse(Files.exists(json));
+
+        int code = Main.run(new String[] {"diff", a.toString(), b.toString(),
+            "--diff-out", heatmap.toString(), "--json", json.toString()});
+
+        assertEquals(2, code);
+        assertFalse(Files.exists(heatmap));
+        assertFalse(Files.exists(json));
+    }
+
+    @Test
     void heatmapIoFailureCannotSuppressTheJsonSidecar(@TempDir Path tmp) throws Exception {
         // F1 (consumer review brewshot #45): --diff-out pointing into a nonexistent directory
         // must not eat the --json sidecar — the machine artifact writes first, independently.
@@ -446,21 +464,25 @@ class BrewShotDiffTest {
     }
 
     @Test
-    void listOfJobsPreflightsAllAliasesBeforeTheFirstWrite(@TempDir Path tmp)
+    void listOfJobsPreflightsAbsentCaseAliasesBeforeTheFirstWrite(@TempDir Path tmp)
             throws Exception {
         Path baseline = write(tmp, "baseline.png", solid(10, 10, Color.WHITE));
-        Path futureSidecar = tmp.resolve("future.json");
+        Path futureSidecar = tmp.resolve("Future.json");
+        Path futureBaseline = tmp.resolve("future.json");
         Path secondSidecar = tmp.resolve("second.json");
+        assertFalse(Files.exists(futureSidecar));
+        assertFalse(Files.exists(futureBaseline));
 
         int code = Main.runDiffJobs(List.of(
             new Main.DiffJob(baseline, baseline, BrewShotDiff.Options.defaults(),
                 null, null, null, futureSidecar),
-            new Main.DiffJob(futureSidecar, baseline, BrewShotDiff.Options.defaults(),
+            new Main.DiffJob(futureBaseline, baseline, BrewShotDiff.Options.defaults(),
                 null, null, null, secondSidecar)));
 
         assertEquals(2, code);
         assertFalse(Files.exists(futureSidecar),
             "the complete batch must be alias-checked before job one writes");
+        assertFalse(Files.exists(futureBaseline));
         assertFalse(Files.exists(secondSidecar));
     }
 }

@@ -39,7 +39,10 @@ fallback preserves the complete-before-replace rule but cannot guarantee
 atomic replacement on a filesystem that does not support `ATOMIC_MOVE`.
 Replacing an existing POSIX target retains its mode bits. A valid output
 symlink remains a symlink and its referent is replaced; broken or cyclic
-output symlinks fail before temporary-file creation.
+output symlinks fail before temporary-file creation. Output aliases are
+rejected before artifacts are written; when either future target is absent,
+Unicode-normalized case-only variants are rejected conservatively, including
+on case-sensitive mounts.
 When `--json` accompanies `--eval`, the manifest's `eval` field preserves the
 JSON value itself — null, boolean, number, string, array, or object — instead
 of flattening it through `String.valueOf`.

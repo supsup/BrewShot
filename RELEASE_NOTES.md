@@ -21,6 +21,8 @@
   retains existing POSIX mode bits and follows valid output symlinks to their
   referents; broken/cyclic links fail before temporary-file creation. CLI
   output paths are preflighted against sibling artifacts and diff baselines.
+  Absent output identities use a fail-closed Unicode-normalized case fold, so
+  case-only future aliases cannot overwrite one another on insensitive mounts.
 - **Typed manifests.** `MiniJson` is now the zero-dependency serializer for the
   full supported JSON domain; manifest `eval` values remain null/boolean/number/
   string/array/object, while non-finite, cyclic, and unsupported values fail loud.

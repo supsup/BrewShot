@@ -3,6 +3,7 @@ package com.brewshot;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.text.Normalizer;
 import java.util.Locale;
 
 /**
@@ -703,7 +704,10 @@ public final class Main {
 
     /**
      * Lexical normalization covers paths that do not exist yet; isSameFile
-     * additionally catches existing symlink and hard-link aliases.
+     * additionally catches existing symlink and hard-link aliases. When either
+     * target is absent, reject normalized case-fold collisions conservatively:
+     * Java has no portable read-only per-mount case-sensitivity query, and a
+     * live probe would itself write during the no-write preflight.
      */
     static boolean pathsAlias(Path first, Path second) throws java.io.IOException {
         Path identityFirst = ArtifactWriter.outputIdentity(first);
@@ -711,9 +715,25 @@ public final class Main {
         if (identityFirst.equals(identitySecond)) {
             return true;
         }
-        return Files.exists(identityFirst)
-            && Files.exists(identitySecond)
-            && Files.isSameFile(identityFirst, identitySecond);
+        boolean firstExists = Files.exists(identityFirst);
+        boolean secondExists = Files.exists(identitySecond);
+        if (firstExists && secondExists) {
+            return Files.isSameFile(identityFirst, identitySecond);
+        }
+        return foldedAbsentPath(identityFirst).equals(foldedAbsentPath(identitySecond));
+    }
+
+    /**
+     * A deliberately broad Unicode fold for absent-path fail-closed identity.
+     * NFKC catches canonically/compatibly equivalent spellings; upper-then-lower
+     * also folds multi-character mappings such as sharp-s.
+     */
+    private static String foldedAbsentPath(Path path) {
+        String normalized =
+            Normalizer.normalize(path.toString(), Normalizer.Form.NFKC);
+        String folded =
+            normalized.toUpperCase(Locale.ROOT).toLowerCase(Locale.ROOT);
+        return Normalizer.normalize(folded, Normalizer.Form.NFKC);
     }
 
     /** Validate a flag value against a fixed allowed set; throws (usage error, exit 2) otherwise. */

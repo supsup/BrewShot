@@ -177,6 +177,34 @@ class MainCliTest {
     }
 
     @Test
+    void absentCaseVariantCaptureOutputsRejectBeforeInputResolutionOrWrite(
+            @TempDir Path directory) throws Exception {
+        Path output = directory.resolve("Result.png");
+        Path manifest = directory.resolve("result.png");
+        Path missingInput = directory.resolve("missing-input.html");
+        org.junit.jupiter.api.Assertions.assertFalse(Files.exists(output));
+        org.junit.jupiter.api.Assertions.assertFalse(Files.exists(manifest));
+
+        ByteArrayOutputStream errors = new ByteArrayOutputStream();
+        PrintStream original = System.err;
+        int code;
+        try {
+            System.setErr(new PrintStream(errors));
+            code = Main.run(new String[] {
+                missingInput.toString(), "-o", output.toString(),
+                "--json", manifest.toString()});
+        } finally {
+            System.setErr(original);
+        }
+
+        assertEquals(2, code);
+        org.junit.jupiter.api.Assertions.assertTrue(
+            errors.toString().contains("must name different files"), errors.toString());
+        org.junit.jupiter.api.Assertions.assertFalse(Files.exists(output));
+        org.junit.jupiter.api.Assertions.assertFalse(Files.exists(manifest));
+    }
+
+    @Test
     void brokenManifestSymlinkCannotBecomeAnAliasAfterCaptureWrites(
             @TempDir Path directory) throws Exception {
         Path output = directory.resolve("future-capture.png");
