@@ -82,7 +82,8 @@ public final class BrewShot implements AutoCloseable {
     private static final Pattern STARTUP_FLAG_ASSIGNMENT = Pattern.compile(
         "(--[A-Za-z0-9][A-Za-z0-9_-]*)=\\S+");
     private static final Pattern STARTUP_FLAG_VALUE = Pattern.compile(
-        "(--[A-Za-z0-9][A-Za-z0-9_-]*)\\s+(?:\\\"[^\\\"]*\\\"|'[^']*'|\\S+)");
+        "(--[A-Za-z0-9][A-Za-z0-9_-]*)\\s++(?!--[A-Za-z0-9])"
+            + "(?:\\\"[^\\\"]*\\\"|'[^']*'|\\S+)");
     private static final Pattern STARTUP_SECRET_ASSIGNMENT = Pattern.compile(
         "(?i)\\b((?=[A-Za-z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|"
             + "COOKIE|AUTH|API_KEY))[A-Za-z_][A-Za-z0-9_]*)=\\S+");
@@ -1156,9 +1157,7 @@ public final class BrewShot implements AutoCloseable {
             boolean profileWriteSettled = profileNonValidSinceNanos < 0
                 || System.nanoTime() - profileNonValidSinceNanos
                     >= TimeUnit.MILLISECONDS.toNanos(BOOTSTRAP_WITNESS_SETTLE_MS);
-            if (!endpoints.isEmpty()
-                    && ((witnessSettled && profileWriteSettled)
-                        || (streamsClosed && fileProbe.state() == ActivePortState.ABSENT))) {
+            if (!endpoints.isEmpty() && witnessSettled && profileWriteSettled) {
                 DevToolsEndpoint endpoint = endpoints.values().iterator().next();
                 return bootstrapResult(
                     DevToolsBootstrapOutcome.ENDPOINT,

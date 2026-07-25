@@ -18,6 +18,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
+import org.junit.jupiter.api.RepeatedTest;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -197,6 +198,35 @@ class BrewShotBootstrapTest {
         }
     }
 
+    @RepeatedTest(5)
+    void closedStreamsStillWaitForDelayedProfileDisagreement(
+            @TempDir Path profile) throws Exception {
+        BootstrapProcess process = BootstrapProcess.alive(
+            "DevTools listening on ws://127.0.0.1:9556" + PATH + "\n", "");
+        Thread writer = new Thread(() -> {
+            try {
+                Thread.sleep(70);
+                Files.writeString(profile.resolve("DevToolsActivePort"),
+                    "9667\n" + PATH + "\n", StandardCharsets.UTF_8);
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        }, "closed-stream-devtools-active-port-writer");
+        writer.start();
+
+        BrewShot.DevToolsBootstrapResult result =
+            BrewShot.observeDevToolsEndpoint(process, profile, 500);
+        writer.join(1_000);
+
+        assertFalse(writer.isAlive(), "delayed profile writer must finish");
+        assertEquals(
+            BrewShot.DevToolsBootstrapOutcome.DISAGREEING_ENDPOINTS,
+            result.outcome());
+        assertEquals(java.util.Set.of(
+            BrewShot.DevToolsWitnessSource.STDOUT,
+            BrewShot.DevToolsWitnessSource.PROFILE), result.sources());
+    }
+
     @Test
     void disagreeingWitnessesFailLoud(@TempDir Path profile) throws Exception {
         Files.writeString(profile.resolve("DevToolsActivePort"),
@@ -251,6 +281,22 @@ class BrewShotBootstrapTest {
         assertTrue(result.stderrTail().contains("<command line redacted>"),
             result.stderrTail());
         assertTrue(result.stdoutTail().length() <= 1_000, result.stdoutTail());
+    }
+
+    @Test
+    void adjacentFlagsCannotExposeCredentialValueInRetainedTail(
+            @TempDir Path profile) throws Exception {
+        BootstrapProcess process = BootstrapProcess.exited(1,
+            "diagnostic --foo --proxy-password hunter2\n", "");
+
+        BrewShot.DevToolsBootstrapResult result =
+            BrewShot.observeDevToolsEndpoint(process, profile, 500);
+
+        assertEquals(BrewShot.DevToolsBootstrapOutcome.PROCESS_EXITED,
+            result.outcome());
+        assertEquals("diagnostic --foo --proxy-password <redacted>",
+            result.stdoutTail());
+        assertFalse(result.stdoutTail().contains("hunter2"), result.stdoutTail());
     }
 
     @Test

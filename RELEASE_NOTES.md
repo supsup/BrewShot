@@ -10,6 +10,9 @@
   supported contexts BrewShot continuously drains bounded stdout and stderr and
   also validates the generated profile's `DevToolsActivePort`, using one
   monotonic deadline and requiring every observed endpoint witness to agree.
+  The 100 ms cross-witness agreement window is honored even after both stream
+  drains reach EOF, and adjacent startup flags cannot hide a credential value
+  from diagnostic-tail redaction.
   Failures distinguish process exit, alive timeout, malformed witnesses, and
   disagreement while retaining only bounded sanitized stream tails. This is a
   narrow response to macOS 26.5.2 / Chrome 150 evidence, not a claim that every
