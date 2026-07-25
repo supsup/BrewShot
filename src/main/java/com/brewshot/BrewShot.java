@@ -2,21 +2,27 @@ package com.brewshot;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.WebSocket;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.SimpleFileVisitor;
+import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Deque;
+import java.util.EnumMap;
+import java.util.EnumSet;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -57,8 +63,38 @@ public final class BrewShot implements AutoCloseable {
     // about vendored-jar provenance (caught by Fixpoint, sirentide #121).
     public static final String VERSION = "0.9.0";
 
-    private static final Pattern WS_LINE = Pattern.compile("DevTools listening on (ws://\\S+)");
+    private static final Pattern DEVTOOLS_LINE =
+        Pattern.compile("DevTools listening on\\s+(\\S+)");
+    private static final Pattern DEVTOOLS_BROWSER_PATH =
+        Pattern.compile("/devtools/browser/[A-Za-z0-9._-]+");
+    private static final Pattern STARTUP_URL_TOKEN =
+        Pattern.compile("(?i)\\b(?:ws|https?)://\\S+");
+    private static final Pattern STARTUP_COMMAND_LINE = Pattern.compile(
+        "(?i)^.*\\b(?:command(?:\\s+line)?|argv|args|launch(?:ing)?)\\s*[:=].*$");
+    private static final Pattern STARTUP_SENSITIVE_HEADER = Pattern.compile(
+        "(?i).*\\b(?:authorization|proxy-authorization|cookie|set-cookie)\\s*[:=].*$");
+    private static final Pattern STARTUP_BEARER_CREDENTIAL = Pattern.compile(
+        "(?i)\\b(bearer|basic)\\s+[^\\s|;,]+");
+    private static final Pattern STARTUP_QUOTED_ABSOLUTE_PATH = Pattern.compile(
+        "([\\\"'])(?:[A-Za-z]:[\\\\/]|/)[^\\\"'\\r\\n]*\\1");
+    private static final Pattern STARTUP_ABSOLUTE_PATH = Pattern.compile(
+        "(?<![A-Za-z0-9])(?:[A-Za-z]:[\\\\/]|/|~[\\\\/])[^\\s|;,)\\]]*");
+    private static final Pattern STARTUP_FLAG_ASSIGNMENT = Pattern.compile(
+        "(--[A-Za-z0-9][A-Za-z0-9_-]*)=\\S+");
+    private static final Pattern STARTUP_FLAG_VALUE = Pattern.compile(
+        "(--[A-Za-z0-9][A-Za-z0-9_-]*)\\s+(?:\\\"[^\\\"]*\\\"|'[^']*'|\\S+)");
+    private static final Pattern STARTUP_SECRET_ASSIGNMENT = Pattern.compile(
+        "(?i)\\b((?=[A-Za-z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|"
+            + "COOKIE|AUTH|API_KEY))[A-Za-z_][A-Za-z0-9_]*)=\\S+");
+    private static final Pattern STARTUP_ENV_ASSIGNMENT = Pattern.compile(
+        "\\b([A-Z][A-Z0-9_]{1,63})=\\S+");
     private static final long DEFAULT_TIMEOUT_MS = 15_000;
+    private static final long BOOTSTRAP_POLL_MS = 20;
+    private static final long BOOTSTRAP_WITNESS_SETTLE_MS = 100;
+    private static final int BOOTSTRAP_STREAM_LINE_CAP = 4_096;
+    private static final int BOOTSTRAP_TAIL_LINE_CAP = 240;
+    private static final int BOOTSTRAP_TAIL_LINES = 4;
+    private static final int DEVTOOLS_ACTIVE_PORT_FILE_CAP = 4_096;
     private static final long DEFAULT_CLOSE_TIMEOUT_MS = 1_000;
     private static final long PROCESS_CLOSE_TIMEOUT_MS = 3_000;
     private static final long PROCESS_FORCE_REAP_TIMEOUT_MS = 2_000;
@@ -239,6 +275,42 @@ public final class BrewShot implements AutoCloseable {
     private static boolean isWindows() {
         return System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT)
             .startsWith("windows");
+    }
+
+    /**
+     * Return a fixed, sanitized refusal for the known-denied macOS Codex
+     * Seatbelt context, or {@code null} when launch may proceed. Chrome 150's
+     * unified headless bootstrap calls into LaunchServices there and aborts
+     * before publishing a DevTools endpoint, sometimes queuing an operator
+     * crash dialog. The separately installed {@code chrome-headless-shell}
+     * does not use that unified browser bootstrap and remains an explicit
+     * opt-in escape hatch through {@code BREWSHOT_CHROME}.
+     */
+    static String launchContextRefusal(Map<String, String> env, String osName,
+                                       String chromeBinary) {
+        boolean mac = osName != null
+            && osName.toLowerCase(java.util.Locale.ROOT).startsWith("mac");
+        String sandbox = env.get("CODEX_SANDBOX");
+        boolean seatbelt = sandbox != null
+            && "seatbelt".equalsIgnoreCase(sandbox.trim());
+        String override = env.get("BREWSHOT_CHROME");
+        boolean explicitHeadlessShell = override != null
+            && override.equals(chromeBinary) && isHeadlessShell(chromeBinary);
+        if (!mac || !seatbelt || explicitHeadlessShell) { return null; }
+        return "BrewShot refused to launch unified Chrome from the macOS Codex Seatbelt "
+            + "context because LaunchServices bootstrap is denied there. Run BrewShot from "
+            + "a normal Terminal or supported container, or explicitly point "
+            + "BREWSHOT_CHROME at chrome-headless-shell. No Chrome process or profile was "
+            + "created.";
+    }
+
+    private static boolean isHeadlessShell(String chromeBinary) {
+        if (chromeBinary == null || chromeBinary.isBlank()) { return false; }
+        String name;
+        try { name = Path.of(chromeBinary).getFileName().toString(); }
+        catch (RuntimeException invalidPath) { return false; }
+        return "chrome-headless-shell".equalsIgnoreCase(name)
+            || "chrome-headless-shell.exe".equalsIgnoreCase(name);
     }
 
     /**
@@ -761,6 +833,9 @@ public final class BrewShot implements AutoCloseable {
         Validation.positiveInt("viewport height", height);
         String bin = findChrome();
         if (bin == null) { throw new IllegalStateException("no Chrome binary found"); }
+        String refusal = launchContextRefusal(
+            System.getenv(), System.getProperty("os.name", ""), bin);
+        if (refusal != null) { throw new IOException(refusal); }
         Path profile = Files.createTempDirectory("brewshot-");
         List<String> args = new ArrayList<>(List.of(
             bin,
@@ -774,12 +849,11 @@ public final class BrewShot implements AutoCloseable {
             "--no-first-run",
             "--no-default-browser-check",
             // macOS 26 + Chrome 150 (plan ba9dafd7, 2026-07-22): without this flag, ~1/3 of
-            // rapid headless launches spawn a doomed secondary Chrome that abort()s inside
-            // TransformProcessType -> _RegisterApplication (LaunchServices refuses the
-            // registration under launch storms). Captures still succeed — the abort feeds the
-            // OPERATOR's "Chrome quit unexpectedly" dialog queue. Empirically eliminated by
-            // skipping the startup-window/app-registration path (0/15 storm launches vs 5/15
-            // without); harmless on Linux/CI.
+            // rapid headless launches spawned a doomed secondary Chrome that abort()ed inside
+            // TransformProcessType -> _RegisterApplication. It reduced the original observed
+            // storm from 5/15 aborts to 0/15, but later Seatbelt evidence proved it is not a
+            // universal crash-dialog fix; launchContextRefusal handles that known-denied context.
+            // The flag remains harmless on Linux/CI.
             "--no-startup-window"));
         // Extra Chrome flags via env — the container hook (e.g. the Docker
         // image sets BREWSHOT_CHROME_ARGS=--no-sandbox: Chrome's sandbox needs
@@ -792,16 +866,18 @@ public final class BrewShot implements AutoCloseable {
         ResourceLease lease = startLaunchProcess(
             profile,
             () -> new ProcessBuilder(args)
-                // stdout is never read — discard it so a chatty binary can't
-                // deadlock on a full 64KB pipe.
-                .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+                // Both startup streams are bounded and continuously drained by
+                // the endpoint witness observer below. Chrome versions and
+                // wrappers have published the DevTools line on either stream.
+                .redirectOutput(ProcessBuilder.Redirect.PIPE)
+                .redirectError(ProcessBuilder.Redirect.PIPE)
                 .start(),
             () -> { });
         Process p = lease.process;
 
         String wsUrl;
         try {
-            wsUrl = awaitDevtoolsUrl(p);
+            wsUrl = awaitDevtoolsUrl(p, profile);
             lease.refreshOwnershipCheckpoint();
         } catch (RuntimeException | IOException | Error e) {
             lease.cleanup(false);
@@ -894,44 +970,507 @@ public final class BrewShot implements AutoCloseable {
         connecting.cancel(true);
     }
 
+    enum DevToolsWitnessSource { STDOUT, STDERR, PROFILE }
+
+    enum DevToolsBootstrapOutcome {
+        ENDPOINT,
+        PROCESS_EXITED,
+        ALIVE_TIMEOUT,
+        MALFORMED_ENDPOINT,
+        DISAGREEING_ENDPOINTS
+    }
+
+    record DevToolsBootstrapResult(
+        DevToolsBootstrapOutcome outcome,
+        String webSocketUrl,
+        Set<DevToolsWitnessSource> sources,
+        int exitCode,
+        long elapsedMillis,
+        String stdoutTail,
+        String stderrTail
+    ) {
+        DevToolsBootstrapResult {
+            sources = sources.isEmpty()
+                ? Set.of()
+                : java.util.Collections.unmodifiableSet(EnumSet.copyOf(sources));
+        }
+    }
+
+    private record DevToolsEndpoint(String canonicalKey, String connectUrl) { }
+
+    private enum ActivePortState { ABSENT, INCOMPLETE, VALID, MALFORMED }
+
+    private record ActivePortProbe(ActivePortState state, DevToolsEndpoint endpoint) {
+        static ActivePortProbe absent() {
+            return new ActivePortProbe(ActivePortState.ABSENT, null);
+        }
+
+        static ActivePortProbe incomplete() {
+            return new ActivePortProbe(ActivePortState.INCOMPLETE, null);
+        }
+
+        static ActivePortProbe malformed() {
+            return new ActivePortProbe(ActivePortState.MALFORMED, null);
+        }
+
+        static ActivePortProbe valid(DevToolsEndpoint endpoint) {
+            return new ActivePortProbe(ActivePortState.VALID, endpoint);
+        }
+    }
+
+    private record BootstrapEvent(
+        DevToolsWitnessSource source,
+        DevToolsEndpoint endpoint,
+        boolean malformed,
+        boolean closed
+    ) {
+        static BootstrapEvent endpoint(DevToolsWitnessSource source,
+                                       DevToolsEndpoint endpoint) {
+            return new BootstrapEvent(source, endpoint, false, false);
+        }
+
+        static BootstrapEvent malformed(DevToolsWitnessSource source) {
+            return new BootstrapEvent(source, null, true, false);
+        }
+
+        static BootstrapEvent closed(DevToolsWitnessSource source) {
+            return new BootstrapEvent(source, null, false, true);
+        }
+    }
+
+    /** A fixed-size sanitized tail; startup output never grows retained state. */
+    private static final class BootstrapTail {
+        private final Deque<String> lines = new ArrayDeque<>();
+
+        synchronized void add(String line) {
+            if (line == null || line.isBlank()) { return; }
+            while (lines.size() >= BOOTSTRAP_TAIL_LINES) { lines.removeFirst(); }
+            lines.addLast(line);
+        }
+
+        synchronized String snapshot() {
+            return String.join(" | ", lines);
+        }
+    }
+
     /**
-     * Read Chrome's stderr for the "DevTools listening on ws://..." line on a
-     * helper thread, so the 15s deadline holds even when the process stays
-     * alive without printing anything (a bare readLine would block forever).
-     * The thread keeps draining stderr afterwards so Chrome never blocks on a
-     * full pipe.
+     * Observe Chrome bootstrap through three independently bounded witnesses:
+     * stdout, stderr, and the generated profile's {@code DevToolsActivePort}.
+     * All observers share one monotonic deadline. Stream readers remain daemon
+     * drains after success, preventing a live Chrome from filling either pipe.
      */
-    private static String awaitDevtoolsUrl(Process p) throws IOException {
-        CompletableFuture<String> found = new CompletableFuture<>();
-        Thread reader = new Thread(() -> {
-            try (var err = new java.io.BufferedReader(new java.io.InputStreamReader(
-                    p.getErrorStream(), StandardCharsets.UTF_8))) {
-                String line;
-                while ((line = err.readLine()) != null) {
-                    if (!found.isDone()) {
-                        Matcher m = WS_LINE.matcher(line);
-                        if (m.find()) { found.complete(m.group(1)); }
-                    }
-                }
-                found.completeExceptionally(
-                    new IOException("Chrome exited without a DevTools listening line"));
-            } catch (IOException e) {
-                found.completeExceptionally(e);
+    static DevToolsBootstrapResult observeDevToolsEndpoint(
+            Process process, Path profileDir, long timeoutMs) throws IOException {
+        Objects.requireNonNull(process, "process");
+        Objects.requireNonNull(profileDir, "profileDir");
+        long boundedTimeoutMs = Math.max(1, timeoutMs);
+        long startedNanos = System.nanoTime();
+        Deadline deadline = Deadline.afterMillis(boundedTimeoutMs);
+        var events = new LinkedBlockingQueue<BootstrapEvent>(32);
+        BootstrapTail stdoutTail = new BootstrapTail();
+        BootstrapTail stderrTail = new BootstrapTail();
+        startBootstrapDrain(
+            "brewshot-stdout", process.getInputStream(),
+            DevToolsWitnessSource.STDOUT, profileDir, events, stdoutTail);
+        startBootstrapDrain(
+            "brewshot-stderr", process.getErrorStream(),
+            DevToolsWitnessSource.STDERR, profileDir, events, stderrTail);
+
+        EnumMap<DevToolsWitnessSource, DevToolsEndpoint> endpoints =
+            new EnumMap<>(DevToolsWitnessSource.class);
+        EnumSet<DevToolsWitnessSource> malformed =
+            EnumSet.noneOf(DevToolsWitnessSource.class);
+        EnumSet<DevToolsWitnessSource> closed =
+            EnumSet.noneOf(DevToolsWitnessSource.class);
+        boolean activePortObserved = false;
+        long firstWitnessNanos = -1;
+        long profileNonValidSinceNanos = -1;
+
+        while (true) {
+            ActivePortProbe fileProbe = probeDevToolsActivePort(profileDir);
+            if (fileProbe.state() != ActivePortState.ABSENT) {
+                activePortObserved = true;
             }
-        }, "brewshot-stderr");
+            if (fileProbe.state() == ActivePortState.VALID) {
+                profileNonValidSinceNanos = -1;
+                malformed.remove(DevToolsWitnessSource.PROFILE);
+                if (!recordEndpoint(
+                        endpoints, DevToolsWitnessSource.PROFILE,
+                        fileProbe.endpoint())) {
+                    return bootstrapResult(
+                        DevToolsBootstrapOutcome.DISAGREEING_ENDPOINTS,
+                        null, endpoints.keySet(), process, startedNanos,
+                        stdoutTail, stderrTail);
+                }
+                if (firstWitnessNanos < 0) { firstWitnessNanos = System.nanoTime(); }
+            } else if (fileProbe.state() == ActivePortState.INCOMPLETE
+                    || fileProbe.state() == ActivePortState.MALFORMED) {
+                long now = System.nanoTime();
+                if (profileNonValidSinceNanos < 0) {
+                    profileNonValidSinceNanos = now;
+                } else if (now - profileNonValidSinceNanos
+                        >= TimeUnit.MILLISECONDS.toNanos(
+                            BOOTSTRAP_WITNESS_SETTLE_MS)) {
+                    // A generated file can be visible between create and its
+                    // second-line write. Only a non-valid file that persists
+                    // for the witness-settle window is a malformed witness.
+                    malformed.add(DevToolsWitnessSource.PROFILE);
+                }
+            } else {
+                profileNonValidSinceNanos = -1;
+                malformed.remove(DevToolsWitnessSource.PROFILE);
+            }
+
+            BootstrapEvent event;
+            while ((event = events.poll()) != null) {
+                if (event.closed()) { closed.add(event.source()); }
+                if (event.malformed()) { malformed.add(event.source()); }
+                if (event.endpoint() != null) {
+                    malformed.remove(event.source());
+                    if (!recordEndpoint(endpoints, event.source(), event.endpoint())) {
+                        return bootstrapResult(
+                            DevToolsBootstrapOutcome.DISAGREEING_ENDPOINTS,
+                            null, endpoints.keySet(), process, startedNanos,
+                            stdoutTail, stderrTail);
+                    }
+                    if (firstWitnessNanos < 0) { firstWitnessNanos = System.nanoTime(); }
+                }
+            }
+
+            if (!endpoints.isEmpty() && !malformed.isEmpty()) {
+                EnumSet<DevToolsWitnessSource> observed =
+                    EnumSet.copyOf(endpoints.keySet());
+                observed.addAll(malformed);
+                return bootstrapResult(
+                    DevToolsBootstrapOutcome.MALFORMED_ENDPOINT,
+                    null, observed, process, startedNanos,
+                    stdoutTail, stderrTail);
+            }
+
+            boolean streamsClosed =
+                closed.contains(DevToolsWitnessSource.STDOUT)
+                    && closed.contains(DevToolsWitnessSource.STDERR);
+            boolean witnessSettled = firstWitnessNanos >= 0
+                && System.nanoTime() - firstWitnessNanos
+                    >= TimeUnit.MILLISECONDS.toNanos(BOOTSTRAP_WITNESS_SETTLE_MS);
+            boolean profileWriteSettled = profileNonValidSinceNanos < 0
+                || System.nanoTime() - profileNonValidSinceNanos
+                    >= TimeUnit.MILLISECONDS.toNanos(BOOTSTRAP_WITNESS_SETTLE_MS);
+            if (!endpoints.isEmpty()
+                    && ((witnessSettled && profileWriteSettled)
+                        || (streamsClosed && fileProbe.state() == ActivePortState.ABSENT))) {
+                DevToolsEndpoint endpoint = endpoints.values().iterator().next();
+                return bootstrapResult(
+                    DevToolsBootstrapOutcome.ENDPOINT,
+                    endpoint.connectUrl(), endpoints.keySet(), process,
+                    startedNanos, stdoutTail, stderrTail);
+            }
+
+            if (!process.isAlive() && streamsClosed) {
+                DevToolsBootstrapOutcome outcome =
+                    !malformed.isEmpty() || activePortObserved
+                        ? DevToolsBootstrapOutcome.MALFORMED_ENDPOINT
+                        : DevToolsBootstrapOutcome.PROCESS_EXITED;
+                EnumSet<DevToolsWitnessSource> observed =
+                    EnumSet.noneOf(DevToolsWitnessSource.class);
+                observed.addAll(malformed);
+                if (activePortObserved) { observed.add(DevToolsWitnessSource.PROFILE); }
+                return bootstrapResult(
+                    outcome, null, observed, process, startedNanos,
+                    stdoutTail, stderrTail);
+            }
+
+            if (deadline.expired()) {
+                if (!endpoints.isEmpty()) {
+                    DevToolsEndpoint endpoint = endpoints.values().iterator().next();
+                    return bootstrapResult(
+                        DevToolsBootstrapOutcome.ENDPOINT,
+                        endpoint.connectUrl(), endpoints.keySet(), process,
+                        startedNanos, stdoutTail, stderrTail);
+                }
+                DevToolsBootstrapOutcome outcome =
+                    !malformed.isEmpty() || activePortObserved
+                        ? DevToolsBootstrapOutcome.MALFORMED_ENDPOINT
+                        : process.isAlive()
+                            ? DevToolsBootstrapOutcome.ALIVE_TIMEOUT
+                            : DevToolsBootstrapOutcome.PROCESS_EXITED;
+                EnumSet<DevToolsWitnessSource> observed =
+                    EnumSet.noneOf(DevToolsWitnessSource.class);
+                observed.addAll(malformed);
+                if (activePortObserved) { observed.add(DevToolsWitnessSource.PROFILE); }
+                return bootstrapResult(
+                    outcome, null, observed, process, startedNanos,
+                    stdoutTail, stderrTail);
+            }
+
+            long sleepNanos = Math.min(
+                deadline.remainingNanos(),
+                TimeUnit.MILLISECONDS.toNanos(BOOTSTRAP_POLL_MS));
+            try { TimeUnit.NANOSECONDS.sleep(Math.max(1, sleepNanos)); }
+            catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("interrupted waiting for Chrome bootstrap", e);
+            }
+        }
+    }
+
+    private static DevToolsBootstrapResult bootstrapResult(
+            DevToolsBootstrapOutcome outcome, String webSocketUrl,
+            Set<DevToolsWitnessSource> sources, Process process,
+            long startedNanos, BootstrapTail stdoutTail,
+            BootstrapTail stderrTail) {
+        long elapsedNanos = Math.max(0, System.nanoTime() - startedNanos);
+        int exitCode = -1;
+        if (!process.isAlive()) {
+            try { exitCode = process.exitValue(); }
+            catch (IllegalThreadStateException ignored) { /* raced alive */ }
+        }
+        return new DevToolsBootstrapResult(
+            outcome, webSocketUrl, sources, exitCode,
+            TimeUnit.NANOSECONDS.toMillis(elapsedNanos),
+            stdoutTail.snapshot(), stderrTail.snapshot());
+    }
+
+    private static boolean recordEndpoint(
+            EnumMap<DevToolsWitnessSource, DevToolsEndpoint> endpoints,
+            DevToolsWitnessSource source, DevToolsEndpoint endpoint) {
+        DevToolsEndpoint prior = endpoints.putIfAbsent(source, endpoint);
+        if (prior != null && !prior.canonicalKey().equals(endpoint.canonicalKey())) {
+            return false;
+        }
+        for (DevToolsEndpoint observed : endpoints.values()) {
+            if (!observed.canonicalKey().equals(endpoint.canonicalKey())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static void startBootstrapDrain(
+            String threadName, InputStream stream, DevToolsWitnessSource source,
+            Path profileDir, LinkedBlockingQueue<BootstrapEvent> events,
+            BootstrapTail tail) {
+        Thread reader = new Thread(
+            () -> drainBootstrapStream(stream, source, profileDir, events, tail),
+            threadName);
         reader.setDaemon(true);
         reader.start();
-        try {
-            return found.get(DEFAULT_TIMEOUT_MS, TimeUnit.MILLISECONDS);
-        } catch (TimeoutException e) {
-            throw new IOException("Chrome never printed a DevTools listening line within "
-                + DEFAULT_TIMEOUT_MS + "ms");
-        } catch (java.util.concurrent.ExecutionException e) {
-            throw new IOException(String.valueOf(e.getCause().getMessage()), e.getCause());
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IOException("interrupted waiting for Chrome", e);
+    }
+
+    private static void drainBootstrapStream(
+            InputStream stream, DevToolsWitnessSource source, Path profileDir,
+            LinkedBlockingQueue<BootstrapEvent> events, BootstrapTail tail) {
+        int endpointEvents = 0;
+        try (InputStreamReader reader =
+                 new InputStreamReader(stream, StandardCharsets.UTF_8)) {
+            char[] buffer = new char[512];
+            StringBuilder line = new StringBuilder();
+            boolean truncated = false;
+            int read;
+            while ((read = reader.read(buffer)) != -1) {
+                for (int i = 0; i < read; i++) {
+                    char c = buffer[i];
+                    if (c == '\n') {
+                        if (handleBootstrapLine(
+                                line.toString(), truncated, source,
+                                profileDir, events, tail, endpointEvents)) {
+                            endpointEvents++;
+                        }
+                        line.setLength(0);
+                        truncated = false;
+                    } else if (c != '\r') {
+                        if (line.length() < BOOTSTRAP_STREAM_LINE_CAP) {
+                            line.append(c);
+                        } else {
+                            truncated = true;
+                        }
+                    }
+                }
+            }
+            if (!line.isEmpty() || truncated) {
+                handleBootstrapLine(
+                    line.toString(), truncated, source, profileDir,
+                    events, tail, endpointEvents);
+            }
+        } catch (IOException e) {
+            tail.add("startup stream read failed ("
+                + e.getClass().getSimpleName() + ")");
+        } finally {
+            events.offer(BootstrapEvent.closed(source));
         }
+    }
+
+    private static boolean handleBootstrapLine(
+            String rawLine, boolean truncated, DevToolsWitnessSource source,
+            Path profileDir, LinkedBlockingQueue<BootstrapEvent> events,
+            BootstrapTail tail, int endpointEvents) {
+        tail.add(sanitizeBootstrapLine(
+            truncated ? rawLine + " <truncated>" : rawLine, profileDir));
+        Matcher marker = DEVTOOLS_LINE.matcher(rawLine);
+        if (!marker.find()) { return false; }
+        if (endpointEvents >= 8) { return true; }
+        if (truncated) {
+            events.offer(BootstrapEvent.malformed(source));
+            return true;
+        }
+        DevToolsEndpoint endpoint = parseStreamDevToolsEndpoint(marker.group(1));
+        events.offer(endpoint != null
+            ? BootstrapEvent.endpoint(source, endpoint)
+            : BootstrapEvent.malformed(source));
+        return true;
+    }
+
+    private static DevToolsEndpoint parseStreamDevToolsEndpoint(String raw) {
+        if (raw == null || raw.length() > 2_048) { return null; }
+        try {
+            URI uri = URI.create(raw);
+            if (!"ws".equalsIgnoreCase(uri.getScheme())
+                    || uri.getUserInfo() != null
+                    || uri.getQuery() != null
+                    || uri.getFragment() != null
+                    || uri.getPort() < 1 || uri.getPort() > 65_535
+                    || !DEVTOOLS_BROWSER_PATH.matcher(uri.getRawPath()).matches()) {
+                return null;
+            }
+            String host = uri.getHost();
+            if (host == null) { return null; }
+            String normalizedHost = host.toLowerCase(java.util.Locale.ROOT);
+            if (!("127.0.0.1".equals(normalizedHost)
+                    || "localhost".equals(normalizedHost)
+                    || "::1".equals(normalizedHost)
+                    || "[::1]".equals(normalizedHost)
+                    || "0:0:0:0:0:0:0:1".equals(normalizedHost))) {
+                return null;
+            }
+            String canonical = "loopback:" + uri.getPort() + uri.getRawPath();
+            return new DevToolsEndpoint(canonical, uri.toASCIIString());
+        } catch (IllegalArgumentException malformed) {
+            return null;
+        }
+    }
+
+    private static ActivePortProbe probeDevToolsActivePort(Path profileDir) {
+        Path activePort = profileDir.resolve("DevToolsActivePort");
+        try {
+            if (Files.notExists(activePort, LinkOption.NOFOLLOW_LINKS)) {
+                return ActivePortProbe.absent();
+            }
+            if (!Files.isRegularFile(activePort, LinkOption.NOFOLLOW_LINKS)) {
+                return ActivePortProbe.malformed();
+            }
+            byte[] bytes;
+            try (InputStream input = Files.newInputStream(
+                    activePort, StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS)) {
+                // The limit is enforced on the opened handle. A size check followed
+                // by readAllLines would be a grow-between-check-and-read allocation
+                // race and would not actually bound this witness.
+                bytes = input.readNBytes(DEVTOOLS_ACTIVE_PORT_FILE_CAP + 1);
+            }
+            if (bytes.length == 0) { return ActivePortProbe.incomplete(); }
+            if (bytes.length > DEVTOOLS_ACTIVE_PORT_FILE_CAP) {
+                return ActivePortProbe.malformed();
+            }
+            String content;
+            try {
+                content = StandardCharsets.UTF_8.newDecoder()
+                    .decode(ByteBuffer.wrap(bytes)).toString();
+            } catch (java.nio.charset.CharacterCodingException invalidUtf8) {
+                return ActivePortProbe.malformed();
+            }
+            List<String> lines = content.lines().toList();
+            if (lines.size() < 2) { return ActivePortProbe.incomplete(); }
+            if (lines.size() != 2) { return ActivePortProbe.malformed(); }
+            String portLine = lines.get(0).trim();
+            String path = lines.get(1).trim();
+            int port;
+            try { port = Integer.parseInt(portLine); }
+            catch (NumberFormatException invalidPort) {
+                return ActivePortProbe.malformed();
+            }
+            if (port < 1 || port > 65_535
+                    || !DEVTOOLS_BROWSER_PATH.matcher(path).matches()) {
+                return ActivePortProbe.malformed();
+            }
+            String canonical = "loopback:" + port + path;
+            return ActivePortProbe.valid(new DevToolsEndpoint(
+                canonical, "ws://127.0.0.1:" + port + path));
+        } catch (java.nio.file.NoSuchFileException race) {
+            return ActivePortProbe.absent();
+        } catch (IOException race) {
+            // Chrome creates then fills the file. A transient read/replace race
+            // is incomplete until the shared bootstrap deadline proves otherwise.
+            return ActivePortProbe.incomplete();
+        }
+    }
+
+    private static String sanitizeBootstrapLine(String raw, Path profileDir) {
+        String source = raw == null ? "" : raw;
+        StringBuilder printable = new StringBuilder(source.length());
+        for (int i = 0; i < source.length(); i++) {
+            char c = source.charAt(i);
+            printable.append(Character.isISOControl(c) ? ' ' : c);
+        }
+        String line = printable.toString();
+        if (STARTUP_COMMAND_LINE.matcher(line).matches()) {
+            return "<command line redacted>";
+        }
+        line = line.replace(profileDir.toString(), "<profile>");
+        line = STARTUP_URL_TOKEN.matcher(line).replaceAll("<url>");
+        if (STARTUP_SENSITIVE_HEADER.matcher(line).matches()) {
+            return "<sensitive startup line redacted>";
+        }
+        line = STARTUP_QUOTED_ABSOLUTE_PATH.matcher(line).replaceAll("<path>");
+        // An unquoted path may itself contain spaces, so replacing only the
+        // first token can disclose the remainder. Redact that diagnostic line
+        // wholesale rather than guessing where the host path ends.
+        if (STARTUP_ABSOLUTE_PATH.matcher(line).find()) {
+            return "<host path line redacted>";
+        }
+        line = STARTUP_FLAG_ASSIGNMENT.matcher(line).replaceAll("$1=<redacted>");
+        line = STARTUP_FLAG_VALUE.matcher(line).replaceAll("$1 <redacted>");
+        line = STARTUP_SECRET_ASSIGNMENT.matcher(line).replaceAll("$1=<redacted>");
+        line = STARTUP_ENV_ASSIGNMENT.matcher(line).replaceAll("$1=<redacted>");
+        line = STARTUP_BEARER_CREDENTIAL.matcher(line).replaceAll("$1 <redacted>");
+        String sanitized = line.strip();
+        if (sanitized.length() > BOOTSTRAP_TAIL_LINE_CAP) {
+            return sanitized.substring(0, BOOTSTRAP_TAIL_LINE_CAP) + "…";
+        }
+        return sanitized;
+    }
+
+    private static String awaitDevtoolsUrl(Process process, Path profileDir)
+            throws IOException {
+        DevToolsBootstrapResult result = observeDevToolsEndpoint(
+            process, profileDir, DEFAULT_TIMEOUT_MS);
+        if (result.outcome() == DevToolsBootstrapOutcome.ENDPOINT) {
+            return result.webSocketUrl();
+        }
+        throw new IOException(bootstrapFailureMessage(result));
+    }
+
+    static String bootstrapFailureMessage(DevToolsBootstrapResult result) {
+        String headline = switch (result.outcome()) {
+            case PROCESS_EXITED -> "Chrome exited before publishing a DevTools endpoint"
+                + (result.exitCode() >= 0 ? " (exit " + result.exitCode() + ")" : "");
+            case ALIVE_TIMEOUT -> "Chrome remained alive without publishing a DevTools endpoint";
+            case MALFORMED_ENDPOINT ->
+                "Chrome published a malformed DevTools endpoint witness via "
+                    + result.sources();
+            case DISAGREEING_ENDPOINTS ->
+                "Chrome published disagreeing DevTools endpoint witnesses via "
+                    + result.sources();
+            case ENDPOINT -> throw new IllegalArgumentException(
+                "successful bootstrap has no failure message");
+        };
+        StringBuilder message = new StringBuilder(headline)
+            .append(" after ").append(result.elapsedMillis()).append("ms");
+        if (!result.stdoutTail().isBlank()) {
+            message.append("; sanitized stdout tail: ").append(result.stdoutTail());
+        }
+        if (!result.stderrTail().isBlank()) {
+            message.append("; sanitized stderr tail: ").append(result.stderrTail());
+        }
+        return message.toString();
     }
 
     // ---- protocol ----------------------------------------------------------

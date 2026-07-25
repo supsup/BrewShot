@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **macOS bootstrap is context-aware and multi-witness.** On macOS only, an
+  inherited `CODEX_SANDBOX=seatbelt` context now refuses unified Chrome before
+  creating a generated profile or starting a process, with a fixed actionable
+  message. A caller may explicitly select `chrome-headless-shell` through
+  `BREWSHOT_CHROME`; normal-Terminal and container launches are unchanged. In
+  supported contexts BrewShot continuously drains bounded stdout and stderr and
+  also validates the generated profile's `DevToolsActivePort`, using one
+  monotonic deadline and requiring every observed endpoint witness to agree.
+  Failures distinguish process exit, alive timeout, malformed witnesses, and
+  disagreement while retaining only bounded sanitized stream tails. This is a
+  narrow response to macOS 26.5.2 / Chrome 150 evidence, not a claim that every
+  Chrome crash dialog has been eliminated; the existing `ResourceLease`
+  ownership and fail-closed profile-retention contract is unchanged.
 - **Contract validation is fail-loud and finite-first.** PDF paper/margins/scale,
   clipped screenshot geometry, recorder counts/delays, diff options/masks, CLI
   positive integers/longs, and public timeout/heap knobs now reject invalid
@@ -39,9 +52,9 @@
 ## 0.9.0
 
 CLI GIF parity — the recorder family finally reachable without writing Java — plus
-the end of the macOS crash-dialog spam.
+the first macOS crash-dialog mitigation.
 
-- **macOS crash-dialog spam eliminated** (`--no-startup-window` in the default launch
+- **macOS crash-dialog storm reduced** (`--no-startup-window` in the default launch
   args): on macOS 26 + Chrome 150, rapid headless launches sporadically abort in
   `TransformProcessType → _RegisterApplication` (LaunchServices refuses the app
   registration under launch storms) — usually a doomed secondary process while the
@@ -49,6 +62,11 @@ the end of the macOS crash-dialog spam.
   dialog on the operator's desktop, and under some conditions (cold `--no-daemon`
   suite runs) the serving process itself dies pre-DevTools. Reported by Charles;
   reproduced 5/15 storm launches without the flag, 0/15 with it, captures intact.
+  That sample demonstrated a mitigation, not universal elimination: later
+  macOS 26.5.2 / Chrome 150 evidence showed unified Chrome's serving process can
+  still abort before DevTools in a LaunchServices-denied Codex Seatbelt context.
+  The Unreleased context refusal and three-witness observer address that narrower
+  failure without rewriting this historical result.
   Reaches embedders (LatteX/Sirentide suites) on their next jar re-vendor. Interim
   workaround is LINEAGE-SPECIFIC (correction credits: Marlow, brewshot/130 AND /132 —
   two claims here were wrong before this wording): LatteX **main** vendors 0.8.0,

@@ -412,6 +412,22 @@ things not to do: **[SECURITY.md](SECURITY.md)**.
 - JDK 21+ (built with 25)
 - A local Chrome or Chromium (auto-discovered; override with `BREWSHOT_CHROME`)
 
+On macOS, the execution context is part of the browser requirement. A normal
+Terminal is the supported host-native lane, and the provided Linux container is
+the portable control. Unified Chrome 150 is known to abort in an inherited
+Codex Seatbelt context (`CODEX_SANDBOX=seatbelt`) before it exposes DevTools, so
+BrewShot refuses that exact combination before it creates a generated profile
+or starts Chrome. Run the command from a normal Terminal/container, or
+explicitly set `BREWSHOT_CHROME` to a compatible `chrome-headless-shell`; the
+refusal does not silently fall back to another browser.
+
+For allowed launches, bootstrap listens to three bounded endpoint witnesses:
+stdout, stderr, and the generated profile's validated `DevToolsActivePort`.
+They share one deadline and must agree when more than one appears. A failure
+names process exit, alive timeout, malformed endpoint, or disagreement and may
+include only bounded sanitized stream tails. BrewShot never uses the operator's
+default Chrome profile or blanket-terminates unrelated Chrome processes.
+
 Locally, the Chrome-driving tests loud-skip when no Chrome is found. In CI they
 must not: the reference workflow sets `BREWSHOT_REQUIRE_CHROME=1`, which turns any
 skip into a failure — so a green build proves the end-to-end suite actually ran,
