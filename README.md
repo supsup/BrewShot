@@ -447,8 +447,11 @@ restart, and multiple workers may share the same mounts. Set
 > On Linux, map the process to the host UID/GID as above or make the bind
 > folders writable by the image's `10001:10001` user. Docker Desktop usually
 > translates ownership automatically; Linux does not. Watch input must be
-> writable because the worker performs atomic state transitions. One-shot CLI
-> input can remain read-only. Details: [SLOWSTART](SLOWSTART.md) Scenario 5.
+> writable because the worker performs atomic state transitions. Individual
+> input files only need to be readable: a foreign-owned mode-`0444` file is
+> finalized with owner-agnostic directory/file moves rather than a hard link.
+> One-shot CLI input can remain read-only. Details:
+> [SLOWSTART](SLOWSTART.md) Scenario 5.
 
 Rolling your own image: install `chromium` + fonts (`fonts-liberation`,
 `fonts-dejavu-core`), set `BREWSHOT_CHROME=/usr/bin/chromium` and

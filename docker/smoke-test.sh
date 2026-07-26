@@ -8,6 +8,9 @@ watch_one="brewshot-smoke-one-$name_suffix"
 watch_recovery="brewshot-smoke-recovery-$name_suffix"
 watch_race_a="brewshot-smoke-race-a-$name_suffix"
 watch_race_b="brewshot-smoke-race-b-$name_suffix"
+watch_foreign="brewshot-smoke-foreign-$name_suffix"
+foreign_input_volume="brewshot-smoke-foreign-input-$name_suffix"
+foreign_output_volume="brewshot-smoke-foreign-output-$name_suffix"
 watch_unreadable_a="brewshot-smoke-unreadable-a-$name_suffix"
 watch_unreadable_b="brewshot-smoke-unreadable-b-$name_suffix"
 watch_unreadable_c="brewshot-smoke-unreadable-c-$name_suffix"
@@ -15,8 +18,11 @@ watch_unreadable_d="brewshot-smoke-unreadable-d-$name_suffix"
 
 cleanup() {
     docker rm -f "$watch_one" "$watch_recovery" "$watch_race_a" "$watch_race_b" \
+        "$watch_foreign" \
         "$watch_unreadable_a" "$watch_unreadable_b" \
         "$watch_unreadable_c" "$watch_unreadable_d" >/dev/null 2>&1 || true
+    docker volume rm -f "$foreign_input_volume" "$foreign_output_volume" \
+        >/dev/null 2>&1 || true
     if [ -n "$tmp_root" ] && [ "$tmp_root" != "/" ]; then
         chmod -R u+rwx "$tmp_root" >/dev/null 2>&1 || true
         rm -rf -- "$tmp_root"
@@ -46,6 +52,22 @@ wait_for_path() {
         attempt=$((attempt + 1))
     done
     if [ ! -e "$target" ]; then
+        echo "timed out waiting for worker artifact: $target" >&2
+        docker logs "$container" >&2 || true
+        return 1
+    fi
+}
+
+wait_for_container_path() {
+    target=$1
+    container=$2
+    attempt=0
+    while ! docker exec "$container" test -e "$target" 2>/dev/null \
+            && [ "$attempt" -lt 400 ]; do
+        sleep 0.05
+        attempt=$((attempt + 1))
+    done
+    if ! docker exec "$container" test -e "$target" 2>/dev/null; then
         echo "timed out waiting for worker artifact: $target" >&2
         docker logs "$container" >&2 || true
         return 1
@@ -111,6 +133,19 @@ assert_png "$output/legacy.png"
 assert_png "$output/explicit.png"
 cmp "$output/legacy.png" "$output/explicit.png"
 docker run --rm "$image" cli --version | grep -q '^brewshot 0\.9\.0$'
+
+# The pre-worker image contract uses /work as its working directory. Preserve
+# both explicit relative output and the default brewshot.png destination.
+legacy_work="$tmp_root/LegacyWork"
+mkdir -p "$legacy_work"
+chmod 0777 "$legacy_work"
+write_html "$legacy_work/relative.html" 'Relative CLI' '#fef9c3'
+docker run --rm -v "$legacy_work:/work" \
+    "$image" relative.html -o relative-output.png
+assert_png "$legacy_work/relative-output.png"
+write_html "$legacy_work/default-relative.html" 'Default CLI' '#e0f2fe'
+docker run --rm -v "$legacy_work:/work" "$image" default-relative.html
+assert_png "$legacy_work/brewshot.png"
 
 # The documented Linux bind-mount shape may override the fixed image user.
 # That UID still receives a private writable Chromium home.
@@ -234,6 +269,72 @@ finished_count=$(
 test "$finished_count" -eq 1
 docker stop -t 3 "$watch_race_a" "$watch_race_b" >/dev/null
 docker rm "$watch_race_a" "$watch_race_b" >/dev/null
+
+# A producer-owned readable file must not require hard-link permission from
+# the fixed 10001 worker. Linux protects a root-owned mode-0444 inode from that
+# link, while writable directories still permit the atomic claim/move state
+# machine. The same watcher must remain live for a later job.
+docker volume create "$foreign_input_volume" >/dev/null
+docker volume create "$foreign_output_volume" >/dev/null
+docker run --rm --user 0:0 \
+    -v "$foreign_input_volume:/brewshot/input" \
+    --entrypoint sh "$image" -c '
+        chmod 0777 /brewshot/input
+        printf "%s\n" \
+            "<!doctype html>" \
+            "<html lang=\"en\"><meta charset=\"utf-8\">" \
+            "<title>Foreign readable</title>" \
+            "<body><h1>Foreign readable</h1></body></html>" \
+            > /brewshot/input/foreign-readable.html
+        chmod 0444 /brewshot/input/foreign-readable.html
+        test "$(stat -c "%u:%g" /brewshot/input/foreign-readable.html)" = "0:0"
+    '
+docker run --rm --user 0:0 \
+    -v "$foreign_output_volume:/brewshot/output" \
+    --entrypoint sh "$image" -c 'chmod 0777 /brewshot/output'
+docker run -d --name "$watch_foreign" \
+    -e BREWSHOT_WATCH_POLL_MS=20 \
+    -v "$foreign_input_volume:/brewshot/input" \
+    -v "$foreign_output_volume:/brewshot/output" \
+    "$image" watch >/dev/null
+wait_for_container_path \
+    /brewshot/output/foreign-readable.html.png "$watch_foreign"
+wait_for_container_path \
+    /brewshot/input/finished/foreign-readable.html "$watch_foreign"
+assert_running "$watch_foreign"
+docker run --rm --user 0:0 \
+    -v "$foreign_input_volume:/brewshot/input" \
+    --entrypoint sh "$image" -c '
+        printf "%s\n" \
+            "<!doctype html>" \
+            "<html><title>After foreign</title><body>After foreign</body></html>" \
+            > /brewshot/input/.after-foreign.html.tmp
+        chmod 0444 /brewshot/input/.after-foreign.html.tmp
+        mv /brewshot/input/.after-foreign.html.tmp \
+            /brewshot/input/after-foreign.html
+    '
+wait_for_container_path \
+    /brewshot/output/after-foreign.html.png "$watch_foreign"
+wait_for_container_path \
+    /brewshot/input/finished/after-foreign.html "$watch_foreign"
+assert_running "$watch_foreign"
+foreign_inspect="$tmp_root/ForeignInspect"
+mkdir -p "$foreign_inspect"
+docker run --rm --user 0:0 \
+    -v "$foreign_output_volume:/brewshot/output:ro" \
+    -v "$foreign_inspect:/inspect" \
+    --entrypoint sh "$image" -c '
+        cp /brewshot/output/foreign-readable.html.png /inspect/
+        cp /brewshot/output/after-foreign.html.png /inspect/
+        chmod 0644 /inspect/foreign-readable.html.png \
+            /inspect/after-foreign.html.png
+    '
+assert_png "$foreign_inspect/foreign-readable.html.png"
+assert_png "$foreign_inspect/after-foreign.html.png"
+test -z "$(docker exec "$watch_foreign" find /brewshot/output \
+    -maxdepth 1 -type f -name '.brewshot-watch-*' -print -quit)"
+docker stop -t 3 "$watch_foreign" >/dev/null
+docker rm "$watch_foreign" >/dev/null
 
 # Four recovery workers race one unreadable processing claim. Direct archive
 # and diagnostic collisions are unrelated sentinels: only physical file

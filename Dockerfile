@@ -56,6 +56,9 @@ RUN chmod 0555 /opt/brewshot/entrypoint.sh \
 
 USER 10001:10001
 ENV HOME=/home/brewshot
-WORKDIR /brewshot
+# Preserve the original container CLI's relative-path contract. Watch mode
+# uses absolute /brewshot/input and /brewshot/output roots, so it does not
+# depend on the process working directory.
+WORKDIR /work
 ENTRYPOINT ["/opt/brewshot/entrypoint.sh"]
 CMD ["--help"]

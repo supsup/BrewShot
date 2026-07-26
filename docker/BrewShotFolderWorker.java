@@ -38,9 +38,11 @@ import java.util.UUID;
  * separate path components means a host-valid source name is never lengthened
  * past the mounted filesystem's component limit. The unique directory means
  * two workers can race for one source without either overwriting the other.
- * Completed output and source archives are published with hard links from
- * fully written files, which is an atomic create-if-absent operation on the
- * mounted filesystem. There is no overwrite fallback.
+ * Completed outputs are published with hard links from fully written
+ * worker-owned files. Source claims are finalized with atomic directory moves
+ * followed by a no-replace presentation move, so a readable foreign-owned
+ * input never depends on Linux hard-link permission. There is no overwrite
+ * fallback.
  */
 public final class BrewShotFolderWorker {
 
@@ -519,28 +521,46 @@ public final class BrewShotFolderWorker {
 
     private boolean archive(Claim claim, FileChannel source, Path bucket)
             throws IOException {
-        Path direct = bucket.resolve(claim.originalName());
-        ArchiveAttempt directAttempt = tryArchiveAt(claim.path(), source, direct);
-        if (directAttempt == ArchiveAttempt.ARCHIVED) {
-            return true;
-        }
-        if (directAttempt == ArchiveAttempt.ALREADY_ARCHIVED) {
-            return false;
+        Path claimDirectory = claim.path().getParent();
+        Path collisionDirectory = bucket.resolve("collisions")
+            .resolve(claim.jobId());
+        try {
+            // Move the worker-owned claim directory, not the producer-owned
+            // inode. This remains an atomic metadata operation even when a
+            // fixed-UID worker can read but cannot hard-link the source.
+            Files.move(claimDirectory, collisionDirectory,
+                StandardCopyOption.ATOMIC_MOVE);
+        } catch (AtomicMoveNotSupportedException unsupported) {
+            throw new IOException("input mount cannot atomically archive work",
+                unsupported);
+        } catch (IOException racedOrFailed) {
+            if (!Files.exists(claimDirectory, LinkOption.NOFOLLOW_LINKS)
+                    && archivedAnywhere(claim, source)) {
+                return false;
+            }
+            throw racedOrFailed;
         }
 
-        Path collisionDir = bucket.resolve("collisions").resolve(claim.jobId());
-        ensureDirectory(collisionDir);
-        Path collisionTarget = collisionDir.resolve(claim.originalName());
-        ArchiveAttempt collisionAttempt = tryArchiveAt(
-            claim.path(), source, collisionTarget);
-        if (collisionAttempt == ArchiveAttempt.ARCHIVED) {
-            return true;
+        Path archivedSource = collisionDirectory.resolve(claim.originalName());
+        if (!sameOpenFileBytes(source, archivedSource)) {
+            throw new IOException("claim archive lost its source");
         }
-        if (collisionAttempt == ArchiveAttempt.ALREADY_ARCHIVED
-                || archivedAnywhere(claim, source)) {
-            return false;
+
+        Path direct = bucket.resolve(claim.originalName());
+        try {
+            // No REPLACE_EXISTING option: a same-name archive is immutable.
+            // The job-id collision directory is already a durable terminal
+            // state, so promotion to the shorter path is presentation only.
+            Files.move(archivedSource, direct);
+            deleteEmptyClaimDirectory(collisionDirectory);
+        } catch (FileAlreadyExistsException collision) {
+            // Retain this source under collisions/<job-id>/original-name.
+        } catch (IOException promotionFailure) {
+            if (!sameOpenFileBytes(source, archivedSource)) {
+                throw promotionFailure;
+            }
         }
-        throw new IOException("claim source disappeared before archive");
+        return true;
     }
 
     /**
@@ -631,25 +651,6 @@ public final class BrewShotFolderWorker {
         return attributes.isRegularFile()
             && attributes.size() == claim.identity().size()
             && Objects.equals(attributes.fileKey(), claim.identity().fileKey());
-    }
-
-    private static ArchiveAttempt tryArchiveAt(Path sourcePath, FileChannel source,
-            Path target)
-            throws IOException {
-        try {
-            Files.createLink(target, sourcePath);
-            return Files.deleteIfExists(sourcePath)
-                ? ArchiveAttempt.ARCHIVED : ArchiveAttempt.ALREADY_ARCHIVED;
-        } catch (FileAlreadyExistsException collision) {
-            if (!sameOpenFileBytes(source, target)) {
-                return ArchiveAttempt.TARGET_COLLISION;
-            }
-            return Files.deleteIfExists(sourcePath)
-                ? ArchiveAttempt.ARCHIVED : ArchiveAttempt.ALREADY_ARCHIVED;
-        } catch (NoSuchFileException sourceDisappeared) {
-            return sameOpenFileBytes(source, target)
-                ? ArchiveAttempt.ALREADY_ARCHIVED : ArchiveAttempt.SOURCE_MISSING;
-        }
     }
 
     private boolean archivedAnywhere(Claim claim, FileChannel source) throws IOException {
@@ -873,13 +874,6 @@ public final class BrewShotFolderWorker {
             // idempotent state transitions remain the correctness boundary.
             channel.close();
         }
-    }
-
-    private enum ArchiveAttempt {
-        ARCHIVED,
-        ALREADY_ARCHIVED,
-        TARGET_COLLISION,
-        SOURCE_MISSING
     }
 
     private static final class JobFailure extends Exception {

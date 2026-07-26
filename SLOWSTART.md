@@ -298,7 +298,10 @@ mount for input, only for output.
 
 For one-shot file input, mount `/brewshot/input` read-only and
 `/brewshot/output` writable. Watch mode needs both mounts writable because the
-input tree is also its durable processing/finished/failed state machine.
+input tree is also its durable processing/finished/failed state machine. The
+files themselves may be readable but foreign-owned or mode `0444`; terminal
+archiving moves directory entries and does not require hard-link permission on
+the producer's inode.
 
 **What Ana should know:** container renders use the Linux font stack, so
 pixels differ subtly from Mac/Windows-Chrome renders — keep your reference
