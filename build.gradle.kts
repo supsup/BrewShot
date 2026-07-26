@@ -10,14 +10,12 @@ group = "com.brewshot"
 version = "0.9.0"
 
 java {
-    toolchain {
-        languageVersion = JavaLanguageVersion.of(25)
-    }
     withSourcesJar()
 }
 
-// Build WITH 25, target 21 bytecode — the README's "JDK 21+" is a tested
-// promise, not an aspiration.
+// Build with the caller's JDK and target 21 bytecode. CI runs this build under
+// both JDK 21 and 25, so "JDK 21+" is a runtime-tested promise rather than a
+// --release-only claim hidden behind a JDK 25 toolchain.
 tasks.withType<JavaCompile>().configureEach {
     options.release = 21
 }
@@ -42,7 +40,7 @@ tasks.jar {
     }
 }
 
-tasks.test {
+fun org.gradle.api.tasks.testing.Test.configureBrewShotTests() {
     useJUnitPlatform()
     // ImageIO/AWT tests must never initialize the macOS AppKit UI process.
     // Keep the test JVM explicit and deterministic on both desktop and CI hosts.
@@ -75,6 +73,97 @@ tasks.test {
             )
         }
     }))
+}
+
+// Browser tests have historically lived beside pure-JDK/ImageIO tests, and a
+// few classes intentionally contain both kinds. Derive method-level filters
+// from the one fail-loud browser gate every Chrome test must invoke instead of
+// maintaining a second, silently drifting hand-written list.
+fun discoverChromeTests(): List<String> {
+    val gate = Regex("TestChrome\\.requireChromeOrLoudSkip\\(")
+    val testMethod = Regex(
+        """(?s)@Test\s+(?:(?:@\w+(?:\([^)]*\))?)\s+)*(?:public\s+|protected\s+|private\s+)?void\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\([^)]*\)\s*(?:throws\s+[^\{]+)?\{"""
+    )
+
+    return fileTree("src/test/java") { include("**/*.java") }
+        .files
+        .sortedBy { it.path }
+        .flatMap { source ->
+            // This class tests the gate itself with injected true/false values;
+            // it never launches a browser and belongs in the unit lane.
+            if (source.name == "TestChromeTest.java") {
+                return@flatMap emptyList()
+            }
+
+            val text = source.readText()
+            val methods = testMethod.findAll(text).toList()
+            gate.findAll(text).map { call ->
+                val method = methods.lastOrNull { it.range.first < call.range.first }
+                    ?: throw GradleException(
+                        "${source.path}: Chrome gate is not inside a discoverable @Test method"
+                    )
+                val nextMethod = methods.firstOrNull { it.range.first > method.range.first }
+                if (nextMethod != null && call.range.first > nextMethod.range.first) {
+                    throw GradleException(
+                        "${source.path}: Chrome gate could not be assigned to one @Test method"
+                    )
+                }
+                "com.brewshot.${source.nameWithoutExtension}.${method.groupValues[1]}"
+            }.toList()
+        }
+        .distinct()
+        .also {
+            if (it.isEmpty()) {
+                throw GradleException("No Chrome-gated tests discovered; refusing a false unit lane")
+            }
+        }
+}
+
+val chromeTests = discoverChromeTests()
+
+tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
+    configureBrewShotTests()
+}
+
+val unitTest by tasks.registering(org.gradle.api.tasks.testing.Test::class) {
+    group = "verification"
+    description = "Runs every browser-free test under an explicitly headless JVM."
+    testClassesDirs = sourceSets.test.get().output.classesDirs
+    classpath = sourceSets.test.get().runtimeClasspath
+    filter {
+        chromeTests.forEach { excludeTestsMatching(it) }
+    }
+    // This becomes a second fail-safe when the operator kill-switch branch
+    // lands; the method filter already prevents Chrome launch on current main.
+    environment("BREWSHOT_FORBID_CHROME", "1")
+}
+
+val chromeTest by tasks.registering(org.gradle.api.tasks.testing.Test::class) {
+    group = "verification"
+    description = "Runs only tests that cross BrewShot's real-Chrome gate."
+    testClassesDirs = sourceSets.test.get().output.classesDirs
+    classpath = sourceSets.test.get().runtimeClasspath
+    filter {
+        chromeTests.forEach { includeTestsMatching(it) }
+        isFailOnNoMatchingTests = true
+    }
+    shouldRunAfter(unitTest)
+}
+
+tasks.register("verifyChromeTestCatalog") {
+    group = "verification"
+    description = "Prints the source-derived Chrome-test catalog used by unitTest/chromeTest."
+    doLast {
+        logger.lifecycle("Chrome-gated tests (${chromeTests.size}):")
+        chromeTests.forEach { logger.lifecycle("  $it") }
+    }
+}
+
+// Preserve the old CLI contract: `test` remains the aggregate lane and runs
+// the union in one JVM; callers can select `unitTest` or `chromeTest` when they
+// need an honest browser-free or browser-required gate.
+tasks.test {
+    description = "Runs the aggregate unit + Chrome test suite."
 }
 
 // Native binary: `./gradlew nativeImage` with a GraalVM JDK selected (or

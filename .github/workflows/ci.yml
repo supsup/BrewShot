@@ -1,43 +1,81 @@
 name: CI
 
-# BrewShot's core is a Chrome-over-CDP harness; a runner without Chrome can only
-# execute the pure-JDK unit tests and would report the end-to-end suite as
-# skipped==green. This workflow installs a real Chrome and sets
-# BREWSHOT_REQUIRE_CHROME so any skip becomes a failure — the suite must actually
-# prove the browser path works.
-
 on:
   push:
-    branches: [main]      # gate main; PRs cover feature branches
+    branches: [main]
   pull_request:
-  workflow_dispatch:      # manual "Run workflow" for on-demand branch checks
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
-  test:
+  unit:
+    name: Browser-free tests (JDK ${{ matrix.java }})
     runs-on: ubuntu-latest
-    env:
-      # Turn assume-skips into hard failures: no silent "green that tested nothing".
-      BREWSHOT_REQUIRE_CHROME: "1"
-      # Chrome's setuid sandbox needs privileges the CI runner doesn't grant;
-      # BrewShot forwards these flags to the launch (see BrewShot.launch()).
-      BREWSHOT_CHROME_ARGS: "--no-sandbox"
+    strategy:
+      fail-fast: false
+      matrix:
+        java: ["21", "25"]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
-      - name: Set up JDK
-        uses: actions/setup-java@v5
+      - name: Set up JDK ${{ matrix.java }}
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5
         with:
           distribution: temurin
-          java-version: "25"
+          java-version: ${{ matrix.java }}
+          cache: gradle
 
-      - name: Install Google Chrome (stable) + fonts
+      - name: Run browser-free lane
+        run: ./gradlew unitTest --no-daemon --stacktrace
+
+  chrome:
+    name: Chrome tests (pinned container)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Run real-browser lane
+        run: docker build --target chrome-test --tag brewshot:chrome-test .
+
+  native:
+    name: Native image smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Set up pinned GraalVM
+        uses: graalvm/setup-graalvm@0def53c0fd8534bc13416c9469f5be45265824fd # v1
+        with:
+          java-version: "25.0.2"
+          distribution: graalvm-community
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build native image
+        run: ./gradlew nativeImage --no-daemon --stacktrace
+
+      - name: Smoke native CLI
+        run: ./build/brewshot --help
+
+  docker:
+    name: Docker build + real capture smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Build pinned runtime image
+        run: docker build --tag brewshot:ci .
+
+      - name: Capture HTML in the container
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y fonts-liberation fonts-dejavu-core fonts-noto-core
-          wget -q -O /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
-          sudo apt-get install -y /tmp/chrome.deb
-          google-chrome-stable --version
-
-      - name: Test (Chrome required — skips fail the build)
-        run: ./gradlew test --no-daemon --stacktrace
+          smoke_dir="$(mktemp -d)"
+          trap 'rm -rf "$smoke_dir"' EXIT
+          chmod 0777 "$smoke_dir"
+          printf '%s\n' '<!doctype html><title>BrewShot CI</title><h1>BrewShot CI</h1>' > "$smoke_dir/page.html"
+          chmod 0644 "$smoke_dir/page.html"
+          docker run --rm --volume "$smoke_dir:/work" brewshot:ci \
+            page.html --settle 100 -o page.png
+          test -s "$smoke_dir/page.png"
+          test "$(od -An -t x1 -N 8 "$smoke_dir/page.png" | tr -d ' \n')" = "89504e470d0a1a0a"
