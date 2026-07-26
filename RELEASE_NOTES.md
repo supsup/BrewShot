@@ -1,11 +1,63 @@
 # BrewShot — Release Notes ☕📸
 
+## Unreleased
+
+- **macOS bootstrap is context-aware and multi-witness.** On macOS only, an
+  inherited `CODEX_SANDBOX=seatbelt` context now refuses unified Chrome before
+  creating a generated profile or starting a process, with a fixed actionable
+  message. A caller may explicitly select `chrome-headless-shell` through
+  `BREWSHOT_CHROME`; normal-Terminal and container launches are unchanged. In
+  supported contexts BrewShot continuously drains bounded stdout and stderr and
+  also validates the generated profile's `DevToolsActivePort`, using one
+  monotonic deadline and requiring every observed endpoint witness to agree.
+  The 100 ms cross-witness agreement window is honored even after both stream
+  drains reach EOF, and adjacent startup flags cannot hide a credential value
+  from diagnostic-tail redaction.
+  Failures distinguish process exit, alive timeout, malformed witnesses, and
+  disagreement while retaining only bounded sanitized stream tails. This is a
+  narrow response to macOS 26.5.2 / Chrome 150 evidence, not a claim that every
+  Chrome crash dialog has been eliminated; the existing `ResourceLease`
+  ownership and fail-closed profile-retention contract is unchanged.
+- **Contract validation is fail-loud and finite-first.** PDF paper/margins/scale,
+  clipped screenshot geometry, recorder counts/delays, diff options/masks, CLI
+  positive integers/longs, and public timeout/heap knobs now reject invalid
+  inputs before protocol or file work. Documented zero-duration no-ops remain
+  only on `settle(0)` and `waitForNetworkIdle(..., 0)`. Shared bounded UTF-8
+  ingestion accepts stdin HTML through exactly 16 MiB and `--eval-file` through
+  exactly 1 MiB, reading only one sentinel byte before an over-limit refusal.
+- **Truthful, transactional artifacts.** Case-insensitive `.jpg`/`.jpeg` CLI
+  stills use Chrome's JPEG encoder (`--jpeg-quality 1..100`, default 90),
+  including clip/scale paths; unknown shoot extensions and non-PNG
+  `--diff-out` names are refused.
+  Screenshots, PDFs, GIFs, manifests, diff JSON, and heatmaps now write through
+  sibling temporaries and move into place atomically when supported. Encoding
+  or temporary-write failures preserve an existing completed target and clean
+  temporary residue best-effort. The complete-temp fallback cannot promise
+  atomic replacement on filesystems that reject `ATOMIC_MOVE`. Replacement
+  retains existing POSIX mode bits and follows valid output symlinks to their
+  referents; broken/cyclic links fail before temporary-file creation. CLI
+  output paths are preflighted against sibling artifacts and diff baselines.
+  Absent output identities use a fail-closed Unicode-normalized case fold, so
+  case-only future aliases cannot overwrite one another on insensitive mounts.
+- **Typed manifests.** `MiniJson` is now the zero-dependency serializer for the
+  full supported JSON domain; manifest `eval` values remain null/boolean/number/
+  string/array/object, while non-finite, cyclic, and unsupported values fail loud.
+- **Immutable diff inputs/results and safe selectors.** `Options` deep-copies and
+  validates mask shape/extents/overflow; `Verdict` owns and re-copies changed
+  bounds. Tolerance is 0–254 and percentage gates are 0–100. One
+  selector-literal helper escapes quotes, backslashes, CR/LF, U+2028, U+2029,
+  and every UTF-16 surrogate code unit before interpolation or UTF-8 output.
+- **Honest GIF timing.** Millisecond delays round to the nearest centisecond
+  (75 ms → 80 ms) while retaining the 20 ms minimum.
+  `BrewShot.effectiveGifDelayMs` and CLI manifest requested/encoded fields expose
+  the effective value.
+
 ## 0.9.0
 
 CLI GIF parity — the recorder family finally reachable without writing Java — plus
-the end of the macOS crash-dialog spam.
+the first macOS crash-dialog mitigation.
 
-- **macOS crash-dialog spam eliminated** (`--no-startup-window` in the default launch
+- **macOS crash-dialog storm reduced** (`--no-startup-window` in the default launch
   args): on macOS 26 + Chrome 150, rapid headless launches sporadically abort in
   `TransformProcessType → _RegisterApplication` (LaunchServices refuses the app
   registration under launch storms) — usually a doomed secondary process while the
@@ -13,6 +65,11 @@ the end of the macOS crash-dialog spam.
   dialog on the operator's desktop, and under some conditions (cold `--no-daemon`
   suite runs) the serving process itself dies pre-DevTools. Reported by Charles;
   reproduced 5/15 storm launches without the flag, 0/15 with it, captures intact.
+  That sample demonstrated a mitigation, not universal elimination: later
+  macOS 26.5.2 / Chrome 150 evidence showed unified Chrome's serving process can
+  still abort before DevTools in a LaunchServices-denied Codex Seatbelt context.
+  The Unreleased context refusal and three-witness observer address that narrower
+  failure without rewriting this historical result.
   Reaches embedders (LatteX/Sirentide suites) on their next jar re-vendor. Interim
   workaround is LINEAGE-SPECIFIC (correction credits: Marlow, brewshot/130 AND /132 —
   two claims here were wrong before this wording): LatteX **main** vendors 0.8.0,
@@ -20,6 +77,24 @@ the end of the macOS crash-dialog spam.
   0.11.0-release lineage (the in-review seam-patch branch) still vendors **0.2.0**,
   which has no env hook — suite runs on that lineage cannot take the workaround and
   will keep spawning dialogs until the fixed jar exists.
+- **Bounded, continuously-owned DevTools transport lifecycle.** Command timeouts now
+  cover WebSocket send plus response on one monotonic deadline; connect is bounded
+  both natively and at the Future boundary, and close has a timed abort fallback. A
+  shutdown admission fence atomically joins Chrome start to its process/profile lease;
+  retained pre-exit handles let cleanup terminate every helper it actually observed.
+  A JDK `ProcessHandle` snapshot cannot prove that a helper created during teardown
+  did not reparent after the final snapshot, however, so the zero-dependency launcher
+  now conservatively retains the temp profile and its in-memory lease unless an
+  external process-tree containment owner proves membership closed and fully reaped.
+  Even then, deregistration requires `Files.notExists(..., NOFOLLOW_LINKS)` to
+  positively establish that no entry remains at the profile pathname; provider
+  uncertainty, probe failure, or a dangling symlink keeps the lease live and
+  retryable. The lease remains retryable only while that JVM lives; JVM exit
+  reclaims the registry but deliberately leaves an unproven profile on disk. This
+  corrects the older “no leaked temp dirs” overclaim. One JVM-hook reconciliation
+  loop shares a five-second
+  process-wait/retry-admission budget; synchronous profile deletion and waiting for an
+  already-admitted OS start remain outside it.
 - **`--gif N` records a looping GIF from the CLI** (plan 6cc2d9ec, roadmap B4): the
   whole `recordGif*` family was library-only, so `java -jar` users had GIFs in the
   engine and zero access from the shell. `--gif N` flips the shoot to a recording

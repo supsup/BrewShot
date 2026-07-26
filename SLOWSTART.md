@@ -134,7 +134,8 @@ animation without writing a line of Java:
 
 ```
 java -jar build/libs/brewshot-0.9.0.jar ./fx-demo.html --gif 40 --gif-element ".fx" -o fx.gif
-# --gif N frames, --gif-delay MS cadence (capture == playback), looping GIF out
+# --gif N frames, --gif-delay MS cadence (GIF playback rounds to nearest 10 ms,
+# minimum 20 ms), looping GIF out
 ```
 
 **The caveat Sam should know:** the PNG/eval path compiles native cleanly (pure
@@ -276,6 +277,40 @@ pixels differ subtly from Mac/Windows-Chrome renders — keep your reference
 images consistently from one environment (CI is the good choice: it's the
 one everyone shares). And inside the container the *jar* runs GIFs happily —
 the macOS-native-binary caveat doesn't exist here.
+
+---
+
+## 6. Mina — "Chrome exits before DevTools on my Mac automation runner"
+
+Mina's same BrewShot command works from a normal macOS Terminal but fails when
+an automation host inherits `CODEX_SANDBOX=seatbelt`. That distinction is real:
+unified Chrome 150 calls macOS LaunchServices during headless bootstrap, and the
+known-denied Seatbelt context can abort the serving process before it publishes
+a DevTools endpoint.
+
+BrewShot refuses that exact macOS + Seatbelt + unified-Chrome combination
+*before* creating its generated profile or starting Chrome. The error tells
+Mina to use the supported normal-Terminal lane, the container lane from
+Scenario 5, or an explicitly installed headless shell:
+
+```
+BREWSHOT_CHROME=/path/to/chrome-headless-shell java -jar brewshot.jar https://example.com -o page.png
+```
+
+The basename must be `chrome-headless-shell` (or `.exe`); BrewShot does not
+silently substitute an arbitrary binary. Outside the refused context, startup
+observes bounded stdout, bounded stderr, and the generated profile's validated
+`DevToolsActivePort` under one deadline. Observed endpoints must agree, and a
+failure says whether Chrome exited, stayed alive without an endpoint, published
+malformed data, or published conflicting witnesses. Diagnostic tails redact
+URLs, absolute host paths, command lines, inline flag values, and secret-shaped
+assignments.
+
+This changes no teardown authority. BrewShot still owns only its generated
+profile and the process tree proven by its `ResourceLease`; it never touches the
+operator's Chrome profile, quits an interactive browser, or blanket-kills
+Chrome. The platform/version evidence and historical `--no-startup-window`
+mitigation boundary are recorded in `RELEASE_NOTES.md`.
 
 ---
 

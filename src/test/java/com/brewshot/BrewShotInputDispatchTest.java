@@ -22,6 +22,28 @@ import org.junit.jupiter.api.Test;
 class BrewShotInputDispatchTest {
 
     @Test
+    void selectorInterpolationPreservesLineBreaksWithoutExecutingSelectorText()
+            throws Exception {
+        TestChrome.requireChromeOrLoudSkip("BrewShotInputDispatchTest");
+        try (BrewShot shot = BrewShot.launch(320, 240)) {
+            shot.html("""
+                <div id="target" style="width:40px;height:30px"></div>
+                <script>window.__brewshotSelectorInjected = false;</script>
+                """);
+
+            assertEquals(40.0, shot.elementBox("body\n#target")[2], 0.01,
+                "LF remains selector whitespace instead of breaking JavaScript source");
+            assertEquals(40.0, shot.elementBox("body\r#target")[2], 0.01,
+                "CR remains selector whitespace instead of breaking JavaScript source");
+
+            assertThrows(RuntimeException.class, () -> shot.elementBox(
+                "body\n#target\");window.__brewshotSelectorInjected=true;//\u2028\u2029"));
+            assertEquals(Boolean.FALSE, shot.eval("window.__brewshotSelectorInjected"),
+                "hostile selector text must remain data, never executable source");
+        }
+    }
+
+    @Test
     void clickDispatchesTrustedPressReleaseClickToHandlers() throws Exception {
         TestChrome.requireChromeOrLoudSkip("BrewShotInputDispatchTest");
         try (BrewShot shot = BrewShot.launch(640, 480)) {
