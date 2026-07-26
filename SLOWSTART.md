@@ -230,6 +230,28 @@ docker run --rm -v "$PWD:/work" brewshot https://ci.internal/report -o /work/rep
 cat page.html | docker run --rm -i -v "$PWD:/work" brewshot - -o /work/page.png
 ```
 
+The default remains that one-shot CLI. `cli` is an optional explicit spelling;
+`watch` is the separate long-running mode:
+
+```sh
+mkdir -p Input Output
+docker run -d --name brewshot-worker --restart unless-stopped \
+  --user "$(id -u):$(id -g)" \
+  --mount type=bind,src="$PWD/Input",dst=/brewshot/input \
+  --mount type=bind,src="$PWD/Output",dst=/brewshot/output \
+  brewshot watch
+```
+
+Drop a complete, self-contained `.html` or `.htm` file directly in `Input`.
+Success publishes `Output/<source-name>.png` and archives the source under
+`Input/finished`; failure publishes a bounded content-free `.error.txt` and
+archives under `Input/failed`. `processing`, `finished`, `failed`, hidden/temp
+files, symlinks, subdirectories, and other extensions are not new jobs.
+Existing artifacts are never overwritten, valid processing claims recover on
+restart, and shared workers converge through atomic claims and physical file
+identity. URLs and advanced flags stay on the ordinary CLI rather than becoming
+an autonomous folder-manifest surface.
+
 **Rolling your own image instead?** Three things a container needs that a
 laptop already has:
 
@@ -261,16 +283,25 @@ mount for input, only for output.
 
 > [!WARNING]
 > **Linux hosts: `Permission denied` on the output is a real trap.** The
-> image deliberately runs as a **non-root user** (a security choice — see the
-> Dockerfile), so the mounted directory must be writable by that user. If
+> image deliberately runs as fixed **non-root `10001:10001`** (a security
+> choice — see the Dockerfile), so the mounted directory must be writable by
+> that user. If
 > your shot dies with `Permission denied`, run with your own uid:
 >
-> ```
-> docker run --user "$(id -u)" --rm -v "$PWD:/work" brewshot … -o /work/page.png
+> ```sh
+> docker run --user "$(id -u):$(id -g)" --rm \
+>   -v "$PWD:/work" brewshot … -o /work/page.png
 > ```
 >
 > macOS and Windows Docker Desktop map this automatically — which is exactly
 > why it works on your laptop and then bites in Linux CI.
+
+For one-shot file input, mount `/brewshot/input` read-only and
+`/brewshot/output` writable. Watch mode needs both mounts writable because the
+input tree is also its durable processing/finished/failed state machine. The
+files themselves may be readable but foreign-owned or mode `0444`; terminal
+archiving moves directory entries and does not require hard-link permission on
+the producer's inode.
 
 **What Ana should know:** container renders use the Linux font stack, so
 pixels differ subtly from Mac/Windows-Chrome renders — keep your reference

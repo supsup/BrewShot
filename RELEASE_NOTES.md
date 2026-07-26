@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- **Docker watched folders without sacrificing the CLI.** The Java 25 image
+  still defaults to BrewShot's original argv/stdin/stdout CLI and now accepts
+  `cli` as an explicit spelling plus a long-running `watch` mode over
+  `/brewshot/input` and `/brewshot/output`; legacy relative CLI paths and the
+  default `brewshot.png` output still resolve below `/work`. The fixed non-root `10001:10001`
+  runtime has a writable Chromium home (including host-UID overrides) while
+  application jars remain immutable under `/opt/brewshot`. Watch mode accepts
+  only complete direct-child local `.html`/`.htm` files, atomically claims them,
+  publishes complete PNGs without
+  overwrite, and moves sources to `finished` or `failed`; diagnostics are
+  bounded and content-free. Restart recovery, name/path bounds, output/archive
+  collisions, unreadable inputs, readable foreign-owned mode-`0444` sources,
+  and shared-worker races use atomic owner-agnostic moves plus stable physical
+  file identity rather than same-name path existence. A cache-disabled Docker
+  build and dedicated real-Chromium smoke pin old/explicit CLI parity, runtime
+  ownership, success/failure/liveness, restart recovery, collision immutability,
+  and multi-worker convergence. URL and advanced-option jobs remain on the
+  one-shot CLI, avoiding a new autonomous URL/SSRF manifest surface.
 - **macOS bootstrap is context-aware and multi-witness.** On macOS only, an
   inherited `CODEX_SANDBOX=seatbelt` context now refuses unified Chrome before
   creating a generated profile or starting a process, with a fixed actionable
