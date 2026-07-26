@@ -370,24 +370,85 @@ entirely in the second one.
 
 ## Running in a container
 
-The repo ships a `Dockerfile` (jar + Chromium + fonts, self-contained — GIFs
-included, since the container runs a JVM):
+The repo ships a self-contained Java 25 image with Chromium and fonts. It runs
+as fixed non-root user `10001:10001`, keeps immutable jars under
+`/opt/brewshot`, and offers two modes:
 
-```
+- the original one-shot CLI (still the default; `cli` is an optional explicit
+  spelling), including URL, stdin, PNG/JPEG/PDF, GIF, diff, and advanced flags;
+- a long-running `watch` worker over `/brewshot/input` and
+  `/brewshot/output`.
+
+Build it and use the old CLI shape unchanged:
+
+```sh
 docker build -t brewshot .
-docker run --rm -v "$PWD:/work" brewshot https://example.com -o /work/page.png
+docker run --rm -v "$PWD:/work" brewshot \
+  https://example.com -o /work/page.png
 ```
 
-(The `-v "$PWD:/work"` mount is how the PNG reaches your directory — the
-container's own filesystem vanishes with `--rm`. Input files ride the same
-mount.)
+For mounted file input, the input mount can stay read-only while output remains
+writable:
+
+```sh
+mkdir -p Input Output
+docker run --rm \
+  --user "$(id -u):$(id -g)" \
+  --mount type=bind,src="$PWD/Input",dst=/brewshot/input,readonly \
+  --mount type=bind,src="$PWD/Output",dst=/brewshot/output \
+  brewshot cli /brewshot/input/page.html \
+    -o /brewshot/output/page.png
+```
+
+### Watched input and output folders
+
+Run a persistent local-HTML worker with writable input and output mounts:
+
+```sh
+mkdir -p Input Output
+docker run -d --name brewshot-worker --restart unless-stopped \
+  --user "$(id -u):$(id -g)" \
+  --mount type=bind,src="$PWD/Input",dst=/brewshot/input \
+  --mount type=bind,src="$PWD/Output",dst=/brewshot/output \
+  brewshot watch
+```
+
+Watch mode accepts complete, visible, regular, direct-child `.html` and `.htm`
+files only. They should be self-contained: claiming moves the file into a
+job-specific processing directory, so sibling asset paths are not a worker
+contract. URL manifests and arbitrary option manifests are intentionally not
+accepted; use the unchanged CLI for URLs and advanced capture options.
+
+Publish a complete job with a hidden sibling plus atomic rename so the worker
+never observes a partial upload:
+
+```sh
+cp page.html Input/.page.html.tmp
+mv Input/.page.html.tmp Input/page.html
+```
+
+For `page.html`, success creates `Output/page.html.png` and moves the original
+to `Input/finished/page.html`:
+
+```text
+Input/page.html
+  -> Input/processing/<job-id>/page.html
+  -> Input/finished/page.html
+```
+
+A failed capture instead creates a bounded, content-free
+`Output/page.html.error.txt` and moves the source below `Input/failed`.
+Existing outputs, diagnostics, and archives are never overwritten; collisions
+are retained under job-id directories. Valid processing claims recover after a
+restart, and multiple workers may share the same mounts. Set
+`BREWSHOT_WATCH_POLL_MS` to `10` through `60000` milliseconds (default `500`).
 
 > [!WARNING]
-> On **Linux hosts**, add `--user "$(id -u)"` if the output dies with
-> `Permission denied` — the image runs non-root by design, and a bind-mounted
-> directory must be writable by that user. Works-on-my-Mac is not evidence
-> here: Docker Desktop maps permissions automatically, Linux CI does not.
-> Details: [SLOWSTART](SLOWSTART.md) Scenario 5.
+> On Linux, map the process to the host UID/GID as above or make the bind
+> folders writable by the image's `10001:10001` user. Docker Desktop usually
+> translates ownership automatically; Linux does not. Watch input must be
+> writable because the worker performs atomic state transitions. One-shot CLI
+> input can remain read-only. Details: [SLOWSTART](SLOWSTART.md) Scenario 5.
 
 Rolling your own image: install `chromium` + fonts (`fonts-liberation`,
 `fonts-dejavu-core`), set `BREWSHOT_CHROME=/usr/bin/chromium` and
