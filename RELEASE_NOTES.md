@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- **`diff` inputs are size-bounded before they are decoded.** `ImageIO.read`
+  allocates a `width × height` raster as its first act, so a PNG that merely
+  *declares* 40000×40000 — a few hundred bytes on disk — used to take the memory
+  before anything could reject it. `brewshot diff` now reads each input's header
+  only (no pixel decode) and refuses an over-limit input as a **usage error, exit
+  2**, distinct from exit 1's "this file did not decode". Two independent, both
+  inclusive ceilings: `-Dbrewshot.maxImageDimension` (default 16384 px per axis)
+  and `-Dbrewshot.maxImagePixels` (default 67108864 total). A present value that
+  is malformed, zero, or negative is a **named refusal** rather than a silent
+  fallback to the default, so a mistyped ceiling can no longer look like an active
+  one. Every input in a batch is probed before any job decodes or writes, and an
+  unreadable header on one input neither cancels the remaining probes nor
+  reclassifies that file — it stays exit 1. The ceiling is not a
+  hostile-concurrent-writer (TOCTOU) boundary: header and decode reopen the path,
+  which suits BrewShot's trusted-operator threat model.
 - **Docker watched folders without sacrificing the CLI.** The Java 25 image
   still defaults to BrewShot's original argv/stdin/stdout CLI and now accepts
   `cli` as an explicit spelling plus a long-running `watch` mode over

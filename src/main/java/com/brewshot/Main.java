@@ -463,16 +463,39 @@ public final class Main {
         // before any job decodes pixels. Batched here rather than per-job so an
         // oversized second job cannot be reached only after the first has already
         // allocated and written.
+        long maxDimension;
+        long maxPixels;
         try {
-            for (DiffJob job : jobs) {
-                requireImageWithinLimits(job.a());
-                requireImageWithinLimits(job.b());
+            // Resolve the ceilings ONCE, before any probe. A malformed ceiling is a
+            // configuration error and must refuse loudly here rather than silently
+            // reverting to the default mid-batch (review brewshot/242 finding 2).
+            maxDimension = positiveLimitProperty(DIMENSION_LIMIT_PROPERTY, DEFAULT_MAX_DIMENSION);
+            maxPixels = positiveLimitProperty(PIXELS_LIMIT_PROPERTY, DEFAULT_MAX_PIXELS);
+        } catch (IllegalArgumentException badLimit) {
+            return err(badLimit.getMessage());
+        }
+        // Probe EVERY input before deciding. The catch sits inside the loop, per
+        // input, because an early header failure must not cancel the remaining
+        // probes: review brewshot/242 finding 1 proved that a malformed first input
+        // let a declared-huge LATER input reach ImageIO.read and write its sidecar,
+        // defeating the whole bound. An unreadable header is not a usage error — it
+        // is recorded and skipped so readImage still reports it canonically as exit 1.
+        ImageTooLargeException oversized = null;
+        for (DiffJob job : jobs) {
+            for (Path input : java.util.List.of(job.a(), job.b())) {
+                try {
+                    requireImageWithinLimits(input, maxDimension, maxPixels);
+                } catch (ImageTooLargeException tooLarge) {
+                    if (oversized == null) {
+                        oversized = tooLarge;   // first offender wins, deterministically
+                    }
+                } catch (java.io.IOException probeFailure) {
+                    // Contained per input; keep probing the rest of the batch.
+                }
             }
-        } catch (ImageTooLargeException oversized) {
+        }
+        if (oversized != null) {
             return err(oversized.getMessage());
-        } catch (java.io.IOException probeFailure) {
-            // An unreadable header is NOT a usage error. Fall through and let
-            // readImage report it canonically as exit 1, unchanged.
         }
 
         int worst = 0;
@@ -543,14 +566,49 @@ public final class Main {
         ImageTooLargeException(String message) { super(message); }
     }
 
-    /** Max px per axis for a diff input; default 16384, override -Dbrewshot.maxImageDimension=N. */
-    private static long maxImageDimension() {
-        return Long.getLong("brewshot.maxImageDimension", 16_384L);
-    }
+    static final String DIMENSION_LIMIT_PROPERTY = "brewshot.maxImageDimension";
+    static final String PIXELS_LIMIT_PROPERTY = "brewshot.maxImagePixels";
 
-    /** Max total area (w*h) for a diff input; default 64 MP, override -Dbrewshot.maxImagePixels=N. */
-    private static long maxImagePixels() {
-        return Long.getLong("brewshot.maxImagePixels", 67_108_864L);
+    /** Max px per axis for a diff input; override -Dbrewshot.maxImageDimension=N. */
+    private static final long DEFAULT_MAX_DIMENSION = 16_384L;
+
+    /** Max total area (w*h) for a diff input; override -Dbrewshot.maxImagePixels=N. */
+    private static final long DEFAULT_MAX_PIXELS = 67_108_864L;
+
+    /**
+     * Read a safety ceiling STRICTLY: absent means the default, but anything present
+     * must be a positive integer.
+     *
+     * <p>{@link Long#getLong(String, long)} returns the fallback for a MALFORMED value
+     * exactly as it does for a missing one, which makes a typo indistinguishable from
+     * absence — an operator who sets {@code -Dbrewshot.maxImageDimension=8l92} believes
+     * a custom ceiling is active while the default silently applies. That is fail-open
+     * configuration on a safety boundary (review brewshot/242 finding 2), so a present
+     * value that is malformed, zero, or negative is a named refusal instead.
+     *
+     * <p>Read fresh per call rather than cached, so a late {@code System.setProperty}
+     * takes effect.
+     */
+    private static long positiveLimitProperty(String name, long fallback) {
+        String raw = System.getProperty(name);
+        if (raw == null) {
+            return fallback;
+        }
+        String trimmed = raw.trim();
+        long parsed;
+        try {
+            parsed = Long.parseLong(trimmed);
+        } catch (NumberFormatException notANumber) {
+            throw new IllegalArgumentException(
+                name + " must be a positive whole number, got: " + raw
+                    + " — remove it to use the default (" + fallback + ")");
+        }
+        if (parsed <= 0) {
+            throw new IllegalArgumentException(
+                name + " must be greater than 0, got: " + parsed
+                    + " — remove it to use the default (" + fallback + ")");
+        }
+        return parsed;
     }
 
     /**
@@ -573,7 +631,7 @@ public final class Main {
      * only ever turn a would-be decode into a usage refusal, never change the "not an
      * image" path.
      */
-    private static void requireImageWithinLimits(Path p)
+    private static void requireImageWithinLimits(Path p, long maxDimension, long maxPixels)
             throws ImageTooLargeException, java.io.IOException {
         try (javax.imageio.stream.ImageInputStream stream =
                  javax.imageio.ImageIO.createImageInputStream(p.toFile())) {
@@ -590,8 +648,6 @@ public final class Main {
                 reader.setInput(stream, true, true);
                 long width = reader.getWidth(0);
                 long height = reader.getHeight(0);
-                long maxDimension = maxImageDimension();
-                long maxPixels = maxImagePixels();
                 if (width > maxDimension || height > maxDimension) {
                     throw new ImageTooLargeException(p + ": " + width + "x" + height
                         + " exceeds the per-axis limit brewshot.maxImageDimension="

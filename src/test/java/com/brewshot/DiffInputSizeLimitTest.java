@@ -11,6 +11,8 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import javax.imageio.ImageIO;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -77,6 +79,20 @@ class DiffInputSizeLimitTest {
     @FunctionalInterface
     private interface ThrowingRunnable {
         void run() throws Exception;
+    }
+
+    /**
+     * Both ceilings are process-global mutable state, so a test that reads the
+     * "default" is really reading whatever ran before it. Clearing around EVERY test
+     * makes each one hermetic and its result order-independent — without this, this
+     * class produced different verdicts for the same code depending on whether a test
+     * ran alone or inside the class.
+     */
+    @BeforeEach
+    @AfterEach
+    void clearCeilings() {
+        System.clearProperty(DIMENSION_KEY);
+        System.clearProperty(PIXELS_KEY);
     }
 
     @Test
@@ -216,6 +232,167 @@ class DiffInputSizeLimitTest {
                 "the message must name the property that raises the ceiling, got: " + stderr);
             assertNotEquals("", stderr.trim(), "a refusal must explain itself");
         });
+    }
+
+    // ---- review brewshot/242: the two false-success shapes Marlow reproduced ------
+
+    @Test
+    void aMalformedEarlierInputMustNotCancelTheProbeOfALaterOversizedOne(@TempDir Path tmp)
+            throws Exception {
+        // MARLOW'S REPRODUCTION (brewshot/242 finding 1). The original code wrapped the
+        // whole batch loop in ONE try, so an IOException thrown while reading job 1's
+        // header exited the loop and jobs 2..N were never probed at all. A declared-huge
+        // later input then reached ImageIO.read and wrote its sidecar — the bound
+        // defeated entirely by a malformed file earlier in the batch.
+        Path malformed = truncatedHeaderPng(tmp.resolve("malformed.png"));
+        // PRECONDITION, asserted rather than assumed. This test is only meaningful if
+        // the fixture reaches the CONTAINED-IOException branch: a reader must be
+        // selected and must then throw while parsing the header. If ImageIO instead
+        // selects no reader, the probe returns quietly, the batch continues anyway, and
+        // the test would pass WITHOUT exercising the bug — which is exactly how an
+        // earlier version of this test passed against the known-broken code.
+        assertTrue(headerReadSelectsAReaderThatThrows(malformed),
+            "fixture must select an ImageReader that then throws on the header; "
+                + "otherwise this test cannot distinguish the fix from the bug");
+        Path bomb = declaredSizePng(tmp.resolve("bomb.png"), 40_000, 40_000);
+        Path fine = png(tmp, "fine.png", 20, 20);
+        Path sidecar = tmp.resolve("later-verdict.json");
+
+        Main.DiffJob first = new Main.DiffJob(
+            malformed, fine, BrewShotDiff.Options.defaults(), null, null, null, null);
+        Main.DiffJob later = new Main.DiffJob(
+            bomb, fine, BrewShotDiff.Options.defaults(), null, null, null, sidecar);
+
+        // State the ceiling explicitly rather than leaning on the ambient default —
+        // an inherited ceiling is what made this assertion order-dependent.
+        int[] captured = new int[1];
+        String stderr = captureStderr(() ->
+            withLimits("1000", null, () ->
+                captured[0] = Main.runDiffJobs(java.util.List.of(first, later))));
+        int code = captured[0];
+
+        assertEquals(EXIT_USAGE, code,
+            "the oversized LATER input must still be found and refused (exit 2), even "
+                + "though an earlier input's header could not be read");
+        // Assert the REASON, not merely the code. Exit 2 is also produced by the alias
+        // preflight and by bad flags, so a code-only assertion can pass for a reason
+        // that has nothing to do with the size bound — which is precisely how this test
+        // passed against the known-broken implementation.
+        assertTrue(stderr.contains(DIMENSION_KEY),
+            "the refusal must come from the SIZE bound and name " + DIMENSION_KEY
+                + ", not from some other exit-2 path; got: " + stderr);
+        assertTrue(stderr.contains("bomb.png"),
+            "the refusal must name the oversized LATER input; got: " + stderr);
+        assertTrue(Files.notExists(sidecar),
+            "no later job may write an artifact once the batch is refused");
+    }
+
+    @Test
+    void aMalformedInputAloneIsStillExitOneNotTwo(@TempDir Path tmp) throws Exception {
+        // The other half of the contract: containing the header IOException must NOT
+        // turn an unreadable file into a usage refusal. With no over-limit input in the
+        // batch, the malformed one still belongs to readImage and still exits 1.
+        Path malformed = tmp.resolve("malformed.png");
+        Files.write(malformed, new byte[] {(byte) 0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'});
+        Path fine = png(tmp, "fine.png", 20, 20);
+
+        assertEquals(EXIT_UNREADABLE,
+            Main.run(new String[] {"diff", malformed.toString(), fine.toString()}),
+            "a malformed input with no over-limit input present stays exit 1");
+    }
+
+    @Test
+    void aMalformedCeilingIsRefusedRatherThanSilentlyIgnored(@TempDir Path tmp) throws Exception {
+        // MARLOW'S REPRODUCTION (brewshot/242 finding 2). Long.getLong returns the
+        // DEFAULT for a malformed value exactly as it does for a missing one, so a typo
+        // was indistinguishable from absence: the operator believed a custom ceiling was
+        // active while 16384/67108864 silently applied. Fail-open on a safety boundary.
+        Path a = png(tmp, "a.png", 20, 20);
+        Path b = png(tmp, "b.png", 20, 20);
+        withLimits("not-a-number", null, () -> {
+            String stderr = captureStderr(() ->
+                Main.run(new String[] {"diff", a.toString(), b.toString()}));
+            assertTrue(stderr.contains(DIMENSION_KEY),
+                "the refusal must name the offending property, got: " + stderr);
+        });
+        withLimits("not-a-number", null, () ->
+            assertEquals(EXIT_USAGE, Main.run(new String[] {"diff", a.toString(), b.toString()}),
+                "a malformed ceiling must refuse (exit 2), never silently use the default"));
+        withLimits(null, "12x34", () ->
+            assertEquals(EXIT_USAGE, Main.run(new String[] {"diff", a.toString(), b.toString()}),
+                "the same strictness applies to the area ceiling"));
+    }
+
+    @Test
+    void aZeroOrNegativeCeilingIsRefused(@TempDir Path tmp) throws Exception {
+        // Parseable but nonsensical. A zero ceiling would refuse every image; a negative
+        // one is meaningless. Both are configuration errors, not silent defaults.
+        Path a = png(tmp, "a.png", 20, 20);
+        Path b = png(tmp, "b.png", 20, 20);
+        for (String bad : new String[] {"0", "-1"}) {
+            withLimits(bad, null, () ->
+                assertEquals(EXIT_USAGE,
+                    Main.run(new String[] {"diff", a.toString(), b.toString()}),
+                    "per-axis ceiling " + bad + " must be refused"));
+            withLimits(null, bad, () ->
+                assertEquals(EXIT_USAGE,
+                    Main.run(new String[] {"diff", a.toString(), b.toString()}),
+                    "area ceiling " + bad + " must be refused"));
+        }
+    }
+
+    @Test
+    void aWhitespacePaddedCeilingIsStillAccepted(@TempDir Path tmp) throws Exception {
+        // Strictness must not become brittleness: a value a shell or CI wrapper padded
+        // is still a valid positive integer and must keep working.
+        Path a = png(tmp, "a.png", 100, 100);
+        Path b = png(tmp, "b.png", 100, 100);
+        withLimits("  100  ", null, () ->
+            assertEquals(EXIT_CLEAN, Main.run(new String[] {"diff", a.toString(), b.toString()}),
+                "a padded but valid ceiling must be parsed, not refused"));
+    }
+
+    /**
+     * A PNG that reliably selects the PNG reader and THEN fails: valid signature plus
+     * an IHDR chunk whose declared length overruns the file. A bare 8-byte signature is
+     * not reliable — whether ImageIO selects a reader for it varies with JVM state,
+     * which is what made the first version of this test order-dependent.
+     */
+    private static Path truncatedHeaderPng(Path target) throws IOException {
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        out.write(new byte[] {(byte) 0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'});
+        writeInt(out, 13);                                          // IHDR declares 13 bytes
+        out.write("IHDR".getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+        out.write(new byte[] {0, 0, 0, 10});                        // ...but only 4 arrive
+        Files.write(target, out.toByteArray());
+        return target;
+    }
+
+    /** True when ImageIO selects a reader for this file AND that reader throws on the header. */
+    private static boolean headerReadSelectsAReaderThatThrows(Path file) throws IOException {
+        try (javax.imageio.stream.ImageInputStream stream =
+                 javax.imageio.ImageIO.createImageInputStream(file.toFile())) {
+            if (stream == null) {
+                return false;
+            }
+            java.util.Iterator<javax.imageio.ImageReader> readers =
+                javax.imageio.ImageIO.getImageReaders(stream);
+            if (!readers.hasNext()) {
+                return false;
+            }
+            javax.imageio.ImageReader reader = readers.next();
+            try {
+                reader.setInput(stream, true, true);
+                reader.getWidth(0);
+                return false;                                       // it succeeded — wrong shape
+            } catch (IOException expected) {
+                return true;
+            } catch (RuntimeException alsoFails) {
+                return false;                                       // not the IOException branch
+            } finally {
+                reader.dispose();
+            }
+        }
     }
 
     /**
