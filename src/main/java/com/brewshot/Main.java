@@ -459,6 +459,21 @@ public final class Main {
         } catch (IllegalArgumentException | java.io.IOException aliasFailure) {
             return err(aliasFailure.getMessage());
         }
+        // Same no-write preflight window: refuse an oversized input from its HEADER,
+        // before any job decodes pixels. Batched here rather than per-job so an
+        // oversized second job cannot be reached only after the first has already
+        // allocated and written.
+        try {
+            for (DiffJob job : jobs) {
+                requireImageWithinLimits(job.a());
+                requireImageWithinLimits(job.b());
+            }
+        } catch (ImageTooLargeException oversized) {
+            return err(oversized.getMessage());
+        } catch (java.io.IOException probeFailure) {
+            // An unreadable header is NOT a usage error. Fall through and let
+            // readImage report it canonically as exit 1, unchanged.
+        }
 
         int worst = 0;
         for (DiffJob job : jobs) {
@@ -521,6 +536,78 @@ public final class Main {
             }
         }
         return worst;
+    }
+
+    /** A diff input whose DECLARED dimensions blow a configured ceiling (usage error, exit 2). */
+    private static final class ImageTooLargeException extends Exception {
+        ImageTooLargeException(String message) { super(message); }
+    }
+
+    /** Max px per axis for a diff input; default 16384, override -Dbrewshot.maxImageDimension=N. */
+    private static long maxImageDimension() {
+        return Long.getLong("brewshot.maxImageDimension", 16_384L);
+    }
+
+    /** Max total area (w*h) for a diff input; default 64 MP, override -Dbrewshot.maxImagePixels=N. */
+    private static long maxImagePixels() {
+        return Long.getLong("brewshot.maxImagePixels", 67_108_864L);
+    }
+
+    /**
+     * Refuse an oversized diff INPUT from its header, BEFORE the full decode.
+     *
+     * <p>{@link javax.imageio.ImageIO#read} allocates a {@code w*h} raster as its first
+     * act, so by the time a decompression-bomb-scale PNG fails it has already tried to
+     * take the memory — a 100000x100000 declared image asks for 40 GB from a 26-byte
+     * file. This reads only {@code getWidth(0)}/{@code getHeight(0)} off an
+     * {@link javax.imageio.ImageReader}, which parses the header and decodes no pixels,
+     * so the refusal costs nothing.
+     *
+     * <p>Both ceilings are read FRESH on every call rather than cached in a static, so a
+     * test (and a caller who sets the property late) sees the current value. The
+     * comparison is strictly {@code >}: an exactly-at-limit input is accepted.
+     *
+     * <p>Deliberately NOT this method's job: deciding that a file is not an image. When
+     * no reader is registered, or the stream cannot be opened, it returns quietly and
+     * leaves {@link #readImage} to report it canonically as exit 1 — so this guard can
+     * only ever turn a would-be decode into a usage refusal, never change the "not an
+     * image" path.
+     */
+    private static void requireImageWithinLimits(Path p)
+            throws ImageTooLargeException, java.io.IOException {
+        try (javax.imageio.stream.ImageInputStream stream =
+                 javax.imageio.ImageIO.createImageInputStream(p.toFile())) {
+            if (stream == null) {
+                return;
+            }
+            java.util.Iterator<javax.imageio.ImageReader> readers =
+                javax.imageio.ImageIO.getImageReaders(stream);
+            if (!readers.hasNext()) {
+                return;
+            }
+            javax.imageio.ImageReader reader = readers.next();
+            try {
+                reader.setInput(stream, true, true);
+                long width = reader.getWidth(0);
+                long height = reader.getHeight(0);
+                long maxDimension = maxImageDimension();
+                long maxPixels = maxImagePixels();
+                if (width > maxDimension || height > maxDimension) {
+                    throw new ImageTooLargeException(p + ": " + width + "x" + height
+                        + " exceeds the per-axis limit brewshot.maxImageDimension="
+                        + maxDimension + " px — raise it with -Dbrewshot.maxImageDimension=N");
+                }
+                // Both operands are already <= maxDimension (16384 by default), so the
+                // product cannot overflow a long even at the widest accepted input.
+                if (width * height > maxPixels) {
+                    throw new ImageTooLargeException(p + ": " + width + "x" + height + " = "
+                        + (width * height) + " px exceeds the area limit brewshot.maxImagePixels="
+                        + maxPixels + " — raise it with -Dbrewshot.maxImagePixels=N");
+                }
+            } finally {
+                reader.dispose();
+            }
+        }
     }
 
     private static java.awt.image.BufferedImage readImage(Path p) throws java.io.IOException {
