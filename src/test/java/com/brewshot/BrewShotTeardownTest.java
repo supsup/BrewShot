@@ -28,10 +28,18 @@ import org.junit.jupiter.api.io.TempDir;
  * and deletes the profile dir while the survivor recreates it.
  *
  * <p>These tests drive the REAL production teardown unit
- * ({@link BrewShot#teardownTree}) against dummy POSIX process trees —
- * {@code /bin/sh} parents with backgrounded children — never a browser. The
- * dummy descendant loops {@code mkdir -p <profile>}, standing in for a Chrome
- * helper flushing profile state after cleanup.
+ * ({@link BrewShot.ResourceLease#cleanup(boolean)}, the same pass close(), the
+ * launch-failure path, and the shutdown hook all funnel through) against dummy
+ * POSIX process trees — {@code /bin/sh} parents with backgrounded children —
+ * never a browser. The dummy descendant loops {@code mkdir -p <profile>},
+ * standing in for a Chrome helper flushing profile state after cleanup.
+ *
+ * <p>The leases are the CONTAINED test variant: production launches carry an
+ * unproven containment gate and deliberately retain the profile rather than
+ * delete it without proof (that gate is pinned by
+ * {@code BrewShotLifecycleOwnershipTest}). Supplying the proof here is what
+ * lets these tests assert on the delete/recreate race itself, which is the
+ * property under test.
  *
  * <p>HONESTY SCOPE of the recreate assertion: what Chrome writes internally
  * post-mortem is not (and cannot honestly be) simulated here. What IS pinned
@@ -54,6 +62,10 @@ class BrewShotTeardownTest {
      *  a red run cannot leak the dummy tree past the test. */
     private final List<ProcessHandle> spawned = new ArrayList<>();
 
+    /** Leases registered here, force-released in @AfterEach so a red run cannot
+     *  leave one in the JVM-wide LIVE registry for another test to trip over. */
+    private final List<BrewShot.ResourceLease> leases = new ArrayList<>();
+
     @BeforeAll
     static void posixOnly() {
         assumeFalse(System.getProperty("os.name", "")
@@ -63,6 +75,9 @@ class BrewShotTeardownTest {
 
     @AfterEach
     void reapEverything() {
+        for (BrewShot.ResourceLease lease : leases) {
+            try { lease.cleanup(false); } catch (RuntimeException ignored) { }
+        }
         for (ProcessHandle ph : spawned) {
             ph.descendants().forEach(ProcessHandle::destroyForcibly);
             ph.destroyForcibly();
@@ -84,6 +99,14 @@ class BrewShotTeardownTest {
             .start();
         spawned.add(p.toHandle());
         return p;
+    }
+
+    /** Register the production lease that owns this dummy process + profile. */
+    private BrewShot.ResourceLease lease(Process p, Path marker) {
+        BrewShot.ResourceLease lease =
+            BrewShot.registerContainedLaunchLeaseForTests(p, marker);
+        leases.add(lease);
+        return lease;
     }
 
     /** Block until the process prints {@code started} (writer child is up). */
@@ -159,7 +182,7 @@ class BrewShotTeardownTest {
         List<ProcessHandle> kids = awaitDescendants(p.toHandle(), 1);
         awaitMarker(marker);
 
-        BrewShot.teardownTree(p.toHandle(), marker, false); // the launch-failure path
+        lease(p, marker).cleanup(false); // the launch-failure path
 
         assertFalse(p.isAlive(), "direct child must be dead");
         assertAllDeadWithin(kids, 3_000);
@@ -173,7 +196,7 @@ class BrewShotTeardownTest {
         awaitDescendants(p.toHandle(), 1);
         awaitMarker(marker);
 
-        BrewShot.teardownTree(p.toHandle(), marker, false);
+        lease(p, marker).cleanup(false);
 
         assertMarkerStaysDeleted(marker);
     }
@@ -191,7 +214,7 @@ class BrewShotTeardownTest {
         // close() semantics: SIGTERM + grace first. The dummy sh exits on
         // SIGTERM but its backgrounded writer does not inherit the signal —
         // exactly the survivor shape.
-        BrewShot.teardownTree(p.toHandle(), marker, true);
+        lease(p, marker).cleanup(true);
 
         assertFalse(p.isAlive(), "direct child must be dead");
         assertAllDeadWithin(kids, 3_000);
@@ -219,7 +242,8 @@ class BrewShotTeardownTest {
         List<ProcessHandle> kids = awaitDescendants(p.toHandle(), 1);
         awaitMarker(marker);
 
-        BrewShot.teardownTree(p.toHandle(), marker, true); // polite path: TERM is IGNORED by the child
+        // polite path: TERM is IGNORED by the child
+        lease(p, marker).cleanup(true);
 
         assertFalse(p.isAlive(), "direct child must be dead");
         assertAllDeadWithin(kids, 3_000);
@@ -246,7 +270,11 @@ class BrewShotTeardownTest {
         awaitMarker(marker);
         assertTrue(p.waitFor(10, TimeUnit.SECONDS), "fixture parent should exit alone");
 
-        BrewShot.teardownTree(p.toHandle(), marker, false);
+        // The lease is registered only AFTER the parent died, so its retained
+        // handle snapshot is EMPTY — the reparented writer is invisible to
+        // terminateProcess. This is the case the sweep exists for; without it
+        // the profile is deleted and the survivor recreates it.
+        lease(p, marker).cleanup(false);
 
         assertAllDeadWithin(kids, 3_000);
         assertMarkerStaysDeleted(marker);

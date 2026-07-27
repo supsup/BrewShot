@@ -1,5 +1,6 @@
 package com.brewshot;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -11,8 +12,10 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import javax.imageio.ImageIO;
+import javax.imageio.metadata.IIOMetadataNode;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.w3c.dom.Node;
 
 /**
  * {@link GifWriter} robustness (plan 04bb9898, downtime finding brewshot/63, Fixpoint-
@@ -67,5 +70,72 @@ class GifWriterTest {
     void anEmptyFrameListIsRejected(@TempDir Path dir) {
         assertThrows(IllegalArgumentException.class,
             () -> GifWriter.write(List.of(), 100, dir.resolve("empty.gif")));
+    }
+
+    @Test
+    void representativeDelaysEncodeAtRoundedCentisecondGranularity(@TempDir Path dir)
+            throws IOException {
+        int[][] cases = {
+            {1, 2}, {19, 2}, {20, 2}, {25, 3}, {75, 8}, {76, 8},
+        };
+        for (int[] testCase : cases) {
+            int requestedMs = testCase[0];
+            Path out = dir.resolve("rounded-" + requestedMs + ".gif");
+            GifWriter.write(List.of(validPng(0xff0000)), requestedMs, out);
+            assertEquals(Integer.toString(testCase[1]), encodedDelay(out, 0),
+                requestedMs + "ms encoded delay");
+        }
+    }
+
+    @Test
+    void firstFrameAndFollowingFramesBothUseRoundedDelays(@TempDir Path dir)
+            throws IOException {
+        Path out = dir.resolve("poster-delay.gif");
+        GifWriter.write(
+            List.of(validPng(0xff0000), validPng(0x00ff00)), 25, 75, out);
+
+        assertEquals("8", encodedDelay(out, 0), "75ms poster hold rounds to 80ms");
+        assertEquals("3", encodedDelay(out, 1), "25ms frame delay rounds to 30ms");
+    }
+
+    @Test
+    void invalidSequenceCannotOverwriteAnExistingCompleteArtifact(@TempDir Path dir)
+            throws IOException {
+        Path out = dir.resolve("existing.gif");
+        Files.writeString(out, "known-good-old-artifact");
+
+        assertThrows(IOException.class,
+            () -> GifWriter.write(List.of(validPng(0xff0000), new byte[] {1, 2}), 40, out));
+
+        assertEquals("known-good-old-artifact", Files.readString(out));
+    }
+
+    private static Node find(Node node, String name) {
+        if (name.equals(node.getNodeName())) {
+            return node;
+        }
+        for (Node child = node.getFirstChild(); child != null; child = child.getNextSibling()) {
+            Node found = find(child, name);
+            if (found != null) {
+                return found;
+            }
+        }
+        return null;
+    }
+
+    private static String encodedDelay(Path gif, int frameIndex) throws IOException {
+        try (var input = ImageIO.createImageInputStream(gif.toFile())) {
+            var reader = ImageIO.getImageReaders(input).next();
+            try {
+                reader.setInput(input);
+                var metadata = reader.getImageMetadata(frameIndex);
+                Node root = metadata.getAsTree(metadata.getNativeMetadataFormatName());
+                IIOMetadataNode control =
+                    (IIOMetadataNode) find(root, "GraphicControlExtension");
+                return control.getAttribute("delayTime");
+            } finally {
+                reader.dispose();
+            }
+        }
     }
 }

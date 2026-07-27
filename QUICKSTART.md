@@ -38,6 +38,7 @@ Object v = shot.eval("document.title");        // any JS expression; promises aw
 // returns String / Double / Boolean / Map / List / null (JSON-serializable values)
 
 shot.screenshot(Path.of("page.png"));          // full page, beyond the viewport
+shot.screenshot(Path.of("page.jpg"), BrewShot.ImageFormat.JPEG, 90);
 byte[] png = shot.screenshotClip(x, y, w, h);  // one rectangle, page coordinates
 ```
 
@@ -98,6 +99,9 @@ shot.recordGifElement(".fx", 30, 25, 75, 1.0,
 
 Looping GIFs, assembled by the JDK's ImageIO. Frames are real captures — if
 nothing animates, all frames match (assert that for trigger-liveness tests).
+GIF delays are encoded in 10 ms units, rounded to nearest (75 ms → 80 ms),
+with a 20 ms minimum; `BrewShot.effectiveGifDelayMs(requested)` reports the
+exact encoded value.
 Stills have the same region trick: `screenshotRegion(from, to, scale)`, and
 `screenshotClip` takes an optional `scale` for cheap downscaled captures.
 For a screen-recording-style TOUR (viewport frames while the page scrolls),
@@ -108,6 +112,7 @@ No Java in hand? The same lane exists on the CLI — `--gif N`, below.
 
 ```
 brewshot https://example.com -o page.png
+brewshot https://example.com -o page.jpeg --jpeg-quality 82
 brewshot ./report.html -o report.png --size 1440x1000 --settle 1500
 cat page.html | brewshot - -o page.png --eval "document.title"
 
@@ -121,12 +126,16 @@ brewshot http://localhost:8080/route -o shot.png \
   --fail-js "!document.querySelector('.error-banner')" \
   --cookie "SESSION=tok@localhost" --json shot.json
 # exit 4 when --fail-js is false — the PNG is still written (failures carry eyes)
+# --eval values retain their JSON type in the --json manifest (not strings)
+# stdin HTML is capped at 16 MiB; --eval-file UTF-8 source is capped at 1 MiB
+# unknown -o extensions are rejected (only png, jpg/jpeg, pdf, guarded gif)
 # (--clip-js still exists for computed rects; --clip-selector covers the common case)
 
 # film it instead of freezing it: N frames as a looping GIF (jar path)
 brewshot ./fx.html --gif 40 -o fx.gif                        # full page
 brewshot ./fx.html --gif 40 --gif-delay 60 --gif-element ".lx-math" -o fx.gif
-# --gif-delay MS: per-frame cadence, capture == playback (default 40)
+# --gif-delay MS: capture cadence + playback request; playback rounds to nearest
+# 10 ms (minimum 20 ms), while manifests report requested and encoded values
 # --gif-element CSS: film just that element's box (composes with --scale)
 # -o *.gif without --gif is refused — no PNG bytes hiding in a .gif name
 ```
