@@ -4,7 +4,7 @@
 
 - **Real resource bounds on the CDP transport, captures, and recordings.** Advertised
   bounds are now enforced rather than assumed. The CDP inbox is a finite queue
-  (`brewshot.maxInboxMessages`, default 1024) sized one slot beyond its cap so the
+  (`brewshot.maxInboxMessages`, default 4096) sized one slot beyond its cap so the
   close/error sentinel always has a home; oversized single messages are dropped at
   reassembly (`brewshot.maxCdpMessageBytes`); console/error retention is clamped to a
   byte budget; screenshot captures are refused from their decoded size before anything
