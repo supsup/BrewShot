@@ -621,9 +621,12 @@ public final class Main {
      * {@link javax.imageio.ImageReader}, which parses the header and decodes no pixels,
      * so the refusal costs nothing.
      *
-     * <p>Both ceilings are read FRESH on every call rather than cached in a static, so a
-     * test (and a caller who sets the property late) sees the current value. The
-     * comparison is strictly {@code >}: an exactly-at-limit input is accepted.
+     * <p>The ceilings are RESOLVED ONCE PER BATCH by the caller and passed in, so every
+     * input in one run is judged against the same values and a malformed ceiling refuses
+     * before any probe rather than mid-batch. They are still read fresh per RUN rather
+     * than cached in a static, so a caller (or test) that sets the property late sees the
+     * new value on the next invocation. The comparison is strictly {@code >}: an
+     * exactly-at-limit input is accepted.
      *
      * <p>Deliberately NOT this method's job: deciding that a file is not an image. When
      * no reader is registered, or the stream cannot be opened, it returns quietly and
