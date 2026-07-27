@@ -1,7 +1,7 @@
-# BrewShot in a box — jar-on-JVM + Chromium, fully self-contained.
-# GIFs work here (JVM ImageIO), unlike the macOS native binary. This is the
-# CI/pipeline shape: reproducible browser, no "which Chrome does the runner
-# have" drift.
+# BrewShot in a box — jar-on-JVM + Chromium, with the original one-shot CLI
+# and an additive container-only folder worker. GIFs work here (JVM ImageIO),
+# unlike the macOS native binary. This is the CI/pipeline shape: reproducible
+# browser, no "which Chrome does the runner have" drift.
 #
 #   docker build -t brewshot .
 #   docker run --rm -v "$PWD:/work" brewshot https://example.com -o /work/page.png
@@ -11,8 +11,19 @@
 FROM eclipse-temurin:25-jdk AS build
 WORKDIR /src
 COPY . .
-RUN ./gradlew --no-daemon jar \
-    && cp $(ls build/libs/brewshot-*.jar | grep -v sources) /brewshot.jar
+RUN ./gradlew --no-daemon clean jar \
+    && mkdir -p /out \
+    && jar_path="$(find build/libs -maxdepth 1 -type f -name 'brewshot-*.jar' \
+        ! -name '*-sources.jar' ! -name '*-javadoc.jar' -print -quit)" \
+    && test -n "$jar_path" \
+    && cp "$jar_path" /out/brewshot.jar
+
+RUN mkdir -p /worker-classes \
+    && javac --release 21 -cp /out/brewshot.jar -d /worker-classes \
+        docker/BrewShotFolderWorker.java \
+    && jar --create --file /out/brewshot-worker.jar \
+        --main-class com.brewshot.BrewShotFolderWorker \
+        -C /worker-classes .
 
 # ---- runtime: JRE + chromium + fonts ------------------------------------
 # Alpine, deliberately: Ubuntu/Debian-slim images ship a snap-stub `chromium`
@@ -25,11 +36,29 @@ RUN apk add --no-cache chromium font-liberation ttf-dejavu font-noto-emoji
 ENV BREWSHOT_CHROME=/usr/bin/chromium-browser \
     BREWSHOT_CHROME_ARGS="--no-sandbox --disable-dev-shm-usage"
 
-COPY --from=build /brewshot.jar /opt/brewshot.jar
-# Non-root: chromium + --no-sandbox as root is the worst combination; a
-# dedicated user keeps renderer compromise contained to nothing.
-RUN adduser -D brewshot
-USER brewshot
+# Non-root: chromium + --no-sandbox as root is the worst combination. Fixed
+# numeric ownership also makes the bind-mount contract explicit on Linux.
+RUN addgroup -S -g 10001 brewshot \
+    && adduser -S -D -u 10001 -G brewshot brewshot \
+    && mkdir -p /opt/brewshot \
+        /home/brewshot \
+        /brewshot/input/processing \
+        /brewshot/input/finished \
+        /brewshot/input/failed/pending \
+        /brewshot/output \
+    && chown -R brewshot:brewshot /home/brewshot /brewshot
+
+COPY --from=build /out/brewshot.jar /opt/brewshot/brewshot.jar
+COPY --from=build /out/brewshot-worker.jar /opt/brewshot/brewshot-worker.jar
+COPY docker/entrypoint.sh /opt/brewshot/entrypoint.sh
+RUN chmod 0555 /opt/brewshot/entrypoint.sh \
+    && chmod 0444 /opt/brewshot/brewshot.jar /opt/brewshot/brewshot-worker.jar
+
+USER 10001:10001
+ENV HOME=/home/brewshot
+# Preserve the original container CLI's relative-path contract. Watch mode
+# uses absolute /brewshot/input and /brewshot/output roots, so it does not
+# depend on the process working directory.
 WORKDIR /work
-ENTRYPOINT ["java", "-jar", "/opt/brewshot.jar"]
+ENTRYPOINT ["/opt/brewshot/entrypoint.sh"]
 CMD ["--help"]

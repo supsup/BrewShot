@@ -1,114 +1,164 @@
 package com.brewshot;
 
-import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.attribute.PosixFileAttributeView;
+import java.nio.file.attribute.PosixFilePermission;
 import java.util.List;
-import java.util.stream.Stream;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
-/**
- * The shared artifact-write policy (review brewshot/157). These assert the property that
- * actually matters on failure — the DESTINATION is never left holding partial or destroyed
- * content — rather than merely that a temp file was used.
- */
+/** Transactional artifact-write failure paths, without Chrome or ImageIO. */
 class ArtifactWriterTest {
 
-    /** Files the policy is allowed to leave behind in the output directory. */
-    private static List<String> strays(Path dir, String... artifacts) throws IOException {
-        List<String> expected = List.of(artifacts);
-        try (Stream<Path> s = Files.list(dir)) {
-            return s.map(p -> p.getFileName().toString())
-                .filter(n -> !expected.contains(n))
-                .toList();
+    @Test
+    void injectedPartialWriteLeavesExistingTargetIntactAndNoTempResidue(
+            @TempDir Path directory) throws Exception {
+        Path target = directory.resolve("evidence.png");
+        Files.writeString(target, "complete-old-artifact");
+
+        IOException failure = assertThrows(IOException.class,
+            () -> ArtifactWriter.write(target, temporary -> {
+                Files.writeString(temporary, "partial-new-artifact");
+                throw new IOException("injected write failure");
+            }));
+
+        assertEquals("injected write failure", failure.getMessage());
+        assertEquals("complete-old-artifact", Files.readString(target));
+        try (var files = Files.list(directory)) {
+            assertEquals(List.of(target), files.toList(),
+                "the sibling temporary file must always be cleaned");
         }
     }
 
     @Test
-    void aFailedWriteLeavesThePreviousArtifactIntact(@TempDir Path dir) throws Exception {
-        Path target = dir.resolve("shot.png");
-        Files.writeString(target, "PREVIOUS-GOOD-ARTIFACT");
+    void injectedPartialWriteLeavesNoNewTargetOrTempResidue(@TempDir Path directory) {
+        Path target = directory.resolve("new.json");
 
-        assertThrows(IOException.class, () -> ArtifactWriter.write(target, ".tmp", tmp -> {
-            Files.writeString(tmp, "half-written garba");
-            throw new IOException("simulated capture failure mid-write");
-        }), "the producer's failure must propagate, not be swallowed");
-
-        assertEquals("PREVIOUS-GOOD-ARTIFACT", Files.readString(target),
-            "a failed re-record must not corrupt OR delete the previous good artifact —"
-                + " the defect GifWriter had, where the failure path deleted the destination");
-        assertEquals(List.of(), strays(dir, "shot.png"),
-            "the temp file must be cleaned up after a failed write");
-    }
-
-    @Test
-    void aFailedFirstWriteLeavesNoArtifactAtAll(@TempDir Path dir) throws Exception {
-        Path target = dir.resolve("first.png");
-
-        assertThrows(IOException.class, () -> ArtifactWriter.write(target, ".tmp", tmp -> {
-            Files.writeString(tmp, "partial");
-            throw new IOException("simulated failure");
+        assertThrows(IOException.class, () -> ArtifactWriter.write(target, temporary -> {
+            Files.writeString(temporary, "{\"partial\":");
+            throw new IOException("injected");
         }));
 
-        assertTrue(Files.notExists(target),
-            "a failed FIRST write must not leave a truncated file that reads as a"
-                + " finished artifact");
-        assertEquals(List.of(), strays(dir, "first.png"), "no temp litter");
+        assertFalse(Files.exists(target));
+        try (var files = Files.list(directory)) {
+            assertEquals(0, files.count(), "no target or sibling temp may survive");
+        } catch (IOException e) {
+            throw new AssertionError(e);
+        }
     }
 
     @Test
-    void successfulWritesReplaceContentAndLeaveNoLitter(@TempDir Path dir) throws Exception {
-        Path bytes = dir.resolve("a.bin");
-        Files.writeString(bytes, "old");
-        ArtifactWriter.writeBytes(bytes, new byte[] {1, 2, 3});
-        assertArrayEquals(new byte[] {1, 2, 3}, Files.readAllBytes(bytes));
-        assertEquals(List.of(), strays(dir, "a.bin"));
+    void unsupportedAtomicMoveFallsBackOnlyAfterTheTempArtifactIsComplete(
+            @TempDir Path directory) throws Exception {
+        Path target = directory.resolve("fallback.pdf");
+        Files.writeString(target, "old");
+        AtomicInteger calls = new AtomicInteger();
 
-        Path text = dir.resolve("b.json");
-        ArtifactWriter.writeString(text, "{\"ok\":true}");
-        assertEquals("{\"ok\":true}", Files.readString(text));
-        assertEquals(List.of(), strays(dir, "a.bin", "b.json"));
+        ArtifactWriter.write(target, temporary -> Files.writeString(temporary, "complete"),
+            (temporary, destination, atomic) -> {
+                calls.incrementAndGet();
+                assertEquals("complete", Files.readString(temporary),
+                    "both move attempts see a fully written temporary artifact");
+                if (atomic) {
+                    throw new AtomicMoveNotSupportedException(
+                        temporary.toString(), destination.toString(), "injected");
+                }
+                Files.move(temporary, destination, StandardCopyOption.REPLACE_EXISTING);
+            });
+
+        assertEquals(2, calls.get(), "atomic attempt followed by one non-atomic fallback");
+        assertEquals("complete", Files.readString(target));
+        try (var files = Files.list(directory)) {
+            assertEquals(List.of(target), files.toList());
+        }
     }
 
-    /**
-     * The GIF lane is the one newly-routed writer that is testable browser-free (screenshot
-     * and PDF need Chrome). A real recording must land a valid artifact and leave the output
-     * directory clean — proving the encode genuinely goes through the temp-then-move path.
-     */
     @Test
-    void gifRecordingLandsAtomicallyWithoutLitter(@TempDir Path dir) throws Exception {
-        Path gif = dir.resolve("out.gif");
-        List<byte[]> frames = List.of(png(dir, 1), png(dir, 2));
-        GifWriter.write(frames, 40, gif);
+    void replacingExistingTargetPreservesPosixPermissions(
+            @TempDir Path directory) throws Exception {
+        Path target = directory.resolve("mode-sensitive.json");
+        Files.writeString(target, "old");
+        Assumptions.assumeTrue(
+            Files.getFileAttributeView(target, PosixFileAttributeView.class) != null,
+            "filesystem does not expose POSIX permissions");
+        Set<PosixFilePermission> expected = Set.of(
+            PosixFilePermission.OWNER_READ,
+            PosixFilePermission.OWNER_WRITE,
+            PosixFilePermission.GROUP_READ);
+        Files.setPosixFilePermissions(target, expected);
 
-        assertTrue(Files.size(gif) > 0, "a recording must land a non-empty GIF");
-        byte[] head = Files.readAllBytes(gif);
-        assertEquals('G', head[0] & 0xFF);
-        assertEquals('I', head[1] & 0xFF);
-        assertEquals('F', head[2] & 0xFF);
-        assertEquals(List.of("out.gif"), Files.list(dir)
-                .map(p -> p.getFileName().toString()).filter(n -> n.endsWith(".gif")).toList(),
-            "no temp .gif litter beside the finished recording");
+        ArtifactWriter.writeString(target, "new", StandardCharsets.UTF_8);
+
+        assertEquals("new", Files.readString(target));
+        assertEquals(expected, Files.getPosixFilePermissions(target));
     }
 
-    /** A tiny distinct PNG frame. */
-    private static byte[] png(Path dir, int shade) throws IOException {
-        java.awt.image.BufferedImage img =
-            new java.awt.image.BufferedImage(4, 4, java.awt.image.BufferedImage.TYPE_INT_RGB);
-        java.awt.Graphics2D g = img.createGraphics();
-        g.setColor(new java.awt.Color(shade * 60, shade * 30, shade * 10));
-        g.fillRect(0, 0, 4, 4);
-        g.dispose();
-        Path p = Files.createTempFile(dir, "frame", ".png");
-        javax.imageio.ImageIO.write(img, "png", p.toFile());
-        byte[] bytes = Files.readAllBytes(p);
-        Files.delete(p);
-        return bytes;
+    @Test
+    void relativeLeafSymlinkRemainsAndItsReferentIsReplaced(
+            @TempDir Path directory) throws Exception {
+        Path realDirectory = Files.createDirectory(directory.resolve("real"));
+        Path linkDirectory = Files.createDirectory(directory.resolve("links"));
+        Path referent = realDirectory.resolve("evidence.json");
+        Files.writeString(referent, "old");
+        Path link = linkDirectory.resolve("latest.json");
+        Path relativeTarget = Path.of("../real/evidence.json");
+        createSymlinkOrSkip(link, relativeTarget);
+
+        ArtifactWriter.writeString(link, "new", StandardCharsets.UTF_8);
+
+        assertTrue(Files.isSymbolicLink(link), "the output symlink entry must survive");
+        assertEquals(relativeTarget, Files.readSymbolicLink(link));
+        assertEquals("new", Files.readString(referent));
+        assertEquals("new", Files.readString(link));
+    }
+
+    @Test
+    void brokenAndCyclicSymlinksFailBeforeWriterOrTempCreation(
+            @TempDir Path directory) throws Exception {
+        AtomicBoolean writerCalled = new AtomicBoolean();
+        Path broken = directory.resolve("broken.json");
+        createSymlinkOrSkip(broken, Path.of("missing.json"));
+
+        IOException brokenFailure = assertThrows(IOException.class,
+            () -> ArtifactWriter.write(broken, temporary -> writerCalled.set(true)));
+        assertTrue(brokenFailure.getMessage().contains("broken"), brokenFailure.getMessage());
+        assertFalse(writerCalled.get(), "broken link must fail before invoking the writer");
+
+        Path first = directory.resolve("first.json");
+        Path second = directory.resolve("second.json");
+        createSymlinkOrSkip(first, Path.of("second.json"));
+        createSymlinkOrSkip(second, Path.of("first.json"));
+        IOException cycleFailure = assertThrows(IOException.class,
+            () -> ArtifactWriter.write(first, temporary -> writerCalled.set(true)));
+        assertTrue(cycleFailure.getMessage().contains("cycle"), cycleFailure.getMessage());
+        assertFalse(writerCalled.get(), "cycle must fail before invoking the writer");
+
+        try (var files = Files.list(directory)) {
+            assertTrue(files.noneMatch(path -> path.getFileName().toString().endsWith(".tmp")),
+                "link validation must happen before sibling temp creation");
+        }
+    }
+
+    private static void createSymlinkOrSkip(Path link, Path target) throws Exception {
+        try {
+            Files.createSymbolicLink(link, target);
+        } catch (UnsupportedOperationException | SecurityException | IOException unavailable) {
+            Assumptions.assumeTrue(false,
+                "symbolic links unavailable for this test: " + unavailable);
+        }
     }
 }

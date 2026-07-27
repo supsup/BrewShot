@@ -3,6 +3,7 @@ package com.brewshot;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.text.Normalizer;
 import java.util.Locale;
 
 /**
@@ -19,13 +20,17 @@ import java.util.Locale;
  * </pre>
  *
  * Exit codes: 0 ok · 2 bad arguments · 3 no Chrome found · 4 --fail-js
- * assertion failed (screenshot still written) or a `diff` gate exceeded
+ * assertion failed (output artifact still written) or a `diff` gate exceeded
  * (verdict still written) · 1 runtime failure.
  * Note: the {@code --gif} lane and `diff` are library/jar-path (ImageIO/AWT is
  * not yet supported by native-image on macOS — the CLI refuses/reports this
  * loudly rather than half-working); the PNG shoot path is native-clean.
  */
 public final class Main {
+
+    private static final int CLI_JPEG_QUALITY = 90;
+    static final int MAX_STDIN_HTML_BYTES = 16 * 1024 * 1024;
+    static final int MAX_EVAL_FILE_BYTES = 1024 * 1024;
 
     private Main() { }
 
@@ -65,6 +70,8 @@ public final class Main {
         int height = 900;
         long settleMs = 800;
         String evalExpr = null;
+        int jpegQuality = CLI_JPEG_QUALITY;
+        boolean jpegQualitySet = false;
         String waitJs = null;
         long waitTimeoutMs = 10_000;
         String clipJs = null;
@@ -102,7 +109,8 @@ public final class Main {
                 }
                 case "--settle" -> settleMs = posLong("--settle", requireValue(args, ++i));
                 case "--eval" -> evalExpr = requireValue(args, ++i);
-                case "--eval-file" -> evalExpr = Files.readString(Path.of(requireValue(args, ++i)));
+                case "--eval-file" -> evalExpr = BoundedUtf8.read(
+                    Path.of(requireValue(args, ++i)), MAX_EVAL_FILE_BYTES, "--eval-file");
                 case "--wait-js" -> waitJs = requireValue(args, ++i);
                 case "--wait-timeout" -> waitTimeoutMs = posLong("--wait-timeout", requireValue(args, ++i));
                 case "--clip-js" -> clipJs = requireValue(args, ++i);
@@ -111,6 +119,11 @@ public final class Main {
                 case "--clip-padding" -> clipPadding = nonNegDouble("--clip-padding", requireValue(args, ++i));
                 case "--fail-js" -> failJs = requireValue(args, ++i);
                 case "--json" -> jsonManifest = Path.of(requireValue(args, ++i));
+                case "--jpeg-quality" -> {
+                    jpegQuality = boundedInt(
+                        "--jpeg-quality", requireValue(args, ++i), 1, 100);
+                    jpegQualitySet = true;
+                }
                 case "--cookie" -> {
                     // name=value@domain (domain defaults to localhost)
                     String[] nv = requireValue(args, ++i).split("=", 2);
@@ -163,11 +176,19 @@ public final class Main {
         // exit 0. A .gif output has unambiguous intent now the gif lane exists: refuse and say so.
         if (!gifSet && isGifOutput(out)) {
             return err("-o names a .gif but --gif N was not given — add --gif N to record, "
-                + "or use a raster output (.png/.jpg) for a still");
+                + "or use a raster output (.png/.jpg/.jpeg) for a still");
         }
         if (gifSet) {
+            if (jpegQualitySet) {
+                return err("--jpeg-quality applies only to .jpg/.jpeg still outputs, not GIF");
+            }
             if (gifFrames < 1) { return err("--gif wants a positive frame count, got: " + gifFrames); }
             if (gifDelayMs < 1) { return err("--gif-delay wants a positive ms value, got: " + gifDelayMs); }
+            try {
+                BrewShot.effectiveGifDelayMs(gifDelayMs);
+            } catch (IllegalArgumentException invalidDelay) {
+                return err(invalidDelay.getMessage());
+            }
             if (!outSet) {
                 out = Path.of("brewshot.gif");
             } else if (!isGifOutput(out)) {
@@ -186,6 +207,15 @@ public final class Main {
         // .pdf output is decided by extension, CASE-INSENSITIVELY (an `-o out.PDF` that fell
         // through to the raster path would write PNG bytes into a .PDF file and report success).
         boolean pdfOut = isPdfOutput(out);
+        boolean jpegOut = isJpegOutput(out);
+        boolean pngOut = isPngOutput(out);
+        if (!gifSet && !pdfOut && !jpegOut && !pngOut) {
+            return err("unsupported output extension: " + out
+                + " (use .png, .jpg/.jpeg, .pdf, or .gif with --gif N)");
+        }
+        if (jpegQualitySet && !jpegOut) {
+            return err("--jpeg-quality applies only to .jpg/.jpeg still outputs");
+        }
         // Raster-only flags cannot be honored on the paged PDF path, and the .pdf branch runs
         // FIRST, so they would be silently ignored — a full-page PDF where the caller asked for a
         // crop. BrewShot output is review evidence, so refuse LOUDLY (exit 2) rather than emit a
@@ -193,19 +223,14 @@ public final class Main {
         if (pdfOut && (clipSelector != null || clipJs != null || scale != 1.0 || clipPadding != 0)) {
             return err("clip/scale flags are raster-only and cannot apply to a .pdf output "
                 + "(PDF is paged, not clipped) — drop --clip-selector/--clip-js/--scale/--clip-padding, "
-                + "or write a raster format (.png/.jpg)");
+                + "or write a raster format (.png/.jpg/.jpeg)");
         }
-
-        // Fix (review brewshot/153): the capture lane is destructively aliasable too — the
-        // primary -o artifact and the --json manifest were written to their paths with no
-        // pre-launch distinctness check, so `-o page.png --json page.png` replaced the
-        // screenshot with JSON and still exited 0. Share the diff lane's pairwise preflight:
-        // reject an aliased -o/--json HERE, BEFORE decode / Chrome launch (before
-        // BrewShot.available()), so the alias never costs a browser start.
-        String captureAliasErr = outputAliasError(
-            new Path[] {out, jsonManifest}, new String[] {"-o", "--json"});
-        if (captureAliasErr != null) {
-            return err(captureAliasErr);
+        if (jsonManifest != null) {
+            try {
+                requireDistinctPaths("-o", out, "--json", jsonManifest);
+            } catch (IllegalArgumentException | java.io.IOException aliasFailure) {
+                return err(aliasFailure.getMessage());
+            }
         }
 
         // Resolve the input MODE before touching Chrome, so arg mistakes fail
@@ -215,6 +240,16 @@ public final class Main {
         else if (input.matches("^[a-z][a-z0-9+.-]*://.*")) { mode = "url"; }
         else if (Files.exists(Path.of(input))) { mode = "file"; }
         else { return err("not a URL, an existing file, or '-': " + input); }
+
+        String stdinHtml = null;
+        if (mode.equals("stdin")) {
+            try {
+                stdinHtml = BoundedUtf8.read(
+                    System.in, MAX_STDIN_HTML_BYTES, "stdin HTML");
+            } catch (java.io.IOException tooLarge) {
+                return err(tooLarge.getMessage());
+            }
+        }
 
         if (!BrewShot.available()) {
             System.err.println("brewshot: no Chrome/Chromium found (set BREWSHOT_CHROME)");
@@ -231,8 +266,7 @@ public final class Main {
             if (mediaType != null) { shot.media(mediaType); }
             if (reducedMotion) { shot.reducedMotion("reduce"); }
             switch (mode) {
-                case "stdin" -> shot.html(new String(
-                    System.in.readAllBytes(), StandardCharsets.UTF_8));
+                case "stdin" -> shot.html(stdinHtml);
                 case "url" -> shot.open(input);
                 default -> shot.open(Path.of(input).toAbsolutePath().toUri().toString());
             }
@@ -280,9 +314,11 @@ public final class Main {
                     System.err.println("brewshot: " + e.getMessage());
                     return 1;
                 }
-                atomicWriteBytes(out, shot.screenshotClip(
+                ArtifactWriter.writeBytes(out, shot.screenshotClip(
                     Math.max(0, b[0] - clipPadding), Math.max(0, b[1] - clipPadding),
-                    b[2] + 2 * clipPadding, b[3] + 2 * clipPadding, scale));
+                    b[2] + 2 * clipPadding, b[3] + 2 * clipPadding, scale,
+                    jpegOut ? BrewShot.ImageFormat.JPEG : BrewShot.ImageFormat.PNG,
+                    jpegOut ? jpegQuality : 0));
             } else if (clipJs != null) {
                 Object r = shot.eval(clipJs);
                 Object x = MiniJson.get(r, "x"), y = MiniJson.get(r, "y");
@@ -291,9 +327,11 @@ public final class Main {
                         || !(w instanceof Double) || !(h instanceof Double)) {
                     return err("--clip-js must return {x,y,w,h} (page coordinates), got: " + r);
                 }
-                atomicWriteBytes(out, shot.screenshotClip(
+                ArtifactWriter.writeBytes(out, shot.screenshotClip(
                     Math.max(0, (Double) x - clipPadding), Math.max(0, (Double) y - clipPadding),
-                    (Double) w + 2 * clipPadding, (Double) h + 2 * clipPadding, scale));
+                    (Double) w + 2 * clipPadding, (Double) h + 2 * clipPadding, scale,
+                    jpegOut ? BrewShot.ImageFormat.JPEG : BrewShot.ImageFormat.PNG,
+                    jpegOut ? jpegQuality : 0));
             } else if (scale != 1.0) {
                 // Standalone --scale: clip the full PAGE box (scroll dimensions, not just the
                 // viewport) at scale — crisp full-page stills with zero extra flags. Chrome's
@@ -301,10 +339,14 @@ public final class Main {
                 Object dims = shot.eval("[document.documentElement.scrollWidth,"
                     + "document.documentElement.scrollHeight].join(',')");
                 String[] wh = String.valueOf(dims).split(",");
-                atomicWriteBytes(out, shot.screenshotClip(0, 0,
-                    Double.parseDouble(wh[0]), Double.parseDouble(wh[1]), scale));
+                ArtifactWriter.writeBytes(out, shot.screenshotClip(0, 0,
+                    Double.parseDouble(wh[0]), Double.parseDouble(wh[1]), scale,
+                    jpegOut ? BrewShot.ImageFormat.JPEG : BrewShot.ImageFormat.PNG,
+                    jpegOut ? jpegQuality : 0));
             } else {
-                shot.screenshot(out);
+                shot.screenshot(out,
+                    jpegOut ? BrewShot.ImageFormat.JPEG : BrewShot.ImageFormat.PNG,
+                    jpegOut ? jpegQuality : 0);
             }
             // --fail-js: assert AFTER the screenshot so failures still carry eyes.
             if (failJs != null) {
@@ -314,12 +356,13 @@ public final class Main {
             if (jsonManifest != null) {
                 writeManifest(jsonManifest, input, mode, width, height, settleMs, waitJs,
                     out, evalResult, failJs, failJsPassed,
-                    System.currentTimeMillis() - t0);
+                    System.currentTimeMillis() - t0, gifSet ? gifDelayMs : null,
+                    jpegOut ? jpegQuality : null);
             }
             System.err.println("brewshot: wrote " + out);
         }
         if (!failJsPassed) {
-            System.err.println("brewshot: --fail-js assertion FAILED (screenshot still written): "
+            System.err.println("brewshot: --fail-js assertion FAILED (output artifact still written): "
                 + failJs);
             return 4;
         }
@@ -341,13 +384,7 @@ public final class Main {
     private static int runDiff(String[] args) {
         java.util.List<Path> images = new java.util.ArrayList<>(2);
         int tolerance = BrewShotDiff.DEFAULT_TOLERANCE;
-        boolean toleranceSet = false;
-        // F-04 (audit, Charles's call): the CLI now defaults to STRICT / pixel-honest. AA
-        // forgiveness silently swallowed a real 1-pixel layout move (a genuine regression
-        // passed as zero changes), so it is OPT-IN via --ignore-antialiasing (default OFF).
-        // --pixel-exact stays as the byte-exact shorthand (tolerance 0 AND no AA forgiveness).
-        boolean ignoreAntialiasing = false;
-        boolean pixelExact = false;
+        boolean ignoreAntialiasing = true;   // Fix's call (brewshot #25): AA-ignore ON by default
         java.util.List<int[]> masks = new java.util.ArrayList<>();
         Double failOverPct = null;
         Long failPixels = null;
@@ -356,26 +393,22 @@ public final class Main {
         try {
             for (int i = 0; i < args.length; i++) {
                 switch (args[i]) {
-                    case "--tolerance" -> {
-                        tolerance = posInt("--tolerance", requireValue(args, ++i));
-                        toleranceSet = true;
-                    }
-                    // F-04: AA forgiveness is OPT-IN now (default strict). This flag turns the
-                    // 3x3 shifted-edge heuristic ON; everything it forgives is still counted and
-                    // printed in the verdict — nothing is silently eaten.
-                    case "--ignore-antialiasing" -> ignoreAntialiasing = true;
-                    // --pixel-exact = byte-exact: tolerance 0 AND no AA forgiveness. Reconciled
-                    // against the strict default below (contradicts --ignore-antialiasing / a
-                    // non-zero --tolerance).
-                    case "--pixel-exact" -> pixelExact = true;
+                    case "--tolerance" -> tolerance =
+                        boundedInt("--tolerance", requireValue(args, ++i), 0, 254);
+                    // AA forgiveness is ON by default; --pixel-exact is the opt-OUT for
+                    // byte-faithful comparisons (every ignored pixel is counted either way).
+                    case "--pixel-exact" -> ignoreAntialiasing = false;
                     case "--mask" -> {
                         String[] p = requireValue(args, ++i).split(",");
                         if (p.length != 4) { return err("--mask wants x,y,w,h"); }
-                        masks.add(new int[] {posInt("--mask x", p[0].trim()), posInt("--mask y", p[1].trim()),
+                        masks.add(new int[] {intValue("--mask x", p[0].trim()),
+                            intValue("--mask y", p[1].trim()),
                             posInt("--mask w", p[2].trim()), posInt("--mask h", p[3].trim())});
                     }
-                    case "--fail-over" -> failOverPct = nonNegDouble("--fail-over", requireValue(args, ++i));
-                    case "--fail-pixels" -> failPixels = posLong("--fail-pixels", requireValue(args, ++i));
+                    case "--fail-over" -> failOverPct =
+                        boundedDouble("--fail-over", requireValue(args, ++i), 0, 100);
+                    case "--fail-pixels" -> failPixels =
+                        nonNegLong("--fail-pixels", requireValue(args, ++i));
                     case "--diff-out" -> diffOut = Path.of(requireValue(args, ++i));
                     case "--json" -> jsonOut = Path.of(requireValue(args, ++i));
                     case "-h", "--help" -> { diffUsage(); return 0; }
@@ -390,37 +423,19 @@ public final class Main {
         } catch (IllegalArgumentException e) {
             return err(e.getMessage());
         }
+        if (diffOut != null && !isPngOutput(diffOut)) {
+            return err("--diff-out writes PNG and requires a .png output path, got: " + diffOut);
+        }
         if (images.size() != 2) {
             diffUsage();
             return 2;
         }
-        // F-04 reconciliation: --pixel-exact (byte-exact) means strict AND tolerance 0. It
-        // contradicts --ignore-antialiasing (opt-in forgiveness) and a non-zero --tolerance —
-        // refuse the contradiction LOUD rather than silently picking a winner.
-        if (pixelExact) {
-            if (ignoreAntialiasing) {
-                return err("--pixel-exact (byte-exact) and --ignore-antialiasing are contradictory"
-                    + " (one demands an exact compare, the other forgives shifted edges) — pick one");
-            }
-            if (toleranceSet && tolerance != 0) {
-                return err("--pixel-exact implies tolerance 0 (byte-exact); drop --tolerance or set"
-                    + " it to 0, got: " + tolerance);
-            }
-            tolerance = 0;
-        }
-        // F-05 (audit): artifact-alias preflight. A sidecar (--json / --diff-out) aliasing an
-        // INPUT (or the other sidecar) would overwrite/destroy it and still exit 0. Reject the
-        // collision here, BEFORE any image is decoded.
-        String aliasErr = diffPathAliasError(images.get(0), images.get(1), jsonOut, diffOut);
-        if (aliasErr != null) {
-            return err(aliasErr);
-        }
         BrewShotDiff.Options options;
         try {
-            // F-03: the compact constructor range-checks tolerance; surface it as exit 2.
-            options = new BrewShotDiff.Options(tolerance, ignoreAntialiasing, java.util.List.copyOf(masks));
-        } catch (IllegalArgumentException e) {
-            return err(e.getMessage());
+            options = new BrewShotDiff.Options(
+                tolerance, ignoreAntialiasing, java.util.List.copyOf(masks));
+        } catch (IllegalArgumentException invalidOptions) {
+            return err(invalidOptions.getMessage());
         }
         DiffJob job = new DiffJob(images.get(0), images.get(1), options,
             failOverPct, failPixels, diffOut, jsonOut);
@@ -435,24 +450,18 @@ public final class Main {
      * image could not be read.
      */
     static int runDiffJobs(java.util.List<DiffJob> jobs) {
+        // Preflight the complete batch before reading or writing any job. A
+        // sidecar/heatmap must never replace another artifact or either source
+        // baseline, including through normalized spellings, symlinks, or hard
+        // links that Files.isSameFile can identify.
+        try {
+            requireDistinctDiffPaths(jobs);
+        } catch (IllegalArgumentException | java.io.IOException aliasFailure) {
+            return err(aliasFailure.getMessage());
+        }
+
         int worst = 0;
         for (DiffJob job : jobs) {
-            // PNG size-limit preflight (audit): inspect each INPUT's DECLARED dimensions via an
-            // ImageIO reader header BEFORE the full decode / pixel-array allocation, so a
-            // decompression-bomb-scale image is a LOUD refusal (exit 2), not an OOM.
-            try {
-                checkImageWithinLimits(job.a());
-                checkImageWithinLimits(job.b());
-            } catch (ImageTooLargeException e) {
-                System.err.println("brewshot: " + e.getMessage());
-                worst = Math.max(worst, 2);
-                continue;
-            } catch (java.io.IOException e) {
-                // A header-read failure is the same class the decode below reports (exit 1).
-                System.err.println("brewshot: " + e.getMessage());
-                worst = Math.max(worst, 1);
-                continue;
-            }
             java.awt.image.BufferedImage a;
             java.awt.image.BufferedImage b;
             try {
@@ -480,8 +489,9 @@ public final class Main {
             // it (each artifact fails independently; the verdict line above always printed).
             if (job.jsonOut() != null) {
                 try {
-                    atomicWriteString(job.jsonOut(),
-                        BrewShotDiff.toJson(verdict, job.failOverPct(), job.failPixels(), exceeded));
+                    ArtifactWriter.writeString(job.jsonOut(),
+                        BrewShotDiff.toJson(verdict, job.failOverPct(), job.failPixels(), exceeded),
+                        StandardCharsets.UTF_8);
                     System.err.println("brewshot: wrote " + job.jsonOut());
                 } catch (java.io.IOException e) {
                     System.err.println("brewshot: failed writing json sidecar: " + e.getMessage());
@@ -490,7 +500,14 @@ public final class Main {
             }
             if (job.diffOut() != null && !verdict.sizeMismatch()) {
                 try {
-                    atomicWritePng(BrewShotDiff.heatmap(a, b, job.options()), job.diffOut());
+                    ArtifactWriter.write(job.diffOut(), temporary -> {
+                        boolean written = javax.imageio.ImageIO.write(
+                            BrewShotDiff.heatmap(a, b, job.options()),
+                            "png", temporary.toFile());
+                        if (!written) {
+                            throw new java.io.IOException("no PNG writer available");
+                        }
+                    });
                     System.err.println("brewshot: wrote " + job.diffOut());
                 } catch (java.io.IOException e) {
                     System.err.println("brewshot: failed writing diff heatmap: " + e.getMessage());
@@ -519,330 +536,204 @@ public final class Main {
         return img;
     }
 
-    // ---- F-05: artifact-alias preflight + atomic sidecar writes -------------------------
-
-    /**
-     * F-05 (audit): the diff sidecars (--json, --diff-out) are written straight to their
-     * paths, so pointing one at an INPUT (or at the other sidecar) overwrote it and still
-     * exited 0 — a silent, destructive alias. Normalize every KNOWN path to an absolute,
-     * lexically-canonical form and require the aliasable pairs distinct. The two INPUTS may
-     * be equal (self-compare is legitimate); only output↔input and output↔output collisions
-     * are rejected. Returns an error message, or {@code null} when clean.
-     */
-    private static String diffPathAliasError(Path a, Path b, Path jsonOut, Path diffOut) {
-        if (jsonOut != null && (sameOutputTarget(jsonOut, a) || sameOutputTarget(jsonOut, b))) {
-            return "--json would overwrite a diff INPUT (" + jsonOut + ") — writing the verdict"
-                + " there destroys the image being compared; choose a distinct path";
-        }
-        if (diffOut != null && (sameOutputTarget(diffOut, a) || sameOutputTarget(diffOut, b))) {
-            return "--diff-out would overwrite a diff INPUT (" + diffOut + ") — writing the heatmap"
-                + " there destroys the image being compared; choose a distinct path";
-        }
-        // The OUTPUT↔OUTPUT distinctness (json vs heatmap) is the same pairwise check the capture
-        // lane needs, so it routes through the shared helper — one preflight, two lanes.
-        return outputAliasError(new Path[] {jsonOut, diffOut}, new String[] {"--json", "--diff-out"});
-    }
-
-    /**
-     * Fix (review brewshot/153): the pairwise OUTPUT-distinctness preflight SHARED by both lanes.
-     * Every non-null path in {@code outputs} must canonicalize distinct; the first collision is
-     * reported by its slot labels. Browser-free and package-visible so the capture lane can reject
-     * an aliased {@code -o}/{@code --json} BEFORE decode / Chrome launch — the same seam the diff
-     * lane already uses for {@code --json}↔{@code --diff-out}. Returns an error message, or
-     * {@code null} when every declared output is distinct. Inputs are NOT included here (a diff
-     * self-compare legitimately passes the same image twice; that lane guards inputs separately).
-     */
-    static String outputAliasError(Path[] outputs, String[] labels) {
-        for (int i = 0; i < outputs.length; i++) {
-            if (outputs[i] == null) {
-                continue;
-            }
-            for (int j = i + 1; j < outputs.length; j++) {
-                if (outputs[j] == null) {
-                    continue;
-                }
-                if (sameOutputTarget(outputs[i], outputs[j])) {
-                    return labels[i] + " and " + labels[j] + " point at the same file ("
-                        + outputs[i] + ") — the second write would clobber the first; choose"
-                        + " distinct paths";
-                }
-            }
-        }
-        return null;
-    }
-
-    /**
-     * True when two declared outputs would land on the SAME file. Lexical comparison is not
-     * enough (review brewshot/157): a case variant on a case-insensitive filesystem and a
-     * symlink both denote one file under two spellings, so the second write still clobbers
-     * the first. Three channels, cheapest first:
-     *
-     * <ol>
-     *   <li>both targets already exist — {@link Files#isSameFile} settles it for symlinks,
-     *       hard links, and case-insensitive filesystems in one syscall;</li>
-     *   <li>otherwise compare PROSPECTIVE keys: the deepest existing ancestor resolved with
-     *       {@code toRealPath()} (which collapses symlinked parent directories) plus the
-     *       not-yet-created trailing names;</li>
-     *   <li>if those keys differ only by case, ask the filesystem that will actually hold
-     *       them whether it is case-insensitive — the case Marlow's probe hit, where BOTH
-     *       targets are absent so channel 1 cannot fire.</li>
-     * </ol>
-     */
-    private static boolean sameOutputTarget(Path a, Path b) {
-        try {
-            if (Files.exists(a) && Files.exists(b)) {
-                return Files.isSameFile(a, b);
-            }
-        } catch (java.io.IOException ignored) {
-            // Unreadable target — fall through to the prospective comparison below.
-        }
-        Path ka = prospectiveKey(a);
-        Path kb = prospectiveKey(b);
-        if (ka.equals(kb)) {
-            return true;
-        }
-        if (ka.toString().equalsIgnoreCase(kb.toString())) {
-            return caseInsensitiveAt(deepestExistingAncestor(ka));
-        }
-        return false;
-    }
-
-    /**
-     * Absolute key for a target that need not exist yet: the deepest EXISTING ancestor with
-     * symlinks resolved, plus the residual names appended lexically. A symlink standing in
-     * for the file itself is followed first (one bounded hop chain), so {@code -o link} and
-     * {@code --json target} key alike.
-     */
-    private static Path prospectiveKey(Path p) {
-        Path abs = p.toAbsolutePath().normalize();
-        for (int hop = 0; hop < 16 && Files.isSymbolicLink(abs); hop++) {
-            try {
-                Path t = Files.readSymbolicLink(abs);
-                abs = (t.isAbsolute() ? t : abs.getParent().resolve(t)).normalize();
-            } catch (java.io.IOException e) {
-                break;
-            }
-        }
-        Path existing = deepestExistingAncestor(abs);
-        if (existing == null) {
-            return abs;
-        }
-        try {
-            return existing.toRealPath().resolve(existing.relativize(abs)).normalize();
-        } catch (java.io.IOException e) {
-            return abs;
-        }
-    }
-
-    /** The nearest ancestor of {@code abs} (inclusive) that exists on disk, or null. */
-    private static Path deepestExistingAncestor(Path abs) {
-        for (Path c = abs; c != null; c = c.getParent()) {
-            if (Files.exists(c)) {
-                return c;
-            }
-        }
-        return null;
-    }
-
-    /**
-     * Probe whether the filesystem holding {@code dir} folds case, by creating a mixed-case
-     * temp file and asking whether its lower-cased spelling resolves to the same file. This is
-     * a real probe rather than an OS guess because case sensitivity is a per-MOUNT property —
-     * a case-sensitive volume can be mounted on a case-insensitive host and vice versa.
-     * Fails CLOSED (reports "insensitive", so the pair is rejected as an alias) when the probe
-     * cannot run: a spurious "choose distinct paths" is a nuisance, while a missed alias
-     * destroys the primary capture, which is the whole defect this guard exists to prevent.
-     */
-    private static boolean caseInsensitiveAt(Path dir) {
-        Path probeDir = (dir != null && Files.isDirectory(dir)) ? dir : null;
-        if (probeDir == null && dir != null) {
-            probeDir = dir.getParent();
-        }
-        if (probeDir == null || !Files.isDirectory(probeDir)) {
-            return true;
-        }
-        Path probe = null;
-        try {
-            probe = Files.createTempFile(probeDir, "BrewShotCase", ".Tmp");
-            Path lowered = probe.resolveSibling(
-                probe.getFileName().toString().toLowerCase(java.util.Locale.ROOT));
-            return Files.exists(lowered);
-        } catch (java.io.IOException | RuntimeException e) {
-            return true;
-        } finally {
-            if (probe != null) {
-                try {
-                    Files.deleteIfExists(probe);
-                } catch (java.io.IOException ignored) {
-                    // Best effort; a stray probe file never affects correctness.
-                }
-            }
-        }
-    }
-
-    // Artifact writes route through ArtifactWriter -- ONE temp-then-atomic policy shared with
-    // the capture lane (BrewShot screenshot/PDF) and GifWriter, per review brewshot/157.
-
-    private static void atomicWriteString(Path target, String body) throws java.io.IOException {
-        ArtifactWriter.writeString(target, body);
-    }
-
-    private static void atomicWriteBytes(Path target, byte[] body) throws java.io.IOException {
-        ArtifactWriter.writeBytes(target, body);
-    }
-
-    private static void atomicWritePng(java.awt.image.BufferedImage img, Path target)
-            throws java.io.IOException {
-        ArtifactWriter.writePng(img, target);
-    }
-
-    // ---- PNG size-limit properties (audit): reject a decompression-bomb input pre-decode ---
-
-    /** An input image whose DECLARED dimensions blow a configured ceiling (rejected exit 2). */
-    private static final class ImageTooLargeException extends Exception {
-        ImageTooLargeException(String message) { super(message); }
-    }
-
-    /** Max px per axis for a diff input; default 16384, override -Dbrewshot.maxImageDimension=N. */
-    private static long maxImageDimension() {
-        return Long.getLong("brewshot.maxImageDimension", 16_384L);
-    }
-
-    /** Max total area (w*h) for a diff input; default 64 MP, override -Dbrewshot.maxImagePixels=N. */
-    private static long maxImagePixels() {
-        return Long.getLong("brewshot.maxImagePixels", 67_108_864L);
-    }
-
-    /**
-     * Reject an oversized diff INPUT BEFORE the full decode. Reads only the header via an
-     * ImageIO {@link javax.imageio.ImageReader} (getWidth/getHeight — no pixel decode, no
-     * {@code w*h} array), so a decompression-bomb-scale image is refused without the
-     * allocation. Properties are read FRESH each call (a test can set them via
-     * System.setProperty). A file with no registered reader is left for {@link #readImage}
-     * to report canonically (exit 1), so the "not an image" path is unchanged.
-     */
-    private static void checkImageWithinLimits(Path p) throws ImageTooLargeException, java.io.IOException {
-        try (javax.imageio.stream.ImageInputStream iis =
-                 javax.imageio.ImageIO.createImageInputStream(p.toFile())) {
-            if (iis == null) {
-                return;
-            }
-            java.util.Iterator<javax.imageio.ImageReader> readers =
-                javax.imageio.ImageIO.getImageReaders(iis);
-            if (!readers.hasNext()) {
-                return;
-            }
-            javax.imageio.ImageReader reader = readers.next();
-            try {
-                reader.setInput(iis, true, true);
-                long w = reader.getWidth(0);
-                long h = reader.getHeight(0);
-                long maxDim = maxImageDimension();
-                long maxPix = maxImagePixels();
-                if (w > maxDim || h > maxDim) {
-                    throw new ImageTooLargeException(p + ": " + w + "x" + h
-                        + " exceeds the per-axis limit brewshot.maxImageDimension=" + maxDim
-                        + " px — raise it with -Dbrewshot.maxImageDimension=N");
-                }
-                if (w * h > maxPix) {
-                    throw new ImageTooLargeException(p + ": " + w + "x" + h + " = " + (w * h)
-                        + " px exceeds the area limit brewshot.maxImagePixels=" + maxPix
-                        + " — raise it with -Dbrewshot.maxImagePixels=N");
-                }
-            } finally {
-                reader.dispose();
-            }
-        }
-    }
-
     private static void diffUsage() {
         System.err.println("""
             brewshot diff — compare two PNGs into a citable textual verdict
 
-            usage: brewshot diff a.png b.png [--tolerance N] [--ignore-antialiasing]
-                                 [--pixel-exact] [--mask x,y,w,h]... [--fail-over PCT]
-                                 [--fail-pixels N] [--diff-out diff.png] [--json verdict.json]
+            usage: brewshot diff a.png b.png [--tolerance N] [--pixel-exact]
+                                 [--mask x,y,w,h]... [--fail-over PCT] [--fail-pixels N]
+                                 [--diff-out diff.png] [--json verdict.json]
 
-              --tolerance    per-channel delta floor 0..254; at/below never counts (default 16;
-                             255 is refused — it would suppress every change, exit 2)
-              --ignore-antialiasing
-                             OPT IN to anti-aliasing forgiveness (a 3x3 shifted-edge
-                             heuristic; default OFF / strict so a 1-pixel layout move is
-                             never silently swallowed). Whatever it forgives is counted
-                             and printed in the verdict — nothing is silently eaten
-              --pixel-exact  byte-exact compare: tolerance 0 AND no AA forgiveness (the
-                             default is already strict; this also zeroes the delta floor)
+              --tolerance    per-channel delta floor, 0-254; at/below never
+                             counts                                      (default 16)
+              --pixel-exact  DISABLE the default anti-aliasing forgiveness (a 3x3
+                             shifted-edge heuristic; whatever it ignores is counted
+                             and printed in the verdict — nothing is silently eaten)
               --mask         exclude a region on both images (dynamic content —
                              clocks, spinners); repeatable
-              --fail-over    exit 4 when changed%% exceeds PCT (verdict still written)
+              --fail-over    exit 4 when changed%% exceeds PCT, 0-100
+                             (verdict still written)
               --fail-pixels  exit 4 when changed pixels exceed N (verdict still written)
               --diff-out     write a heatmap PNG (base dimmed, changes magenta)
               --json         write the machine-readable verdict sidecar
 
-            The two inputs and any --json/--diff-out target must be distinct paths (an alias
-            that would overwrite an input is refused, exit 2). Input dimensions are capped
-            (brewshot.maxImageDimension=16384 px/axis, brewshot.maxImagePixels=67108864 area;
-            raise via -D). A size mismatch renders an explicit sizeMismatch verdict (never a
-            crash); under any --fail-* gate it exits 4. Uses ImageIO (JVM/jar path — the same
+            A size mismatch renders an explicit sizeMismatch verdict (never a crash);
+            under any --fail-* gate it exits 4. Uses ImageIO (JVM/jar path — the same
             caveat as GIF recording; not the macOS native binary).""");
     }
 
     /** The machine-readable sidecar CI/agent wrappers want beside the PNG. */
-    private static void writeManifest(Path manifest, String input, String mode,
+    static void writeManifest(Path manifest, String input, String mode,
             int width, int height, long settleMs, String waitJs, Path out,
-            Object evalResult, String failJs, boolean failJsPassed, long elapsedMs)
+            Object evalResult, String failJs, boolean failJsPassed, long elapsedMs,
+            Integer requestedGifDelayMs, Integer jpegQuality)
             throws java.io.IOException {
-        StringBuilder j = new StringBuilder(256);
-        j.append("{\n")
-         .append("  \"input\": \"").append(MiniJson.esc(input)).append("\",\n")
-         .append("  \"mode\": \"").append(mode).append("\",\n")
-         .append("  \"viewport\": \"").append(width).append('x').append(height).append("\",\n")
-         .append("  \"settleMs\": ").append(settleMs).append(",\n")
-         .append("  \"waitJs\": ").append(waitJs == null ? "null"
-             : '"' + MiniJson.esc(waitJs) + '"').append(",\n")
-         .append("  \"out\": \"").append(MiniJson.esc(out.toString())).append("\",\n")
-         .append("  \"outBytes\": ").append(Files.size(out)).append(",\n")
-         .append("  \"eval\": ").append(evalResult == null ? "null"
-             : '"' + MiniJson.esc(String.valueOf(evalResult)) + '"').append(",\n")
-         .append("  \"failJs\": ").append(failJs == null ? "null"
-             : '"' + MiniJson.esc(failJs) + '"').append(",\n")
-         .append("  \"failJsPassed\": ").append(failJsPassed).append(",\n")
-         .append("  \"elapsedMs\": ").append(elapsedMs).append(",\n")
-         .append("  \"brewshot\": \"").append(BrewShot.VERSION).append("\"\n")
-         .append("}\n");
-        // Temp-then-atomic, matching the diff lane (Fix, review brewshot/153): the manifest
-        // lands whole or not at all, never a half-written sidecar beside the screenshot.
-        atomicWriteString(manifest, j.toString());
+        java.util.Map<String, Object> fields = new java.util.LinkedHashMap<>();
+        fields.put("input", input);
+        fields.put("mode", mode);
+        fields.put("viewport", width + "x" + height);
+        fields.put("settleMs", settleMs);
+        fields.put("waitJs", waitJs);
+        fields.put("out", out.toString());
+        fields.put("outBytes", Files.size(out));
+        fields.put("eval", evalResult);
+        fields.put("failJs", failJs);
+        fields.put("failJsPassed", failJsPassed);
+        fields.put("elapsedMs", elapsedMs);
+        if (requestedGifDelayMs != null) {
+            fields.put("gifDelayMsRequested", requestedGifDelayMs);
+            fields.put("gifDelayMsEncoded",
+                BrewShot.effectiveGifDelayMs(requestedGifDelayMs));
+        }
+        if (jpegQuality != null) {
+            fields.put("jpegQuality", jpegQuality);
+        }
+        fields.put("brewshot", BrewShot.VERSION);
+        ArtifactWriter.writeString(
+            manifest, MiniJson.stringifyPretty(fields) + "\n", StandardCharsets.UTF_8);
     }
 
     private static int posInt(String flag, String v) {
-        try { return Integer.parseInt(v); }
+        int value;
+        try { value = Integer.parseInt(v); }
         catch (NumberFormatException e) { throw new IllegalArgumentException(flag + " wants a number, got: " + v); }
+        return Validation.positiveInt(flag, value);
     }
 
     private static long posLong(String flag, String v) {
-        try { return Long.parseLong(v); }
+        long value;
+        try { value = Long.parseLong(v); }
         catch (NumberFormatException e) { throw new IllegalArgumentException(flag + " wants a number (ms), got: " + v); }
+        return Validation.positiveLong(flag, value);
+    }
+
+    private static long nonNegLong(String flag, String v) {
+        long value;
+        try { value = Long.parseLong(v); }
+        catch (NumberFormatException e) {
+            throw new IllegalArgumentException(flag + " wants a number, got: " + v);
+        }
+        return Validation.nonNegativeLong(flag, value);
+    }
+
+    private static int intValue(String flag, String v) {
+        try { return Integer.parseInt(v); }
+        catch (NumberFormatException e) {
+            throw new IllegalArgumentException(flag + " wants an integer, got: " + v);
+        }
+    }
+
+    private static int boundedInt(String flag, String v, int min, int max) {
+        int value = intValue(flag, v);
+        return Validation.intRange(flag, value, min, max);
     }
 
     private static double posDouble(String flag, String v) {
         double d;
         try { d = Double.parseDouble(v); }
         catch (NumberFormatException e) { throw new IllegalArgumentException(flag + " wants a number, got: " + v); }
-        if (!Double.isFinite(d) || d <= 0) {
-            throw new IllegalArgumentException(flag + " wants a positive number, got: " + v);
-        }
-        return d;
+        return Validation.positiveFinite(flag, d);
     }
 
     private static double nonNegDouble(String flag, String v) {
         double d;
         try { d = Double.parseDouble(v); }
         catch (NumberFormatException e) { throw new IllegalArgumentException(flag + " wants a number, got: " + v); }
-        if (!Double.isFinite(d) || d < 0) {
-            throw new IllegalArgumentException(flag + " wants a non-negative number, got: " + v);
+        return Validation.nonNegativeFinite(flag, d);
+    }
+
+    private static double boundedDouble(String flag, String v, double min, double max) {
+        double d;
+        try { d = Double.parseDouble(v); }
+        catch (NumberFormatException e) {
+            throw new IllegalArgumentException(flag + " wants a number, got: " + v);
         }
-        return d;
+        return Validation.finiteRange(flag, d, min, max);
+    }
+
+    private static void requireDistinctPaths(
+            String firstRole, Path first, String secondRole, Path second)
+            throws java.io.IOException {
+        if (first == null || second == null) {
+            return;
+        }
+        if (pathsAlias(first, second)) {
+            throw new IllegalArgumentException(
+                firstRole + " and " + secondRole
+                    + " must name different files, but both resolve to " + first);
+        }
+    }
+
+    private record NamedPath(String role, Path path) { }
+
+    /**
+     * Compare the entire future batch, not only one job at a time: an early
+     * job's output cannot overwrite a later baseline before that job reads it,
+     * and no two sidecars/heatmaps may overwrite each other.
+     */
+    private static void requireDistinctDiffPaths(java.util.List<DiffJob> jobs)
+            throws java.io.IOException {
+        java.util.List<NamedPath> outputs = new java.util.ArrayList<>();
+        java.util.List<NamedPath> inputs = new java.util.ArrayList<>();
+        for (int index = 0; index < jobs.size(); index++) {
+            DiffJob job = jobs.get(index);
+            String prefix = "diff job " + (index + 1) + " ";
+            inputs.add(new NamedPath(prefix + "first input", job.a()));
+            inputs.add(new NamedPath(prefix + "second input", job.b()));
+            if (job.jsonOut() != null) {
+                outputs.add(new NamedPath(prefix + "--json", job.jsonOut()));
+            }
+            if (job.diffOut() != null) {
+                outputs.add(new NamedPath(prefix + "--diff-out", job.diffOut()));
+            }
+        }
+        for (int first = 0; first < outputs.size(); first++) {
+            for (int second = first + 1; second < outputs.size(); second++) {
+                NamedPath a = outputs.get(first);
+                NamedPath b = outputs.get(second);
+                requireDistinctPaths(a.role(), a.path(), b.role(), b.path());
+            }
+        }
+        for (NamedPath output : outputs) {
+            for (NamedPath input : inputs) {
+                requireDistinctPaths(
+                    output.role(), output.path(), input.role(), input.path());
+            }
+        }
+    }
+
+    /**
+     * Lexical normalization covers paths that do not exist yet; isSameFile
+     * additionally catches existing symlink and hard-link aliases. When either
+     * target is absent, reject normalized case-fold collisions conservatively:
+     * Java has no portable read-only per-mount case-sensitivity query, and a
+     * live probe would itself write during the no-write preflight.
+     */
+    static boolean pathsAlias(Path first, Path second) throws java.io.IOException {
+        Path identityFirst = ArtifactWriter.outputIdentity(first);
+        Path identitySecond = ArtifactWriter.outputIdentity(second);
+        if (identityFirst.equals(identitySecond)) {
+            return true;
+        }
+        boolean firstExists = Files.exists(identityFirst);
+        boolean secondExists = Files.exists(identitySecond);
+        if (firstExists && secondExists) {
+            return Files.isSameFile(identityFirst, identitySecond);
+        }
+        return foldedAbsentPath(identityFirst).equals(foldedAbsentPath(identitySecond));
+    }
+
+    /**
+     * A deliberately broad Unicode fold for absent-path fail-closed identity.
+     * NFKC catches canonically/compatibly equivalent spellings; upper-then-lower
+     * also folds multi-character mappings such as sharp-s.
+     */
+    private static String foldedAbsentPath(Path path) {
+        String normalized =
+            Normalizer.normalize(path.toString(), Normalizer.Form.NFKC);
+        String folded =
+            normalized.toUpperCase(Locale.ROOT).toLowerCase(Locale.ROOT);
+        return Normalizer.normalize(folded, Normalizer.Form.NFKC);
     }
 
     /** Validate a flag value against a fixed allowed set; throws (usage error, exit 2) otherwise. */
@@ -868,8 +759,7 @@ public final class Main {
 
     /**
      * Whether an output path selects the PDF branch — a {@code .pdf} extension, matched
-     * CASE-INSENSITIVELY. This is the ONLY extension-based dispatch in the CLI; a
-     * case-sensitive compare let {@code -o out.PDF} fall through and write PNG bytes into a
+     * CASE-INSENSITIVELY. A case-sensitive compare let {@code -o out.PDF} fall through and write PNG bytes into a
      * {@code .PDF} file (Fix review, brewshot 99 F2). Package-private so the dispatch decision
      * is unit-testable without Chrome. Mirrors the codebase's only other case-normalization
      * ({@code osName().toLowerCase(Locale.ROOT)} in {@link BrewShot}).
@@ -888,6 +778,21 @@ public final class Main {
         return out.toString().toLowerCase(Locale.ROOT).endsWith(".gif");
     }
 
+    /**
+     * Whether a still output selects Chrome's JPEG encoder. Both conventional
+     * extensions are matched case-insensitively; PNG is the only other accepted
+     * raster extension.
+     */
+    static boolean isJpegOutput(Path out) {
+        String lower = out.toString().toLowerCase(Locale.ROOT);
+        return lower.endsWith(".jpg") || lower.endsWith(".jpeg");
+    }
+
+    /** Whether a still output explicitly names the lossless PNG format. */
+    static boolean isPngOutput(Path out) {
+        return out.toString().toLowerCase(Locale.ROOT).endsWith(".png");
+    }
+
     private static void usage() {
         System.err.println("""
             brewshot — Java brews screenshots (headless Chrome over CDP, zero deps)
@@ -898,11 +803,13 @@ public final class Main {
               <url>        open an address (http/https/file)
               <file.html>  open a local file
               -            read direct HTML source from stdin
-              -o           output PNG path            (default brewshot.png)
+              -o           output .png, .jpg/.jpeg, .pdf, or (with --gif) .gif
+                           path; JPEG quality defaults to 90 (default brewshot.png)
               --size       viewport, e.g. 1440x1000   (default 1280x900)
               --settle     ms to wait before shooting (default 800)
               --eval       print a JS expression's value before shooting
-              --eval-file  like --eval, JS read from a file (no shell quoting)
+              --eval-file  like --eval, JS read from a UTF-8 file (max 1 MiB;
+                           no shell quoting)
               --wait-js    JS predicate to poll before shooting (deterministic ready)
               --wait-timeout  ms budget for --wait-js       (default 10000)
               --clip-js    JS returning {x,y,w,h} page-coords: shoot just that rect
@@ -917,14 +824,17 @@ public final class Main {
               --color-scheme dark|light  force prefers-color-scheme before capture
               --media      print|screen  force the emulated media type (e.g. @media print)
               --reduced-motion  force prefers-reduced-motion: reduce before capture
-              --fail-js    JS assertion; false -> exit 4 (PNG still written)
-              --json       write a machine-readable manifest beside the PNG
+              --fail-js    JS assertion; false -> exit 4 (output artifact still written)
+              --json       write a machine-readable manifest beside the output
+              --jpeg-quality  JPEG quality 1-100, only with .jpg/.jpeg output
+                           (default 90)
               --gif N      record N frames as a looping GIF instead of a still
                            (default -o becomes brewshot.gif; an explicit non-.gif
                            -o is refused). JAR PATH ONLY: GIF assembly rides
                            ImageIO/AWT, which the native binary does not have —
                            run via java -jar brewshot.jar
-              --gif-delay  ms between frames, capture AND playback  (default 40)
+              --gif-delay  ms between frames, capture AND playback; GIF rounds
+                           to nearest 10 ms, minimum 20 ms          (default 40)
               --gif-element  CSS selector: film just that element's box (resolved
                            once, exit 1 if nothing matches); composes with --scale
               --version    print the version and exit
@@ -932,6 +842,9 @@ public final class Main {
             subcommands:
               diff a.png b.png   pixel diff -> citable verdict + threshold gate
                                  (see 'brewshot diff --help'; no Chrome needed)
+
+            stdin HTML is UTF-8 and capped at 16 MiB. Unknown output extensions
+            are refused rather than receiving misnamed PNG bytes.
 
             requires a local Chrome/Chromium (or set BREWSHOT_CHROME).""");
     }

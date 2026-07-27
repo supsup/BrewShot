@@ -3,6 +3,7 @@ package com.brewshot;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -33,6 +34,83 @@ import org.junit.jupiter.api.io.TempDir;
  * discovers or launches Chrome.
  */
 class BrewShotTransportDeadlineTest {
+
+    @Test
+    void publicTimeoutAndHeapContractsRejectInvalidValuesAndKeepDocumentedZeroNoOps(
+            @TempDir Path temp) throws Exception {
+        FakeWebSocket socket = new FakeWebSocket();
+        BrewShot shot = new BrewShot(
+            new FakeProcess(true), profile(temp, "validation"), socket,
+            new LinkedBlockingQueue<>(), 40);
+        try {
+            assertThrows(IllegalArgumentException.class, () -> shot.navTimeout(0));
+            assertThrows(IllegalArgumentException.class, () -> shot.navTimeout(-1));
+            assertThrows(IllegalArgumentException.class, () -> shot.commandTimeout(0));
+            assertThrows(IllegalArgumentException.class, () -> shot.commandTimeout(-1));
+            assertThrows(IllegalArgumentException.class, () -> shot.recordingHeapBudget(0));
+            assertThrows(IllegalArgumentException.class, () -> shot.recordingHeapBudget(-1));
+            assertThrows(IllegalArgumentException.class, () -> shot.waitFor("true", 0));
+            assertThrows(IllegalArgumentException.class,
+                () -> shot.waitForNetworkIdle(-1, 1));
+            assertThrows(IllegalArgumentException.class,
+                () -> shot.waitForNetworkIdle(1, -1));
+            assertThrows(IllegalArgumentException.class, () -> shot.settle(-1));
+
+            assertSame(shot, shot.navTimeout(1));
+            assertSame(shot, shot.commandTimeout(1));
+            assertSame(shot, shot.recordingHeapBudget(1));
+            shot.waitForNetworkIdle(0, 0);
+            shot.settle(0);
+            assertEquals(0, socket.sendCalls.get(),
+                "documented zero-duration no-ops must not touch CDP");
+        } finally {
+            shot.close();
+        }
+    }
+
+    @Test
+    void everyLibraryRecorderRejectsBadCountsAndDelaysBeforeProtocolTraffic(
+            @TempDir Path temp) throws Exception {
+        FakeWebSocket socket = new FakeWebSocket();
+        BrewShot shot = new BrewShot(
+            new FakeProcess(true), profile(temp, "recorder-validation"), socket,
+            new LinkedBlockingQueue<>(), 40);
+        Path out = temp.resolve("never-written.gif");
+        try {
+            assertThrows(IllegalArgumentException.class,
+                () -> shot.recordGif(0, 0, 1, 1, 0, 1, 1, out));
+            assertThrows(IllegalArgumentException.class,
+                () -> shot.recordGif(0, 0, 1, 1, 1, 0, 1, out));
+            assertThrows(IllegalArgumentException.class,
+                () -> shot.recordGif(0, 0, 1, 1, 1, 1, 0, out));
+            assertThrows(IllegalArgumentException.class,
+                () -> shot.recordGifElement("#x", 0, 1, 1, 1, out));
+            assertThrows(IllegalArgumentException.class,
+                () -> shot.recordGifElement("#x", 1, 0, 1, 1, out));
+            assertThrows(IllegalArgumentException.class,
+                () -> shot.recordGifScroll(0, 0, 1, 1, out));
+            assertThrows(IllegalArgumentException.class,
+                () -> shot.recordGifScroll(1, -1, 1, 1, out));
+            assertThrows(IllegalArgumentException.class,
+                () -> shot.recordGifScroll(1, 0, 0, 1, out));
+            assertThrows(IllegalArgumentException.class,
+                () -> shot.recordGifFullPage(0, 1, 1, out));
+            assertThrows(IllegalArgumentException.class,
+                () -> shot.recordGifFullPage(1, 0, 1, out));
+            assertThrows(IllegalArgumentException.class,
+                () -> shot.recordGifRegion(0, 1, 0, 1, 1, out));
+            assertThrows(IllegalArgumentException.class,
+                () -> shot.recordGifRegion(0, 1, 1, 0, 1, out));
+            assertThrows(IllegalArgumentException.class,
+                () -> shot.recordGifStream(0, 1, out));
+            assertThrows(IllegalArgumentException.class,
+                () -> shot.recordGifStream(1, 0, out));
+            assertEquals(0, socket.sendCalls.get(),
+                "invalid recorder arguments must fail before page eval/capture");
+        } finally {
+            shot.close();
+        }
+    }
 
     @Test
     void neverCompletingSendUsesCommandBudgetAndCancelsTransport(@TempDir Path temp)
@@ -109,6 +187,60 @@ class BrewShotTransportDeadlineTest {
         try {
             assertEquals("still-ok", shot.eval("'still-ok'"));
             assertEquals(1, socket.sendCalls.get());
+        } finally {
+            shot.close();
+        }
+    }
+
+    @Test
+    void waitForUsesSaturatedMonotonicDeadlineAtLongMax(
+            @TempDir Path temp) throws Exception {
+        LinkedBlockingQueue<String> inbox = new LinkedBlockingQueue<>();
+        FakeWebSocket socket = new FakeWebSocket();
+        AtomicInteger polls = new AtomicInteger();
+        socket.onSend = text -> {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> sent = (Map<String, Object>) MiniJson.parse(text);
+            int id = ((Number) sent.get("id")).intValue();
+            boolean ready = polls.incrementAndGet() >= 2;
+            inbox.add("{\"id\":" + id
+                + ",\"result\":{\"result\":{\"value\":" + ready + "}}}");
+            return CompletableFuture.completedFuture(socket);
+        };
+        BrewShot shot = new BrewShot(
+            new FakeProcess(true), profile(temp, "wait-for-max"), socket, inbox, 40);
+
+        long started = System.nanoTime();
+        try {
+            shot.waitFor("ready", Long.MAX_VALUE);
+            assertEquals(2, polls.get(),
+                "Long.MAX_VALUE must not wrap into a timeout after the first false poll");
+            assertTrue(elapsedMillis(started) < 1_000,
+                "the successful discriminator must not spend the enormous budget");
+        } finally {
+            shot.close();
+        }
+    }
+
+    @Test
+    void networkIdleUsesSaturatedMonotonicDeadlineAtLongMax(
+            @TempDir Path temp) throws Exception {
+        LinkedBlockingQueue<String> inbox = new LinkedBlockingQueue<>();
+        inbox.add("{\"method\":\"Network.requestWillBeSent\","
+            + "\"params\":{\"requestId\":\"request-1\"}}");
+        inbox.add("{\"method\":\"Network.loadingFinished\","
+            + "\"params\":{\"requestId\":\"request-1\"}}");
+        BrewShot shot = new BrewShot(
+            new FakeProcess(true), profile(temp, "network-idle-max"),
+            new FakeWebSocket(), inbox, 40);
+
+        long started = System.nanoTime();
+        try {
+            shot.waitForNetworkIdle(30, Long.MAX_VALUE);
+            long elapsedMs = elapsedMillis(started);
+            assertTrue(elapsedMs >= 20 && elapsedMs < 1_000,
+                "network quiet window should complete promptly, not wrap or wait forever: "
+                    + elapsedMs + "ms");
         } finally {
             shot.close();
         }

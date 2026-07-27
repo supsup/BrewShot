@@ -1,9 +1,12 @@
 package com.brewshot;
 
+import java.lang.reflect.Array;
 import java.util.ArrayList;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Pattern;
 
 /**
  * Minimal JSON reader/escaper — just enough to speak the Chrome DevTools
@@ -24,6 +27,8 @@ public final class MiniJson {
      * (it fails the one eval call with a clear error instead). See SECURITY.md.
      */
     private static final int MAX_DEPTH = 200;
+    private static final Pattern JSON_NUMBER = Pattern.compile(
+        "-?(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?");
 
     private final String s;
     private int i;
@@ -53,7 +58,14 @@ public final class MiniJson {
                 case '\r' -> b.append("\\r");
                 case '\t' -> b.append("\\t");
                 default -> {
-                    if (c < 0x20) {
+                    // U+2028/U+2029 are valid JSON but historically terminate
+                    // JavaScript source string literals. Escaping them keeps this
+                    // one escaper safe for both CDP JSON and embedded JS literals.
+                    // Escape every UTF-16 surrogate code unit, including valid
+                    // pairs. Raw lone surrogates cannot be represented in UTF-8
+                    // and otherwise get rejected or replaced during file IO.
+                    if (c < 0x20 || c == '\u2028' || c == '\u2029'
+                            || Character.isSurrogate(c)) {
                         b.append(String.format("\\u%04x", (int) c));
                     } else {
                         b.append(c);
@@ -62,6 +74,158 @@ public final class MiniJson {
             }
         }
         return b.toString();
+    }
+
+    /**
+     * Serialize the JSON value domain without dependencies. Supported values
+     * are null, booleans, finite numbers, strings, maps with string keys, lists,
+     * and Java arrays (including primitive arrays). Unsupported values,
+     * non-finite numbers, excessive nesting, and cycles fail loud.
+     */
+    public static String stringify(Object value) {
+        return stringify(value, false);
+    }
+
+    /** Pretty form used for human-readable sidecars without a second serializer. */
+    static String stringifyPretty(Object value) {
+        return stringify(value, true);
+    }
+
+    private static String stringify(Object value, boolean pretty) {
+        StringBuilder out = new StringBuilder(256);
+        appendJson(out, value, pretty, 0, new IdentityHashMap<>());
+        return out.toString();
+    }
+
+    private static void appendJson(StringBuilder out, Object value, boolean pretty,
+                                   int depth, IdentityHashMap<Object, Boolean> active) {
+        if (depth > MAX_DEPTH) {
+            throw new IllegalArgumentException("JSON nested deeper than " + MAX_DEPTH);
+        }
+        if (value == null) {
+            out.append("null");
+        } else if (value instanceof String string) {
+            out.append('"').append(esc(string)).append('"');
+        } else if (value instanceof Boolean bool) {
+            out.append(bool);
+        } else if (value instanceof Number number) {
+            appendNumber(out, number);
+        } else if (value instanceof Map<?, ?> map) {
+            enterContainer(value, active);
+            try {
+                appendMap(out, map, pretty, depth, active);
+            } finally {
+                active.remove(value);
+            }
+        } else if (value instanceof List<?> list) {
+            enterContainer(value, active);
+            try {
+                appendList(out, list, pretty, depth, active);
+            } finally {
+                active.remove(value);
+            }
+        } else if (value.getClass().isArray()) {
+            enterContainer(value, active);
+            try {
+                appendArray(out, value, pretty, depth, active);
+            } finally {
+                active.remove(value);
+            }
+        } else {
+            throw new IllegalArgumentException(
+                "unsupported JSON value type: " + value.getClass().getName());
+        }
+    }
+
+    private static void appendNumber(StringBuilder out, Number number) {
+        if (number instanceof Double d && !Double.isFinite(d)
+                || number instanceof Float f && !Float.isFinite(f)) {
+            throw new IllegalArgumentException("JSON numbers must be finite, got: " + number);
+        }
+        String encoded = number.toString();
+        if (!JSON_NUMBER.matcher(encoded).matches()) {
+            throw new IllegalArgumentException("unsupported JSON number: " + encoded);
+        }
+        out.append(encoded);
+    }
+
+    private static void appendMap(StringBuilder out, Map<?, ?> map, boolean pretty,
+                                  int depth, IdentityHashMap<Object, Boolean> active) {
+        out.append('{');
+        boolean first = true;
+        for (Map.Entry<?, ?> entry : map.entrySet()) {
+            if (!(entry.getKey() instanceof String key)) {
+                throw new IllegalArgumentException("JSON object keys must be strings, got: "
+                    + entry.getKey());
+            }
+            if (!first) {
+                out.append(',');
+            }
+            if (pretty) {
+                out.append('\n');
+                indent(out, depth + 1);
+            }
+            first = false;
+            out.append('"').append(esc(key)).append('"').append(pretty ? ": " : ":");
+            appendJson(out, entry.getValue(), pretty, depth + 1, active);
+        }
+        if (pretty && !map.isEmpty()) {
+            out.append('\n');
+            indent(out, depth);
+        }
+        out.append('}');
+    }
+
+    private static void appendList(StringBuilder out, List<?> list, boolean pretty,
+                                   int depth, IdentityHashMap<Object, Boolean> active) {
+        out.append('[');
+        for (int i = 0; i < list.size(); i++) {
+            if (i > 0) {
+                out.append(',');
+            }
+            if (pretty) {
+                out.append('\n');
+                indent(out, depth + 1);
+            }
+            appendJson(out, list.get(i), pretty, depth + 1, active);
+        }
+        if (pretty && !list.isEmpty()) {
+            out.append('\n');
+            indent(out, depth);
+        }
+        out.append(']');
+    }
+
+    private static void appendArray(StringBuilder out, Object array, boolean pretty,
+                                    int depth, IdentityHashMap<Object, Boolean> active) {
+        out.append('[');
+        int length = Array.getLength(array);
+        for (int i = 0; i < length; i++) {
+            if (i > 0) {
+                out.append(',');
+            }
+            if (pretty) {
+                out.append('\n');
+                indent(out, depth + 1);
+            }
+            appendJson(out, Array.get(array, i), pretty, depth + 1, active);
+        }
+        if (pretty && length > 0) {
+            out.append('\n');
+            indent(out, depth);
+        }
+        out.append(']');
+    }
+
+    private static void enterContainer(Object container,
+                                       IdentityHashMap<Object, Boolean> active) {
+        if (active.put(container, Boolean.TRUE) != null) {
+            throw new IllegalArgumentException("cyclic value is not valid JSON");
+        }
+    }
+
+    private static void indent(StringBuilder out, int depth) {
+        out.append("  ".repeat(depth));
     }
 
     /** Dotted-path lookup into a parsed tree; null when any hop is missing. */
@@ -163,7 +327,11 @@ public final class MiniJson {
         int start = i;
         while (i < s.length() && "+-0123456789.eE".indexOf(s.charAt(i)) >= 0) { i++; }
         if (start == i) { throw err("expected value"); }
-        return Double.parseDouble(s.substring(start, i));
+        Double value = Double.parseDouble(s.substring(start, i));
+        if (!Double.isFinite(value)) {
+            throw err("JSON number is not finite");
+        }
+        return value;
     }
 
     private Object lit(String word, Object v) {

@@ -134,7 +134,8 @@ animation without writing a line of Java:
 
 ```
 java -jar build/libs/brewshot-0.9.0.jar ./fx-demo.html --gif 40 --gif-element ".fx" -o fx.gif
-# --gif N frames, --gif-delay MS cadence (capture == playback), looping GIF out
+# --gif N frames, --gif-delay MS cadence (GIF playback rounds to nearest 10 ms,
+# minimum 20 ms), looping GIF out
 ```
 
 **The caveat Sam should know:** the PNG/eval path compiles native cleanly (pure
@@ -229,6 +230,28 @@ docker run --rm -v "$PWD:/work" brewshot https://ci.internal/report -o /work/rep
 cat page.html | docker run --rm -i -v "$PWD:/work" brewshot - -o /work/page.png
 ```
 
+The default remains that one-shot CLI. `cli` is an optional explicit spelling;
+`watch` is the separate long-running mode:
+
+```sh
+mkdir -p Input Output
+docker run -d --name brewshot-worker --restart unless-stopped \
+  --user "$(id -u):$(id -g)" \
+  --mount type=bind,src="$PWD/Input",dst=/brewshot/input \
+  --mount type=bind,src="$PWD/Output",dst=/brewshot/output \
+  brewshot watch
+```
+
+Drop a complete, self-contained `.html` or `.htm` file directly in `Input`.
+Success publishes `Output/<source-name>.png` and archives the source under
+`Input/finished`; failure publishes a bounded content-free `.error.txt` and
+archives under `Input/failed`. `processing`, `finished`, `failed`, hidden/temp
+files, symlinks, subdirectories, and other extensions are not new jobs.
+Existing artifacts are never overwritten, valid processing claims recover on
+restart, and shared workers converge through atomic claims and physical file
+identity. URLs and advanced flags stay on the ordinary CLI rather than becoming
+an autonomous folder-manifest surface.
+
 **Rolling your own image instead?** Three things a container needs that a
 laptop already has:
 
@@ -260,22 +283,65 @@ mount for input, only for output.
 
 > [!WARNING]
 > **Linux hosts: `Permission denied` on the output is a real trap.** The
-> image deliberately runs as a **non-root user** (a security choice — see the
-> Dockerfile), so the mounted directory must be writable by that user. If
+> image deliberately runs as fixed **non-root `10001:10001`** (a security
+> choice — see the Dockerfile), so the mounted directory must be writable by
+> that user. If
 > your shot dies with `Permission denied`, run with your own uid:
 >
-> ```
-> docker run --user "$(id -u)" --rm -v "$PWD:/work" brewshot … -o /work/page.png
+> ```sh
+> docker run --user "$(id -u):$(id -g)" --rm \
+>   -v "$PWD:/work" brewshot … -o /work/page.png
 > ```
 >
 > macOS and Windows Docker Desktop map this automatically — which is exactly
 > why it works on your laptop and then bites in Linux CI.
+
+For one-shot file input, mount `/brewshot/input` read-only and
+`/brewshot/output` writable. Watch mode needs both mounts writable because the
+input tree is also its durable processing/finished/failed state machine. The
+files themselves may be readable but foreign-owned or mode `0444`; terminal
+archiving moves directory entries and does not require hard-link permission on
+the producer's inode.
 
 **What Ana should know:** container renders use the Linux font stack, so
 pixels differ subtly from Mac/Windows-Chrome renders — keep your reference
 images consistently from one environment (CI is the good choice: it's the
 one everyone shares). And inside the container the *jar* runs GIFs happily —
 the macOS-native-binary caveat doesn't exist here.
+
+---
+
+## 6. Mina — "Chrome exits before DevTools on my Mac automation runner"
+
+Mina's same BrewShot command works from a normal macOS Terminal but fails when
+an automation host inherits `CODEX_SANDBOX=seatbelt`. That distinction is real:
+unified Chrome 150 calls macOS LaunchServices during headless bootstrap, and the
+known-denied Seatbelt context can abort the serving process before it publishes
+a DevTools endpoint.
+
+BrewShot refuses that exact macOS + Seatbelt + unified-Chrome combination
+*before* creating its generated profile or starting Chrome. The error tells
+Mina to use the supported normal-Terminal lane, the container lane from
+Scenario 5, or an explicitly installed headless shell:
+
+```
+BREWSHOT_CHROME=/path/to/chrome-headless-shell java -jar brewshot.jar https://example.com -o page.png
+```
+
+The basename must be `chrome-headless-shell` (or `.exe`); BrewShot does not
+silently substitute an arbitrary binary. Outside the refused context, startup
+observes bounded stdout, bounded stderr, and the generated profile's validated
+`DevToolsActivePort` under one deadline. Observed endpoints must agree, and a
+failure says whether Chrome exited, stayed alive without an endpoint, published
+malformed data, or published conflicting witnesses. Diagnostic tails redact
+URLs, absolute host paths, command lines, inline flag values, and secret-shaped
+assignments.
+
+This changes no teardown authority. BrewShot still owns only its generated
+profile and the process tree proven by its `ResourceLease`; it never touches the
+operator's Chrome profile, quits an interactive browser, or blanket-kills
+Chrome. The platform/version evidence and historical `--no-startup-window`
+mitigation boundary are recorded in `RELEASE_NOTES.md`.
 
 ---
 

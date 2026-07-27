@@ -2,24 +2,31 @@ package com.brewshot;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.WebSocket;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.SimpleFileVisitor;
+import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Deque;
+import java.util.EnumMap;
+import java.util.EnumSet;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
@@ -56,8 +63,39 @@ public final class BrewShot implements AutoCloseable {
     // about vendored-jar provenance (caught by Fixpoint, sirentide #121).
     public static final String VERSION = "0.9.0";
 
-    private static final Pattern WS_LINE = Pattern.compile("DevTools listening on (ws://\\S+)");
+    private static final Pattern DEVTOOLS_LINE =
+        Pattern.compile("DevTools listening on\\s+(\\S+)");
+    private static final Pattern DEVTOOLS_BROWSER_PATH =
+        Pattern.compile("/devtools/browser/[A-Za-z0-9._-]+");
+    private static final Pattern STARTUP_URL_TOKEN =
+        Pattern.compile("(?i)\\b(?:ws|https?)://\\S+");
+    private static final Pattern STARTUP_COMMAND_LINE = Pattern.compile(
+        "(?i)^.*\\b(?:command(?:\\s+line)?|argv|args|launch(?:ing)?)\\s*[:=].*$");
+    private static final Pattern STARTUP_SENSITIVE_HEADER = Pattern.compile(
+        "(?i).*\\b(?:authorization|proxy-authorization|cookie|set-cookie)\\s*[:=].*$");
+    private static final Pattern STARTUP_BEARER_CREDENTIAL = Pattern.compile(
+        "(?i)\\b(bearer|basic)\\s+[^\\s|;,]+");
+    private static final Pattern STARTUP_QUOTED_ABSOLUTE_PATH = Pattern.compile(
+        "([\\\"'])(?:[A-Za-z]:[\\\\/]|/)[^\\\"'\\r\\n]*\\1");
+    private static final Pattern STARTUP_ABSOLUTE_PATH = Pattern.compile(
+        "(?<![A-Za-z0-9])(?:[A-Za-z]:[\\\\/]|/|~[\\\\/])[^\\s|;,)\\]]*");
+    private static final Pattern STARTUP_FLAG_ASSIGNMENT = Pattern.compile(
+        "(--[A-Za-z0-9][A-Za-z0-9_-]*)=\\S+");
+    private static final Pattern STARTUP_FLAG_VALUE = Pattern.compile(
+        "(--[A-Za-z0-9][A-Za-z0-9_-]*)\\s++(?!--[A-Za-z0-9])"
+            + "(?:\\\"[^\\\"]*\\\"|'[^']*'|\\S+)");
+    private static final Pattern STARTUP_SECRET_ASSIGNMENT = Pattern.compile(
+        "(?i)\\b((?=[A-Za-z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|"
+            + "COOKIE|AUTH|API_KEY))[A-Za-z_][A-Za-z0-9_]*)=\\S+");
+    private static final Pattern STARTUP_ENV_ASSIGNMENT = Pattern.compile(
+        "\\b([A-Z][A-Z0-9_]{1,63})=\\S+");
     private static final long DEFAULT_TIMEOUT_MS = 15_000;
+    private static final long BOOTSTRAP_POLL_MS = 20;
+    private static final long BOOTSTRAP_WITNESS_SETTLE_MS = 100;
+    private static final int BOOTSTRAP_STREAM_LINE_CAP = 4_096;
+    private static final int BOOTSTRAP_TAIL_LINE_CAP = 240;
+    private static final int BOOTSTRAP_TAIL_LINES = 4;
+    private static final int DEVTOOLS_ACTIVE_PORT_FILE_CAP = 4_096;
     private static final long DEFAULT_CLOSE_TIMEOUT_MS = 1_000;
     private static final long PROCESS_CLOSE_TIMEOUT_MS = 3_000;
     private static final long PROCESS_FORCE_REAP_TIMEOUT_MS = 2_000;
@@ -121,7 +159,7 @@ public final class BrewShot implements AutoCloseable {
     // events. Mutated only in routeEvent on the single draining thread, so a
     // plain HashSet is safe. Cleared per navigation.
     private final Set<String> inFlightRequestIds = new HashSet<>();
-    private long lastNetChangeMs;
+    private long lastNetChangeNanos = System.nanoTime();
     // Load/navigation wait budget (ms). Defaults from BREWSHOT_TIMEOUT_MS or the
     // 15s constant; override per-instance with navTimeout(). Governs open()/html()
     // and the ready-waits, so a slow page on a loaded CI runner isn't unraisable.
@@ -238,6 +276,42 @@ public final class BrewShot implements AutoCloseable {
     private static boolean isWindows() {
         return System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT)
             .startsWith("windows");
+    }
+
+    /**
+     * Return a fixed, sanitized refusal for the known-denied macOS Codex
+     * Seatbelt context, or {@code null} when launch may proceed. Chrome 150's
+     * unified headless bootstrap calls into LaunchServices there and aborts
+     * before publishing a DevTools endpoint, sometimes queuing an operator
+     * crash dialog. The separately installed {@code chrome-headless-shell}
+     * does not use that unified browser bootstrap and remains an explicit
+     * opt-in escape hatch through {@code BREWSHOT_CHROME}.
+     */
+    static String launchContextRefusal(Map<String, String> env, String osName,
+                                       String chromeBinary) {
+        boolean mac = osName != null
+            && osName.toLowerCase(java.util.Locale.ROOT).startsWith("mac");
+        String sandbox = env.get("CODEX_SANDBOX");
+        boolean seatbelt = sandbox != null
+            && "seatbelt".equalsIgnoreCase(sandbox.trim());
+        String override = env.get("BREWSHOT_CHROME");
+        boolean explicitHeadlessShell = override != null
+            && override.equals(chromeBinary) && isHeadlessShell(chromeBinary);
+        if (!mac || !seatbelt || explicitHeadlessShell) { return null; }
+        return "BrewShot refused to launch unified Chrome from the macOS Codex Seatbelt "
+            + "context because LaunchServices bootstrap is denied there. Run BrewShot from "
+            + "a normal Terminal or supported container, or explicitly point "
+            + "BREWSHOT_CHROME at chrome-headless-shell. No Chrome process or profile was "
+            + "created.";
+    }
+
+    private static boolean isHeadlessShell(String chromeBinary) {
+        if (chromeBinary == null || chromeBinary.isBlank()) { return false; }
+        String name;
+        try { name = Path.of(chromeBinary).getFileName().toString(); }
+        catch (RuntimeException invalidPath) { return false; }
+        return "chrome-headless-shell".equalsIgnoreCase(name)
+            || "chrome-headless-shell.exe".equalsIgnoreCase(name);
     }
 
     /**
@@ -756,8 +830,13 @@ public final class BrewShot implements AutoCloseable {
 
     /** Launch headless Chrome with the given viewport and attach to a fresh tab. */
     public static BrewShot launch(int width, int height) throws IOException {
+        Validation.positiveInt("viewport width", width);
+        Validation.positiveInt("viewport height", height);
         String bin = findChrome();
         if (bin == null) { throw new IllegalStateException("no Chrome binary found"); }
+        String refusal = launchContextRefusal(
+            System.getenv(), System.getProperty("os.name", ""), bin);
+        if (refusal != null) { throw new IOException(refusal); }
         Path profile = Files.createTempDirectory("brewshot-");
         List<String> args = new ArrayList<>(List.of(
             bin,
@@ -771,12 +850,11 @@ public final class BrewShot implements AutoCloseable {
             "--no-first-run",
             "--no-default-browser-check",
             // macOS 26 + Chrome 150 (plan ba9dafd7, 2026-07-22): without this flag, ~1/3 of
-            // rapid headless launches spawn a doomed secondary Chrome that abort()s inside
-            // TransformProcessType -> _RegisterApplication (LaunchServices refuses the
-            // registration under launch storms). Captures still succeed — the abort feeds the
-            // OPERATOR's "Chrome quit unexpectedly" dialog queue. Empirically eliminated by
-            // skipping the startup-window/app-registration path (0/15 storm launches vs 5/15
-            // without); harmless on Linux/CI.
+            // rapid headless launches spawned a doomed secondary Chrome that abort()ed inside
+            // TransformProcessType -> _RegisterApplication. It reduced the original observed
+            // storm from 5/15 aborts to 0/15, but later Seatbelt evidence proved it is not a
+            // universal crash-dialog fix; launchContextRefusal handles that known-denied context.
+            // The flag remains harmless on Linux/CI.
             "--no-startup-window"));
         // Extra Chrome flags via env — the container hook (e.g. the Docker
         // image sets BREWSHOT_CHROME_ARGS=--no-sandbox: Chrome's sandbox needs
@@ -789,16 +867,18 @@ public final class BrewShot implements AutoCloseable {
         ResourceLease lease = startLaunchProcess(
             profile,
             () -> new ProcessBuilder(args)
-                // stdout is never read — discard it so a chatty binary can't
-                // deadlock on a full 64KB pipe.
-                .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+                // Both startup streams are bounded and continuously drained by
+                // the endpoint witness observer below. Chrome versions and
+                // wrappers have published the DevTools line on either stream.
+                .redirectOutput(ProcessBuilder.Redirect.PIPE)
+                .redirectError(ProcessBuilder.Redirect.PIPE)
                 .start(),
             () -> { });
         Process p = lease.process;
 
         String wsUrl;
         try {
-            wsUrl = awaitDevtoolsUrl(p);
+            wsUrl = awaitDevtoolsUrl(p, profile);
             lease.refreshOwnershipCheckpoint();
         } catch (RuntimeException | IOException | Error e) {
             lease.cleanup(false);
@@ -891,44 +971,505 @@ public final class BrewShot implements AutoCloseable {
         connecting.cancel(true);
     }
 
+    enum DevToolsWitnessSource { STDOUT, STDERR, PROFILE }
+
+    enum DevToolsBootstrapOutcome {
+        ENDPOINT,
+        PROCESS_EXITED,
+        ALIVE_TIMEOUT,
+        MALFORMED_ENDPOINT,
+        DISAGREEING_ENDPOINTS
+    }
+
+    record DevToolsBootstrapResult(
+        DevToolsBootstrapOutcome outcome,
+        String webSocketUrl,
+        Set<DevToolsWitnessSource> sources,
+        int exitCode,
+        long elapsedMillis,
+        String stdoutTail,
+        String stderrTail
+    ) {
+        DevToolsBootstrapResult {
+            sources = sources.isEmpty()
+                ? Set.of()
+                : java.util.Collections.unmodifiableSet(EnumSet.copyOf(sources));
+        }
+    }
+
+    private record DevToolsEndpoint(String canonicalKey, String connectUrl) { }
+
+    private enum ActivePortState { ABSENT, INCOMPLETE, VALID, MALFORMED }
+
+    private record ActivePortProbe(ActivePortState state, DevToolsEndpoint endpoint) {
+        static ActivePortProbe absent() {
+            return new ActivePortProbe(ActivePortState.ABSENT, null);
+        }
+
+        static ActivePortProbe incomplete() {
+            return new ActivePortProbe(ActivePortState.INCOMPLETE, null);
+        }
+
+        static ActivePortProbe malformed() {
+            return new ActivePortProbe(ActivePortState.MALFORMED, null);
+        }
+
+        static ActivePortProbe valid(DevToolsEndpoint endpoint) {
+            return new ActivePortProbe(ActivePortState.VALID, endpoint);
+        }
+    }
+
+    private record BootstrapEvent(
+        DevToolsWitnessSource source,
+        DevToolsEndpoint endpoint,
+        boolean malformed,
+        boolean closed
+    ) {
+        static BootstrapEvent endpoint(DevToolsWitnessSource source,
+                                       DevToolsEndpoint endpoint) {
+            return new BootstrapEvent(source, endpoint, false, false);
+        }
+
+        static BootstrapEvent malformed(DevToolsWitnessSource source) {
+            return new BootstrapEvent(source, null, true, false);
+        }
+
+        static BootstrapEvent closed(DevToolsWitnessSource source) {
+            return new BootstrapEvent(source, null, false, true);
+        }
+    }
+
+    /** A fixed-size sanitized tail; startup output never grows retained state. */
+    private static final class BootstrapTail {
+        private final Deque<String> lines = new ArrayDeque<>();
+
+        synchronized void add(String line) {
+            if (line == null || line.isBlank()) { return; }
+            while (lines.size() >= BOOTSTRAP_TAIL_LINES) { lines.removeFirst(); }
+            lines.addLast(line);
+        }
+
+        synchronized String snapshot() {
+            return String.join(" | ", lines);
+        }
+    }
+
     /**
-     * Read Chrome's stderr for the "DevTools listening on ws://..." line on a
-     * helper thread, so the 15s deadline holds even when the process stays
-     * alive without printing anything (a bare readLine would block forever).
-     * The thread keeps draining stderr afterwards so Chrome never blocks on a
-     * full pipe.
+     * Observe Chrome bootstrap through three independently bounded witnesses:
+     * stdout, stderr, and the generated profile's {@code DevToolsActivePort}.
+     * All observers share one monotonic deadline. Stream readers remain daemon
+     * drains after success, preventing a live Chrome from filling either pipe.
      */
-    private static String awaitDevtoolsUrl(Process p) throws IOException {
-        CompletableFuture<String> found = new CompletableFuture<>();
-        Thread reader = new Thread(() -> {
-            try (var err = new java.io.BufferedReader(new java.io.InputStreamReader(
-                    p.getErrorStream(), StandardCharsets.UTF_8))) {
-                String line;
-                while ((line = err.readLine()) != null) {
-                    if (!found.isDone()) {
-                        Matcher m = WS_LINE.matcher(line);
-                        if (m.find()) { found.complete(m.group(1)); }
-                    }
-                }
-                found.completeExceptionally(
-                    new IOException("Chrome exited without a DevTools listening line"));
-            } catch (IOException e) {
-                found.completeExceptionally(e);
+    static DevToolsBootstrapResult observeDevToolsEndpoint(
+            Process process, Path profileDir, long timeoutMs) throws IOException {
+        Objects.requireNonNull(process, "process");
+        Objects.requireNonNull(profileDir, "profileDir");
+        long boundedTimeoutMs = Math.max(1, timeoutMs);
+        long startedNanos = System.nanoTime();
+        Deadline deadline = Deadline.afterMillis(boundedTimeoutMs);
+        var events = new LinkedBlockingQueue<BootstrapEvent>(32);
+        BootstrapTail stdoutTail = new BootstrapTail();
+        BootstrapTail stderrTail = new BootstrapTail();
+        startBootstrapDrain(
+            "brewshot-stdout", process.getInputStream(),
+            DevToolsWitnessSource.STDOUT, profileDir, events, stdoutTail);
+        startBootstrapDrain(
+            "brewshot-stderr", process.getErrorStream(),
+            DevToolsWitnessSource.STDERR, profileDir, events, stderrTail);
+
+        EnumMap<DevToolsWitnessSource, DevToolsEndpoint> endpoints =
+            new EnumMap<>(DevToolsWitnessSource.class);
+        EnumSet<DevToolsWitnessSource> malformed =
+            EnumSet.noneOf(DevToolsWitnessSource.class);
+        EnumSet<DevToolsWitnessSource> closed =
+            EnumSet.noneOf(DevToolsWitnessSource.class);
+        boolean activePortObserved = false;
+        long firstWitnessNanos = -1;
+        long profileNonValidSinceNanos = -1;
+
+        while (true) {
+            ActivePortProbe fileProbe = probeDevToolsActivePort(profileDir);
+            if (fileProbe.state() != ActivePortState.ABSENT) {
+                activePortObserved = true;
             }
-        }, "brewshot-stderr");
+            if (fileProbe.state() == ActivePortState.VALID) {
+                profileNonValidSinceNanos = -1;
+                malformed.remove(DevToolsWitnessSource.PROFILE);
+                if (!recordEndpoint(
+                        endpoints, DevToolsWitnessSource.PROFILE,
+                        fileProbe.endpoint())) {
+                    return bootstrapResult(
+                        DevToolsBootstrapOutcome.DISAGREEING_ENDPOINTS,
+                        null, endpoints.keySet(), process, startedNanos,
+                        stdoutTail, stderrTail);
+                }
+                if (firstWitnessNanos < 0) { firstWitnessNanos = System.nanoTime(); }
+            } else if (fileProbe.state() == ActivePortState.INCOMPLETE
+                    || fileProbe.state() == ActivePortState.MALFORMED) {
+                long now = System.nanoTime();
+                if (profileNonValidSinceNanos < 0) {
+                    profileNonValidSinceNanos = now;
+                } else if (now - profileNonValidSinceNanos
+                        >= TimeUnit.MILLISECONDS.toNanos(
+                            BOOTSTRAP_WITNESS_SETTLE_MS)) {
+                    // A generated file can be visible between create and its
+                    // second-line write. Only a non-valid file that persists
+                    // for the witness-settle window is a malformed witness.
+                    malformed.add(DevToolsWitnessSource.PROFILE);
+                }
+            } else {
+                profileNonValidSinceNanos = -1;
+                malformed.remove(DevToolsWitnessSource.PROFILE);
+            }
+
+            BootstrapEvent event;
+            while ((event = events.poll()) != null) {
+                if (event.closed()) { closed.add(event.source()); }
+                if (event.malformed()) { malformed.add(event.source()); }
+                if (event.endpoint() != null) {
+                    malformed.remove(event.source());
+                    if (!recordEndpoint(endpoints, event.source(), event.endpoint())) {
+                        return bootstrapResult(
+                            DevToolsBootstrapOutcome.DISAGREEING_ENDPOINTS,
+                            null, endpoints.keySet(), process, startedNanos,
+                            stdoutTail, stderrTail);
+                    }
+                    if (firstWitnessNanos < 0) { firstWitnessNanos = System.nanoTime(); }
+                }
+            }
+
+            if (!endpoints.isEmpty() && !malformed.isEmpty()) {
+                EnumSet<DevToolsWitnessSource> observed =
+                    EnumSet.copyOf(endpoints.keySet());
+                observed.addAll(malformed);
+                return bootstrapResult(
+                    DevToolsBootstrapOutcome.MALFORMED_ENDPOINT,
+                    null, observed, process, startedNanos,
+                    stdoutTail, stderrTail);
+            }
+
+            boolean streamsClosed =
+                closed.contains(DevToolsWitnessSource.STDOUT)
+                    && closed.contains(DevToolsWitnessSource.STDERR);
+            boolean witnessSettled = firstWitnessNanos >= 0
+                && System.nanoTime() - firstWitnessNanos
+                    >= TimeUnit.MILLISECONDS.toNanos(BOOTSTRAP_WITNESS_SETTLE_MS);
+            boolean profileWriteSettled = profileNonValidSinceNanos < 0
+                || System.nanoTime() - profileNonValidSinceNanos
+                    >= TimeUnit.MILLISECONDS.toNanos(BOOTSTRAP_WITNESS_SETTLE_MS);
+            if (!endpoints.isEmpty() && witnessSettled && profileWriteSettled) {
+                DevToolsEndpoint endpoint = endpoints.values().iterator().next();
+                return bootstrapResult(
+                    DevToolsBootstrapOutcome.ENDPOINT,
+                    endpoint.connectUrl(), endpoints.keySet(), process,
+                    startedNanos, stdoutTail, stderrTail);
+            }
+
+            if (!process.isAlive() && streamsClosed) {
+                DevToolsBootstrapOutcome outcome =
+                    !malformed.isEmpty() || activePortObserved
+                        ? DevToolsBootstrapOutcome.MALFORMED_ENDPOINT
+                        : DevToolsBootstrapOutcome.PROCESS_EXITED;
+                EnumSet<DevToolsWitnessSource> observed =
+                    EnumSet.noneOf(DevToolsWitnessSource.class);
+                observed.addAll(malformed);
+                if (activePortObserved) { observed.add(DevToolsWitnessSource.PROFILE); }
+                return bootstrapResult(
+                    outcome, null, observed, process, startedNanos,
+                    stdoutTail, stderrTail);
+            }
+
+            if (deadline.expired()) {
+                if (!endpoints.isEmpty()) {
+                    DevToolsEndpoint endpoint = endpoints.values().iterator().next();
+                    return bootstrapResult(
+                        DevToolsBootstrapOutcome.ENDPOINT,
+                        endpoint.connectUrl(), endpoints.keySet(), process,
+                        startedNanos, stdoutTail, stderrTail);
+                }
+                DevToolsBootstrapOutcome outcome =
+                    !malformed.isEmpty() || activePortObserved
+                        ? DevToolsBootstrapOutcome.MALFORMED_ENDPOINT
+                        : process.isAlive()
+                            ? DevToolsBootstrapOutcome.ALIVE_TIMEOUT
+                            : DevToolsBootstrapOutcome.PROCESS_EXITED;
+                EnumSet<DevToolsWitnessSource> observed =
+                    EnumSet.noneOf(DevToolsWitnessSource.class);
+                observed.addAll(malformed);
+                if (activePortObserved) { observed.add(DevToolsWitnessSource.PROFILE); }
+                return bootstrapResult(
+                    outcome, null, observed, process, startedNanos,
+                    stdoutTail, stderrTail);
+            }
+
+            long sleepNanos = Math.min(
+                deadline.remainingNanos(),
+                TimeUnit.MILLISECONDS.toNanos(BOOTSTRAP_POLL_MS));
+            try { TimeUnit.NANOSECONDS.sleep(Math.max(1, sleepNanos)); }
+            catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("interrupted waiting for Chrome bootstrap", e);
+            }
+        }
+    }
+
+    private static DevToolsBootstrapResult bootstrapResult(
+            DevToolsBootstrapOutcome outcome, String webSocketUrl,
+            Set<DevToolsWitnessSource> sources, Process process,
+            long startedNanos, BootstrapTail stdoutTail,
+            BootstrapTail stderrTail) {
+        long elapsedNanos = Math.max(0, System.nanoTime() - startedNanos);
+        int exitCode = -1;
+        if (!process.isAlive()) {
+            try { exitCode = process.exitValue(); }
+            catch (IllegalThreadStateException ignored) { /* raced alive */ }
+        }
+        return new DevToolsBootstrapResult(
+            outcome, webSocketUrl, sources, exitCode,
+            TimeUnit.NANOSECONDS.toMillis(elapsedNanos),
+            stdoutTail.snapshot(), stderrTail.snapshot());
+    }
+
+    private static boolean recordEndpoint(
+            EnumMap<DevToolsWitnessSource, DevToolsEndpoint> endpoints,
+            DevToolsWitnessSource source, DevToolsEndpoint endpoint) {
+        DevToolsEndpoint prior = endpoints.putIfAbsent(source, endpoint);
+        if (prior != null && !prior.canonicalKey().equals(endpoint.canonicalKey())) {
+            return false;
+        }
+        for (DevToolsEndpoint observed : endpoints.values()) {
+            if (!observed.canonicalKey().equals(endpoint.canonicalKey())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static void startBootstrapDrain(
+            String threadName, InputStream stream, DevToolsWitnessSource source,
+            Path profileDir, LinkedBlockingQueue<BootstrapEvent> events,
+            BootstrapTail tail) {
+        Thread reader = new Thread(
+            () -> drainBootstrapStream(stream, source, profileDir, events, tail),
+            threadName);
         reader.setDaemon(true);
         reader.start();
-        try {
-            return found.get(DEFAULT_TIMEOUT_MS, TimeUnit.MILLISECONDS);
-        } catch (TimeoutException e) {
-            throw new IOException("Chrome never printed a DevTools listening line within "
-                + DEFAULT_TIMEOUT_MS + "ms");
-        } catch (java.util.concurrent.ExecutionException e) {
-            throw new IOException(String.valueOf(e.getCause().getMessage()), e.getCause());
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IOException("interrupted waiting for Chrome", e);
+    }
+
+    private static void drainBootstrapStream(
+            InputStream stream, DevToolsWitnessSource source, Path profileDir,
+            LinkedBlockingQueue<BootstrapEvent> events, BootstrapTail tail) {
+        int endpointEvents = 0;
+        try (InputStreamReader reader =
+                 new InputStreamReader(stream, StandardCharsets.UTF_8)) {
+            char[] buffer = new char[512];
+            StringBuilder line = new StringBuilder();
+            boolean truncated = false;
+            int read;
+            while ((read = reader.read(buffer)) != -1) {
+                for (int i = 0; i < read; i++) {
+                    char c = buffer[i];
+                    if (c == '\n') {
+                        if (handleBootstrapLine(
+                                line.toString(), truncated, source,
+                                profileDir, events, tail, endpointEvents)) {
+                            endpointEvents++;
+                        }
+                        line.setLength(0);
+                        truncated = false;
+                    } else if (c != '\r') {
+                        if (line.length() < BOOTSTRAP_STREAM_LINE_CAP) {
+                            line.append(c);
+                        } else {
+                            truncated = true;
+                        }
+                    }
+                }
+            }
+            if (!line.isEmpty() || truncated) {
+                handleBootstrapLine(
+                    line.toString(), truncated, source, profileDir,
+                    events, tail, endpointEvents);
+            }
+        } catch (IOException e) {
+            tail.add("startup stream read failed ("
+                + e.getClass().getSimpleName() + ")");
+        } finally {
+            events.offer(BootstrapEvent.closed(source));
         }
+    }
+
+    private static boolean handleBootstrapLine(
+            String rawLine, boolean truncated, DevToolsWitnessSource source,
+            Path profileDir, LinkedBlockingQueue<BootstrapEvent> events,
+            BootstrapTail tail, int endpointEvents) {
+        tail.add(sanitizeBootstrapLine(
+            truncated ? rawLine + " <truncated>" : rawLine, profileDir));
+        Matcher marker = DEVTOOLS_LINE.matcher(rawLine);
+        if (!marker.find()) { return false; }
+        if (endpointEvents >= 8) { return true; }
+        if (truncated) {
+            events.offer(BootstrapEvent.malformed(source));
+            return true;
+        }
+        DevToolsEndpoint endpoint = parseStreamDevToolsEndpoint(marker.group(1));
+        events.offer(endpoint != null
+            ? BootstrapEvent.endpoint(source, endpoint)
+            : BootstrapEvent.malformed(source));
+        return true;
+    }
+
+    private static DevToolsEndpoint parseStreamDevToolsEndpoint(String raw) {
+        if (raw == null || raw.length() > 2_048) { return null; }
+        try {
+            URI uri = URI.create(raw);
+            if (!"ws".equalsIgnoreCase(uri.getScheme())
+                    || uri.getUserInfo() != null
+                    || uri.getQuery() != null
+                    || uri.getFragment() != null
+                    || uri.getPort() < 1 || uri.getPort() > 65_535
+                    || !DEVTOOLS_BROWSER_PATH.matcher(uri.getRawPath()).matches()) {
+                return null;
+            }
+            String host = uri.getHost();
+            if (host == null) { return null; }
+            String normalizedHost = host.toLowerCase(java.util.Locale.ROOT);
+            if (!("127.0.0.1".equals(normalizedHost)
+                    || "localhost".equals(normalizedHost)
+                    || "::1".equals(normalizedHost)
+                    || "[::1]".equals(normalizedHost)
+                    || "0:0:0:0:0:0:0:1".equals(normalizedHost))) {
+                return null;
+            }
+            String canonical = "loopback:" + uri.getPort() + uri.getRawPath();
+            return new DevToolsEndpoint(canonical, uri.toASCIIString());
+        } catch (IllegalArgumentException malformed) {
+            return null;
+        }
+    }
+
+    private static ActivePortProbe probeDevToolsActivePort(Path profileDir) {
+        Path activePort = profileDir.resolve("DevToolsActivePort");
+        try {
+            if (Files.notExists(activePort, LinkOption.NOFOLLOW_LINKS)) {
+                return ActivePortProbe.absent();
+            }
+            if (!Files.isRegularFile(activePort, LinkOption.NOFOLLOW_LINKS)) {
+                return ActivePortProbe.malformed();
+            }
+            byte[] bytes;
+            try (InputStream input = Files.newInputStream(
+                    activePort, StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS)) {
+                // The limit is enforced on the opened handle. A size check followed
+                // by readAllLines would be a grow-between-check-and-read allocation
+                // race and would not actually bound this witness.
+                bytes = input.readNBytes(DEVTOOLS_ACTIVE_PORT_FILE_CAP + 1);
+            }
+            if (bytes.length == 0) { return ActivePortProbe.incomplete(); }
+            if (bytes.length > DEVTOOLS_ACTIVE_PORT_FILE_CAP) {
+                return ActivePortProbe.malformed();
+            }
+            String content;
+            try {
+                content = StandardCharsets.UTF_8.newDecoder()
+                    .decode(ByteBuffer.wrap(bytes)).toString();
+            } catch (java.nio.charset.CharacterCodingException invalidUtf8) {
+                return ActivePortProbe.malformed();
+            }
+            List<String> lines = content.lines().toList();
+            if (lines.size() < 2) { return ActivePortProbe.incomplete(); }
+            if (lines.size() != 2) { return ActivePortProbe.malformed(); }
+            String portLine = lines.get(0).trim();
+            String path = lines.get(1).trim();
+            int port;
+            try { port = Integer.parseInt(portLine); }
+            catch (NumberFormatException invalidPort) {
+                return ActivePortProbe.malformed();
+            }
+            if (port < 1 || port > 65_535
+                    || !DEVTOOLS_BROWSER_PATH.matcher(path).matches()) {
+                return ActivePortProbe.malformed();
+            }
+            String canonical = "loopback:" + port + path;
+            return ActivePortProbe.valid(new DevToolsEndpoint(
+                canonical, "ws://127.0.0.1:" + port + path));
+        } catch (java.nio.file.NoSuchFileException race) {
+            return ActivePortProbe.absent();
+        } catch (IOException race) {
+            // Chrome creates then fills the file. A transient read/replace race
+            // is incomplete until the shared bootstrap deadline proves otherwise.
+            return ActivePortProbe.incomplete();
+        }
+    }
+
+    private static String sanitizeBootstrapLine(String raw, Path profileDir) {
+        String source = raw == null ? "" : raw;
+        StringBuilder printable = new StringBuilder(source.length());
+        for (int i = 0; i < source.length(); i++) {
+            char c = source.charAt(i);
+            printable.append(Character.isISOControl(c) ? ' ' : c);
+        }
+        String line = printable.toString();
+        if (STARTUP_COMMAND_LINE.matcher(line).matches()) {
+            return "<command line redacted>";
+        }
+        line = line.replace(profileDir.toString(), "<profile>");
+        line = STARTUP_URL_TOKEN.matcher(line).replaceAll("<url>");
+        if (STARTUP_SENSITIVE_HEADER.matcher(line).matches()) {
+            return "<sensitive startup line redacted>";
+        }
+        line = STARTUP_QUOTED_ABSOLUTE_PATH.matcher(line).replaceAll("<path>");
+        // An unquoted path may itself contain spaces, so replacing only the
+        // first token can disclose the remainder. Redact that diagnostic line
+        // wholesale rather than guessing where the host path ends.
+        if (STARTUP_ABSOLUTE_PATH.matcher(line).find()) {
+            return "<host path line redacted>";
+        }
+        line = STARTUP_FLAG_ASSIGNMENT.matcher(line).replaceAll("$1=<redacted>");
+        line = STARTUP_FLAG_VALUE.matcher(line).replaceAll("$1 <redacted>");
+        line = STARTUP_SECRET_ASSIGNMENT.matcher(line).replaceAll("$1=<redacted>");
+        line = STARTUP_ENV_ASSIGNMENT.matcher(line).replaceAll("$1=<redacted>");
+        line = STARTUP_BEARER_CREDENTIAL.matcher(line).replaceAll("$1 <redacted>");
+        String sanitized = line.strip();
+        if (sanitized.length() > BOOTSTRAP_TAIL_LINE_CAP) {
+            return sanitized.substring(0, BOOTSTRAP_TAIL_LINE_CAP) + "…";
+        }
+        return sanitized;
+    }
+
+    private static String awaitDevtoolsUrl(Process process, Path profileDir)
+            throws IOException {
+        DevToolsBootstrapResult result = observeDevToolsEndpoint(
+            process, profileDir, DEFAULT_TIMEOUT_MS);
+        if (result.outcome() == DevToolsBootstrapOutcome.ENDPOINT) {
+            return result.webSocketUrl();
+        }
+        throw new IOException(bootstrapFailureMessage(result));
+    }
+
+    static String bootstrapFailureMessage(DevToolsBootstrapResult result) {
+        String headline = switch (result.outcome()) {
+            case PROCESS_EXITED -> "Chrome exited before publishing a DevTools endpoint"
+                + (result.exitCode() >= 0 ? " (exit " + result.exitCode() + ")" : "");
+            case ALIVE_TIMEOUT -> "Chrome remained alive without publishing a DevTools endpoint";
+            case MALFORMED_ENDPOINT ->
+                "Chrome published a malformed DevTools endpoint witness via "
+                    + result.sources();
+            case DISAGREEING_ENDPOINTS ->
+                "Chrome published disagreeing DevTools endpoint witnesses via "
+                    + result.sources();
+            case ENDPOINT -> throw new IllegalArgumentException(
+                "successful bootstrap has no failure message");
+        };
+        StringBuilder message = new StringBuilder(headline)
+            .append(" after ").append(result.elapsedMillis()).append("ms");
+        if (!result.stdoutTail().isBlank()) {
+            message.append("; sanitized stdout tail: ").append(result.stdoutTail());
+        }
+        if (!result.stderrTail().isBlank()) {
+            message.append("; sanitized stderr tail: ").append(result.stderrTail());
+        }
+        return message.toString();
     }
 
     // ---- protocol ----------------------------------------------------------
@@ -1103,12 +1644,12 @@ public final class BrewShot implements AutoCloseable {
                 // genuinely new request grows the set. Either way it is activity.
                 Object rid = MiniJson.get(m, "params.requestId");
                 if (rid != null) { inFlightRequestIds.add(String.valueOf(rid)); }
-                lastNetChangeMs = System.currentTimeMillis();
+                lastNetChangeNanos = System.nanoTime();
             }
             case "Network.loadingFinished", "Network.loadingFailed" -> {
                 Object rid = MiniJson.get(m, "params.requestId");
                 if (rid != null) { inFlightRequestIds.remove(String.valueOf(rid)); }
-                lastNetChangeMs = System.currentTimeMillis();
+                lastNetChangeNanos = System.nanoTime();
             }
             default -> { /* drop: nothing awaits it, nothing reads it */ }
         }
@@ -1225,7 +1766,7 @@ public final class BrewShot implements AutoCloseable {
         consoleLog.clear();
         errorLog.clear();
         inFlightRequestIds.clear();
-        lastNetChangeMs = System.currentTimeMillis();
+        lastNetChangeNanos = System.nanoTime();
         // Re-send any active colorScheme/media/reducedMotion override BEFORE the navigation
         // command below, so the new document paints under it from the first frame — a no-op
         // when none was ever set (plan 02af3a3d: emulation must survive "any new page/navigation
@@ -1239,11 +1780,12 @@ public final class BrewShot implements AutoCloseable {
      * Fails loud with the predicate text on timeout.
      */
     public void waitFor(String jsPredicate, long timeoutMs) {
-        long deadline = System.currentTimeMillis() + timeoutMs;
+        Validation.positiveLong("waitFor timeoutMs", timeoutMs);
+        Deadline deadline = Deadline.afterMillis(timeoutMs);
         while (true) {
             Object v = eval("!!(" + jsPredicate + ")");
             if (Boolean.TRUE.equals(v)) { return; }
-            if (System.currentTimeMillis() > deadline) {
+            if (deadline.expired()) {
                 throw new IllegalStateException(
                     "waitFor timed out after " + timeoutMs + "ms: " + jsPredicate);
             }
@@ -1429,7 +1971,7 @@ public final class BrewShot implements AutoCloseable {
      * dashboard on a loaded CI runner that needs &gt;15s is no longer unraisable.
      */
     public BrewShot navTimeout(long millis) {
-        if (millis > 0) { this.navTimeoutMs = millis; }
+        this.navTimeoutMs = Validation.positiveLong("navTimeout millis", millis);
         return this;
     }
 
@@ -1445,7 +1987,7 @@ public final class BrewShot implements AutoCloseable {
      * itself was fast, and raising the navigation budget would not have helped it.
      */
     public BrewShot commandTimeout(long millis) {
-        if (millis > 0) { this.commandTimeoutMs = millis; }
+        this.commandTimeoutMs = Validation.positiveLong("commandTimeout millis", millis);
         return this;
     }
 
@@ -1460,7 +2002,7 @@ public final class BrewShot implements AutoCloseable {
      * announces itself beats both an OOM and a silently short one.
      */
     public BrewShot recordingHeapBudget(long bytes) {
-        if (bytes > 0) { this.maxRecordingBytes = bytes; }
+        this.maxRecordingBytes = Validation.positiveLong("recordingHeapBudget bytes", bytes);
         return this;
     }
 
@@ -1470,13 +2012,20 @@ public final class BrewShot implements AutoCloseable {
      * hard gate). {@link #open}/{@link #html} return on {@code loadEventFired},
      * which fires BEFORE async XHR/fetch settle; this bridges that gap. Network
      * is tracked from launch and the in-flight count resets per navigation.
+     * A zero timeout is an intentional no-op; negative values are rejected.
      */
     public void waitForNetworkIdle(long quietMillis, long timeoutMillis) {
-        long deadline = System.currentTimeMillis() + timeoutMillis;
-        while (System.currentTimeMillis() < deadline) {
+        Validation.nonNegativeLong("network-idle quietMillis", quietMillis);
+        Validation.nonNegativeLong("network-idle timeoutMillis", timeoutMillis);
+        Deadline deadline = Deadline.afterMillis(timeoutMillis);
+        long quietNanos = TimeUnit.MILLISECONDS.toNanos(quietMillis);
+        while (!deadline.expired()) {
             drainInboxNonBlocking();
-            long now = System.currentTimeMillis();
-            if (inFlightRequestIds.isEmpty() && now - lastNetChangeMs >= quietMillis) { return; }
+            long quietForNanos = System.nanoTime() - lastNetChangeNanos;
+            if (inFlightRequestIds.isEmpty()
+                    && quietForNanos >= quietNanos) {
+                return;
+            }
             try { Thread.sleep(15); }
             catch (InterruptedException e) { Thread.currentThread().interrupt(); return; }
         }
@@ -1502,8 +2051,9 @@ public final class BrewShot implements AutoCloseable {
         waitForFontsReady();
     }
 
-    /** Sleep helper for settle waits between eval steps. */
+    /** Sleep helper for settle waits between eval steps. Zero is an intentional no-op. */
     public void settle(long millis) {
+        Validation.nonNegativeLong("settle millis", millis);
         try { Thread.sleep(millis); }
         catch (InterruptedException e) { Thread.currentThread().interrupt(); }
     }
@@ -1523,12 +2073,10 @@ public final class BrewShot implements AutoCloseable {
      * unit-testable without a browser.
      */
     static String captureFormatParams(ImageFormat fmt, int quality) {
+        Objects.requireNonNull(fmt, "fmt");
         if (fmt == ImageFormat.JPEG) {
-            if (quality < 1 || quality > 100) {
-                throw new IllegalArgumentException(
-                    "jpeg quality must be 1-100, got " + quality);
-            }
-            return "\"format\":\"jpeg\",\"quality\":" + quality;
+            return "\"format\":\"jpeg\",\"quality\":"
+                + Validation.intRange("jpeg quality", quality, 1, 100);
         }
         return "\"format\":\"png\"";
     }
@@ -1563,6 +2111,16 @@ public final class BrewShot implements AutoCloseable {
                              double paperWidthIn, double paperHeightIn,
                              double marginTopIn, double marginRightIn,
                              double marginBottomIn, double marginLeftIn) {
+        public PdfOptions {
+            Validation.finiteRange("pdf scale", scale, 0.1, 2.0);
+            Validation.positiveFinite("pdf paper width", paperWidthIn);
+            Validation.positiveFinite("pdf paper height", paperHeightIn);
+            Validation.nonNegativeFinite("pdf top margin", marginTopIn);
+            Validation.nonNegativeFinite("pdf right margin", marginRightIn);
+            Validation.nonNegativeFinite("pdf bottom margin", marginBottomIn);
+            Validation.nonNegativeFinite("pdf left margin", marginLeftIn);
+        }
+
         /** US Letter, portrait, zero-margin, backgrounds on, scale 1.0. */
         public static PdfOptions defaults() {
             return new PdfOptions(false, true, 1.0, 8.5, 11.0, 0, 0, 0, 0);
@@ -1609,18 +2167,7 @@ public final class BrewShot implements AutoCloseable {
      * browser (mirrors {@link #captureFormatParams(ImageFormat, int)}).
      */
     static String printPdfParams(PdfOptions o) {
-        if (o.paperWidthIn() <= 0 || o.paperHeightIn() <= 0) {
-            throw new IllegalArgumentException(
-                "pdf paper size must be positive inches, got "
-                    + o.paperWidthIn() + "x" + o.paperHeightIn());
-        }
-        if (o.marginTopIn() < 0 || o.marginRightIn() < 0
-                || o.marginBottomIn() < 0 || o.marginLeftIn() < 0) {
-            throw new IllegalArgumentException("pdf margins must be non-negative inches");
-        }
-        if (o.scale() < 0.1 || o.scale() > 2.0) {
-            throw new IllegalArgumentException("pdf scale must be 0.1-2.0, got " + o.scale());
-        }
+        Objects.requireNonNull(o, "opts");
         return "\"landscape\":" + o.landscape()
             + ",\"printBackground\":" + o.printBackground()
             + ",\"scale\":" + o.scale()
@@ -1676,12 +2223,7 @@ public final class BrewShot implements AutoCloseable {
      */
     public byte[] screenshotClip(double x, double y, double width, double height,
                                  double scale, ImageFormat fmt, int quality) {
-        if (!Double.isFinite(x) || !Double.isFinite(y)
-                || !Double.isFinite(width) || !Double.isFinite(height)
-                || !Double.isFinite(scale) || scale <= 0) {
-            throw new IllegalArgumentException("non-finite/invalid clip: "
-                + x + "," + y + " " + width + "x" + height + " @" + scale);
-        }
+        validateClipGeometry(x, y, width, height, scale);
         Map<String, Object> r = command("Page.captureScreenshot",
             "{" + captureFormatParams(fmt, quality)
                 + ",\"captureBeyondViewport\":true,\"clip\":{"
@@ -1689,6 +2231,38 @@ public final class BrewShot implements AutoCloseable {
                 + ",\"width\":" + width + ",\"height\":" + height
                 + ",\"scale\":" + scale + "}}");
         return Base64.getDecoder().decode((String) r.get("data"));
+    }
+
+    static void validateClipGeometry(double x, double y, double width,
+                                     double height, double scale) {
+        Validation.finite("clip x", x);
+        Validation.finite("clip y", y);
+        Validation.positiveFinite("clip width", width);
+        Validation.positiveFinite("clip height", height);
+        Validation.positiveFinite("clip scale", scale);
+    }
+
+    static void validateFrameRecorder(int frames, int captureDelayMs,
+                                      int playbackDelayMs) {
+        Validation.positiveInt("frames", frames);
+        Validation.positiveInt("captureDelayMs", captureDelayMs);
+        effectiveGifDelayMs(playbackDelayMs);
+    }
+
+    /**
+     * Effective per-frame delay a GIF can encode. GIF stores centiseconds, so
+     * requested milliseconds are rounded to the nearest 10&nbsp;ms (half up);
+     * the existing 20&nbsp;ms minimum is retained. For example, 75&nbsp;ms
+     * encodes as 80&nbsp;ms. Values beyond the GIF unsigned-16-bit delay field
+     * are rejected instead of wrapping.
+     */
+    public static int effectiveGifDelayMs(int requestedDelayMs) {
+        // 65,535 centiseconds is the largest representable GIF delay.
+        // Requests through 655,354 ms still round to that value; 655,355 ms
+        // would round to the unrepresentable 65,536 centiseconds.
+        Validation.intRange("GIF delayMs", requestedDelayMs, 1, 655_354);
+        long centiseconds = Math.max(2L, (requestedDelayMs + 5L) / 10L);
+        return Math.toIntExact(centiseconds * 10L);
     }
 
     /**
@@ -1714,11 +2288,13 @@ public final class BrewShot implements AutoCloseable {
      *   <li>{@code playbackDelayMs} — the per-frame display duration stamped into
      *       the GIF: this is the SPEED. {@code playbackDelayMs > captureDelayMs}
      *       plays it back in slow motion; {@code <} speeds it up; {@code ==} is
-     *       ≈ real time. FPS = {@code 1000 / playbackDelayMs}.</li>
+     *       ≈ real time. GIF rounds to centiseconds; exact FPS is
+     *       {@code 1000 / effectiveGifDelayMs(playbackDelayMs)}.</li>
      * </ul>
      * Sample a fast effect densely and replay it readably:
      * {@code recordGif(..., 60, 25, 75, out)} — 60 shots ~25ms apart, played at
-     * 75ms/frame (≈13fps slow-mo). See the README "GIF playback speed" table.
+     * 75ms requested (80ms encoded, 12.5fps slow-mo). See the README
+     * "GIF playback speed" table.
      */
     public void recordGif(double x, double y, double width, double height,
                           int frames, int captureDelayMs, int playbackDelayMs, Path out)
@@ -1741,6 +2317,9 @@ public final class BrewShot implements AutoCloseable {
     public void recordGif(double x, double y, double width, double height,
                           int frames, int captureDelayMs, int playbackDelayMs,
                           IntConsumer beforeFrame, Path out) throws IOException {
+        validateFrameRecorder(frames, captureDelayMs, playbackDelayMs);
+        validateClipGeometry(x, y, width, height, 1.0);
+        Objects.requireNonNull(beforeFrame, "beforeFrame");
         // The frame COUNT bounds the loop but not the BYTES — full-page frames at a
         // large count are the same OOM the screencast recorder guards against, so
         // both recorder families ride the ONE FrameBudget (the write-side twin the
@@ -1764,7 +2343,7 @@ public final class BrewShot implements AutoCloseable {
      * matches. The building block for element-targeted capture.
      */
     public double[] elementBox(String cssSelector) {
-        String sel = "'" + cssSelector.replace("\\", "\\\\").replace("'", "\\'") + "'";
+        String sel = jsStringLiteral(cssSelector);
         Object v = eval("(function(){var e=document.querySelector(" + sel + ");"
             + "if(!e)return 'none';var r=e.getBoundingClientRect();"
             + "return [r.left+window.scrollX,r.top+window.scrollY,r.width,r.height].join(',');})()");
@@ -1774,6 +2353,17 @@ public final class BrewShot implements AutoCloseable {
         String[] p = s.split(",");
         return new double[] {Double.parseDouble(p[0]), Double.parseDouble(p[1]),
                              Double.parseDouble(p[2]), Double.parseDouble(p[3])};
+    }
+
+    /**
+     * Quote a Java string as one JavaScript source string literal. JSON string
+     * syntax is also valid here; {@link MiniJson#esc} covers quotes,
+     * backslashes, controls, CR/LF, and the JavaScript line separators U+2028
+     * and U+2029. Package-private for injection-focused tests.
+     */
+    static String jsStringLiteral(String value) {
+        Objects.requireNonNull(value, "value");
+        return '"' + MiniJson.esc(value) + '"';
     }
 
     // ---- input dispatch ----------------------------------------------------
@@ -1836,7 +2426,7 @@ public final class BrewShot implements AutoCloseable {
      * the same eval is already post-scroll.
      */
     private double[] visibleCenter(String cssSelector) {
-        String sel = "'" + cssSelector.replace("\\", "\\\\").replace("'", "\\'") + "'";
+        String sel = jsStringLiteral(cssSelector);
         Object v = eval("(function(){var e=document.querySelector(" + sel + ");"
             + "if(!e)return 'none';e.scrollIntoView({block:'center',inline:'center'});"
             + "var r=e.getBoundingClientRect();"
@@ -1903,9 +2493,8 @@ public final class BrewShot implements AutoCloseable {
      * an element flush against the edge.
      */
     public byte[] screenshotElement(String cssSelector, double scale, double paddingPx) {
-        if (!Double.isFinite(paddingPx) || paddingPx < 0) {
-            throw new IllegalArgumentException("invalid paddingPx: " + paddingPx);
-        }
+        Validation.positiveFinite("clip scale", scale);
+        Validation.nonNegativeFinite("paddingPx", paddingPx);
         double[] b = elementBox(cssSelector);
         return screenshotClip(Math.max(0, b[0] - paddingPx), Math.max(0, b[1] - paddingPx),
             b[2] + 2 * paddingPx, b[3] + 2 * paddingPx, scale);
@@ -1975,6 +2564,10 @@ public final class BrewShot implements AutoCloseable {
     public void recordGifElement(String cssSelector, int frames, int captureDelayMs,
                                  int playbackDelayMs, int firstFrameDelayMs, double scale,
                                  IntConsumer beforeFrame, Path out) throws IOException {
+        validateFrameRecorder(frames, captureDelayMs, playbackDelayMs);
+        effectiveGifDelayMs(firstFrameDelayMs);
+        Validation.positiveFinite("recording scale", scale);
+        Objects.requireNonNull(beforeFrame, "beforeFrame");
         double[] b = elementBox(cssSelector);
         // brewshot 109: EVERY accumulating recorder rides the one FrameBudget.
         FrameBudget budget = new FrameBudget();
@@ -2000,6 +2593,10 @@ public final class BrewShot implements AutoCloseable {
      */
     public void recordGifScroll(int panFrames, int holdFrames, int playbackDelayMs,
                                 double scale, Path out) throws IOException {
+        Validation.positiveInt("panFrames", panFrames);
+        Validation.nonNegativeInt("holdFrames", holdFrames);
+        effectiveGifDelayMs(playbackDelayMs);
+        Validation.positiveFinite("recording scale", scale);
         double w = ((Number) eval("document.documentElement.scrollWidth")).doubleValue();
         double h = ((Number) eval("document.documentElement.scrollHeight")).doubleValue();
         double vh = ((Number) eval("window.innerHeight")).doubleValue();
@@ -2028,6 +2625,8 @@ public final class BrewShot implements AutoCloseable {
      */
     public void recordGifFullPage(int frames, int frameDelayMs, double scale, Path out)
             throws IOException {
+        validateFrameRecorder(frames, frameDelayMs, frameDelayMs);
+        Validation.positiveFinite("recording scale", scale);
         double w = ((Number) eval("document.documentElement.scrollWidth")).doubleValue();
         double h = ((Number) eval("document.documentElement.scrollHeight")).doubleValue();
         FrameBudget budget = new FrameBudget();
@@ -2048,6 +2647,7 @@ public final class BrewShot implements AutoCloseable {
      */
     public byte[] screenshotRegion(double fromFraction, double toFraction, double scale) {
         checkFractions(fromFraction, toFraction);
+        Validation.positiveFinite("region scale", scale);
         double w = ((Number) eval("document.documentElement.scrollWidth")).doubleValue();
         double h = ((Number) eval("document.documentElement.scrollHeight")).doubleValue();
         return screenshotClip(0, h * fromFraction, w, h * (toFraction - fromFraction), scale);
@@ -2062,6 +2662,8 @@ public final class BrewShot implements AutoCloseable {
                                 int frames, int frameDelayMs, double scale, Path out)
             throws IOException {
         checkFractions(fromFraction, toFraction);
+        validateFrameRecorder(frames, frameDelayMs, frameDelayMs);
+        Validation.positiveFinite("recording scale", scale);
         double w = ((Number) eval("document.documentElement.scrollWidth")).doubleValue();
         double h = ((Number) eval("document.documentElement.scrollHeight")).doubleValue();
         double y = h * fromFraction;
@@ -2077,6 +2679,8 @@ public final class BrewShot implements AutoCloseable {
     }
 
     private static void checkFractions(double from, double to) {
+        Validation.finite("region fromFraction", from);
+        Validation.finite("region toFraction", to);
         if (!(from >= 0 && to <= 1 && from < to)) {
             throw new IllegalArgumentException(
                 "region fractions want 0 <= from < to <= 1, got " + from + ".." + to);
@@ -2112,11 +2716,10 @@ public final class BrewShot implements AutoCloseable {
      */
     public int recordGifStream(int durationMs, int playbackDelayMs, int firstFrameDelayMs,
                                int maxWidth, Path out) throws IOException {
-        if (durationMs <= 0 || playbackDelayMs <= 0 || firstFrameDelayMs <= 0 || maxWidth < 0) {
-            throw new IllegalArgumentException("recordGifStream wants durationMs/delays > 0"
-                + " and maxWidth >= 0, got " + durationMs + "/" + playbackDelayMs + "/"
-                + firstFrameDelayMs + "/" + maxWidth);
-        }
+        Validation.positiveInt("durationMs", durationMs);
+        effectiveGifDelayMs(playbackDelayMs);
+        effectiveGifDelayMs(firstFrameDelayMs);
+        Validation.nonNegativeInt("maxWidth", maxWidth);
         FrameBudget budget = new FrameBudget();
         command("Page.startScreencast", maxWidth > 0
             ? "{\"format\":\"png\",\"everyNthFrame\":1,\"maxWidth\":" + maxWidth + "}"
