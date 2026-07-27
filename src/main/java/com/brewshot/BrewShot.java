@@ -487,6 +487,11 @@ public final class BrewShot implements AutoCloseable {
         private ProcessHandle parentHandle;
         private final List<ProcessHandle> descendantHandles = new ArrayList<>();
         private Owner owner = Owner.LAUNCH;
+        /** The argv sweep enumerates every process on the host (~30ms here), so
+         *  it runs ONCE per lease rather than on every retry pass: reparenting
+         *  happens at most once per launch, and a per-pass sweep would spend a
+         *  meaningful slice of the bounded cleanup budget re-proving it. */
+        private boolean orphanSweepDone;
 
         private ResourceLease(Process process, Path profileDir,
                               ProfileDeleter profileDeleter,
@@ -533,8 +538,19 @@ public final class BrewShot implements AutoCloseable {
             boolean processTreeReaped = terminateProcess(
                 process, parentHandle, List.copyOf(descendantHandles),
                 gracefulFirst, deadline);
+            // Runs BEFORE the release gate and the delete: a helper that was
+            // reparented out of every handle snapshot is invisible to
+            // terminateProcess, and it recreates the directory we are about to
+            // remove. Its liveness also gates release — a known argv-matching
+            // survivor is positive evidence that containment is NOT closed.
+            boolean orphansReaped = true;
+            if (!orphanSweepDone) {
+                orphanSweepDone = true;
+                orphansReaped =
+                    allHandlesDead(sweepOrphansByProfilePath(profileDir, deadline));
+            }
             boolean releaseProven =
-                processTreeReaped && processTreeReleaseSafe();
+                processTreeReaped && orphansReaped && processTreeReleaseSafe();
             if (releaseProven) {
                 try { profileDeleter.delete(profileDir); }
                 catch (RuntimeException ignored) {
@@ -2902,6 +2918,9 @@ public final class BrewShot implements AutoCloseable {
     }
 
     private static boolean isAlive(Process process) {
+        // A handle-only teardown (the orphan sweep) has no Process reference;
+        // "no process" is dead, not indeterminate.
+        if (process == null) { return false; }
         try { return process.isAlive(); }
         catch (RuntimeException ignored) { return true; }
     }
@@ -2909,6 +2928,79 @@ public final class BrewShot implements AutoCloseable {
     private static boolean handleAlive(ProcessHandle handle) {
         try { return handle.isAlive(); }
         catch (RuntimeException ignored) { return true; }
+    }
+
+    /**
+     * Reparented-orphan sweep, keyed on this launch's unique profile path.
+     *
+     * <p>The retained-handle snapshot in {@link ResourceLease} covers every
+     * member an enumeration ever OBSERVED. It cannot cover a helper that was
+     * already reparented before the first observation — the shape of a FAILED
+     * bootstrap (Marlow's report, brewshot room 140): Chrome's launcher
+     * re-execs or spawns helpers and the direct child exits ("Chrome exited
+     * without a DevTools listening line") before any {@code descendants()}
+     * walk runs. No walk from a dead root finds those helpers, yet they still
+     * hold and rewrite the profile directory.
+     *
+     * <p>What DOES still identify them is argv: every process of this launch
+     * carries {@code --user-data-dir=<profile>}, and the profile is a fresh
+     * {@link Files#createTempDirectory} name — long, random, never reused — so
+     * a full-path match cannot collide with an unrelated process. Matching on
+     * the path, never on a process name, is what keeps this from being a
+     * "kill anything called chrome" sweep.
+     *
+     * <p>Enumeration and the returned liveness are best effort:
+     * {@code info().commandLine()} is empty for other users' processes, so a
+     * clean sweep is evidence, not proof — which is why the caller still
+     * requires an independent containment proof before releasing the profile.
+     *
+     * @return the handles this sweep signalled, for the caller's liveness gate
+     */
+    private static List<ProcessHandle> sweepOrphansByProfilePath(
+            Path profileDir, Deadline deadline) {
+        String needle;
+        try { needle = profileDir.toAbsolutePath().toString(); }
+        catch (RuntimeException ignored) { return List.of(); }
+        if (needle.isEmpty()) { return List.of(); }
+
+        ProcessHandle self = ProcessHandle.current();
+        List<ProcessHandle> orphans = new ArrayList<>();
+        try (var all = ProcessHandle.allProcesses()) {
+            all.filter(ph -> !ph.equals(self))
+                .filter(ph -> commandLineContains(ph, needle))
+                .forEach(orphans::add);
+        } catch (RuntimeException ignored) {
+            // A racing exit mid-enumeration must not break the rest of cleanup;
+            // whatever was collected before the fault is still worth killing.
+        }
+        for (ProcessHandle orphan : orphans) {
+            try { orphan.destroyForcibly(); }
+            catch (RuntimeException ignored) { /* already gone */ }
+        }
+        if (!orphans.isEmpty()) {
+            boolean[] interrupted = { false };
+            awaitHandles(null, orphans, deadline, interrupted);
+            if (interrupted[0]) { Thread.currentThread().interrupt(); }
+        }
+        return orphans;
+    }
+
+    private static boolean commandLineContains(ProcessHandle handle, String needle) {
+        try {
+            return handle.info().commandLine()
+                .map(commandLine -> commandLine.contains(needle))
+                .orElse(false);
+        } catch (RuntimeException ignored) {
+            // Unreadable process info is not a match claim.
+            return false;
+        }
+    }
+
+    private static boolean allHandlesDead(List<ProcessHandle> handles) {
+        for (ProcessHandle handle : handles) {
+            if (handleAlive(handle)) { return false; }
+        }
+        return true;
     }
 
     private static boolean allProcessesDead(
