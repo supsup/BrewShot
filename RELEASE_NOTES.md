@@ -2,6 +2,51 @@
 
 ## Unreleased
 
+- **Reparented-orphan sweep before profile release** (plan 735951a2; Marlow's
+  report-only evidence, brewshot room 140): `ResourceLease` cleanup force-kills
+  every process-tree member an enumeration ever OBSERVED, but a helper that was
+  reparented BEFORE the first `descendants()` snapshot is invisible to every
+  handle walk — the shape of a failed bootstrap, where the direct child exits
+  ("Chrome exited without a DevTools listening line") before any walk runs while
+  its helpers live on and recreate the generated `brewshot-*` profile dir.
+  Cleanup now also force-kills any process still carrying this launch's unique
+  `--user-data-dir=<temp>` path in its argv — a full-path match against a fresh
+  `createTempDirectory` name, never a process name — and runs it BEFORE the
+  delete. A still-live argv match is positive evidence that containment is not
+  closed, so it now blocks profile release rather than letting the delete race a
+  live writer; the fail-closed retention contract is strengthened, not relaxed.
+  Chose argv matching over POSIX process groups: `ProcessBuilder` cannot
+  `setsid`, so groups would cost a wrapper hop on every launch. Verified
+  red-then-green against dummy `/bin/sh` process trees whose reparented child
+  demonstrably recreated the dir without the sweep; NOT verified against a real
+  failed Chrome bootstrap (browser launches are operator-forbidden while the
+  crash-dialog investigation is live). The correlation between this leak class
+  and the macOS crash-alert reports remains THEORY — the evidence in room 140
+  shows a survivor recreating the profile dir, not that this ends the alerts.
+- **`BREWSHOT_FORBID_CHROME=1` test-gate kill switch**: the Chrome-gated suites
+  previously keyed only on browser availability, so a Chrome-having host could
+  not run `./gradlew test` without launching Chrome. The operator switch makes
+  gated suites loud-skip exactly like a browser-less host (banner + JUnit
+  skip); `BREWSHOT_REQUIRE_CHROME`'s no-skip guard still fails a
+  forbid+require run.
+- **Real resource bounds on the CDP transport, captures, and recordings.** Advertised
+  bounds are now enforced rather than assumed. The CDP inbox is a finite queue
+  (`brewshot.maxInboxMessages`, default 4096) sized one slot beyond its cap so the
+  close/error sentinel always has a home; oversized single messages are dropped at
+  reassembly (`brewshot.maxCdpMessageBytes`); console/error retention is clamped to a
+  byte budget; screenshot captures are refused from their decoded size before anything
+  is written; and GIF recording checks frame dimensions and a decoded working-set budget
+  before decode. Every refusal and drop is **announced once and counted**, never silent.
+  **Terminal transport state is now durable:** a nonblocking drain — reachable from
+  `console()`, `errors()`, `freshNavigation()` and `waitForNetworkIdle()` — used to
+  consume the close sentinel and leave later callers unable to learn the socket had died,
+  so a command waited out its full timeout with Chrome still alive; the closed state is
+  now latched and every subsequent command fails fast with a closed-socket reason.
+  Tradeoffs, stated because they are real: the new defaults can refuse very large captures
+  and recordings that previously succeeded (all are `-D` overridable), and a saturated
+  inbox can drop a solicited response and surface it as a command timeout. These are
+  bounds for the trusted-page model — not a defence against a hostile page.
+
 - **Docker watched folders without sacrificing the CLI.** The Java 25 image
   still defaults to BrewShot's original argv/stdin/stdout CLI and now accepts
   `cli` as an explicit spelling plus a long-running `watch` mode over
