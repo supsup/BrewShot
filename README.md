@@ -293,6 +293,14 @@ largest cluster at 173,203 (43x17, 20% of the change) — in the body.
   evidence-first contract as `--fail-js`. Percent thresholds are bounded to
   0–100, and per-channel tolerance is bounded to 0–254 so even a maximum
   255-channel delta remains observable.
+- **Input size is bounded before the decode** — `diff` reads each input's PNG
+  header first and refuses an oversized one as a usage error (**exit 2**) without
+  allocating its raster, so a file that *declares* 40000×40000 costs a header read
+  rather than 6 GB of memory. Two independent ceilings, both inclusive and both
+  raisable when you genuinely have a large image: `-Dbrewshot.maxImageDimension`
+  (default 16384 px per axis) and `-Dbrewshot.maxImagePixels` (default 67108864
+  total). A file that simply isn't a decodable image is unaffected — that stays
+  exit 1.
 - **Mask dynamic regions** (`--mask x,y,w,h`, repeatable): zero a clock or
   spinner on both images so the numbers stay stable and citable. Masks require
   positive extents, are clipped to the image, and a wholly outside mask is an

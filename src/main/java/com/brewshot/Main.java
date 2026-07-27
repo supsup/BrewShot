@@ -646,7 +646,12 @@ public final class Main {
 
             A size mismatch renders an explicit sizeMismatch verdict (never a crash);
             under any --fail-* gate it exits 4. Uses ImageIO (JVM/jar path — the same
-            caveat as GIF recording; not the macOS native binary).""");
+            caveat as GIF recording; not the macOS native binary).
+
+            Inputs are size-checked from their header BEFORE any decode and refused
+            with exit 2 if over: -Dbrewshot.maxImageDimension (default 16384 px per
+            axis) and -Dbrewshot.maxImagePixels (default 67108864 total). Both bounds
+            are inclusive; raise either when you genuinely have a larger image.""");
     }
 
     /** The machine-readable sidecar CI/agent wrappers want beside the PNG. */
