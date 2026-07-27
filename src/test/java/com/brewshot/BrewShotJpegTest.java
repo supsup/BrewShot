@@ -81,4 +81,32 @@ class BrewShotJpegTest {
             assertEquals((byte) 'P', pngBytes[1], "PNG default still PNG");
         }
     }
+
+    @Test
+    void cliMixedCaseJpegExtensionWritesDecodableJpegBytes() throws Exception {
+        TestChrome.requireChromeOrLoudSkip("BrewShotJpegTest");
+        Path directory = Files.createTempDirectory("brewshot-cli-jpeg");
+        Path page = directory.resolve("page.html");
+        Files.writeString(page, """
+            <style>*{margin:0}</style>
+            <div id="card" style="width:180px;height:90px;
+              background:linear-gradient(90deg,#124,#f80)">jpeg</div>
+            """);
+        Path jpeg = directory.resolve("card.JpEg");
+        Path manifest = directory.resolve("card.json");
+
+        int code = Main.run(new String[] {
+            page.toString(), "-o", jpeg.toString(), "--clip-selector", "#card",
+            "--jpeg-quality", "61", "--json", manifest.toString(), "--settle", "25",
+        });
+
+        assertEquals(0, code);
+        byte[] bytes = Files.readAllBytes(jpeg);
+        assertEquals((byte) 0xFF, bytes[0], "CLI JPEG magic byte 0");
+        assertEquals((byte) 0xD8, bytes[1], "CLI JPEG magic byte 1");
+        assertTrue(javax.imageio.ImageIO.read(jpeg.toFile()) != null,
+            "CLI .jpeg artifact must decode as JPEG, never contain PNG bytes");
+        assertEquals(61.0,
+            MiniJson.get(MiniJson.parse(Files.readString(manifest)), "jpegQuality"));
+    }
 }
