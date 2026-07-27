@@ -19,11 +19,20 @@ final class TestChrome {
     private TestChrome() { }
 
     /**
-     * Gate a browser-dependent suite: if no Chrome/Chromium/Edge is found, emit
-     * a loud SKIPPED banner and abort the test as a JUnit skip. Otherwise return.
+     * Gate a browser-dependent suite: if no Chrome/Chromium/Edge is found — or
+     * the operator set {@code BREWSHOT_FORBID_CHROME} to forbid launching the
+     * one that IS installed — emit a loud SKIPPED banner and abort the test as
+     * a JUnit skip. Otherwise return.
      */
     static void requireChromeOrLoudSkip(String suiteName) {
-        requireChromeOrLoudSkip(suiteName, BrewShot.available());
+        requireChromeOrLoudSkip(suiteName, BrewShot.available(),
+            isTruthy(System.getenv("BREWSHOT_FORBID_CHROME")));
+    }
+
+    /** Same truthiness the build's BREWSHOT_REQUIRE_CHROME guard uses. */
+    private static boolean isTruthy(String v) {
+        return v != null && (v.equals("1")
+            || v.equalsIgnoreCase("true") || v.equalsIgnoreCase("yes"));
     }
 
     /**
@@ -31,6 +40,44 @@ final class TestChrome {
      * be driven under test even when this host DOES have a browser installed.
      */
     static void requireChromeOrLoudSkip(String suiteName, boolean chromeAvailable) {
+        requireChromeOrLoudSkip(suiteName, chromeAvailable, false);
+    }
+
+    /**
+     * Full seam. {@code launchForbidden} is the operator kill switch
+     * ({@code BREWSHOT_FORBID_CHROME=1}): a host can HAVE a browser that the
+     * operator has forbidden the suite to launch (live example: a macOS
+     * crash-dialog investigation where every extra Chrome launch pollutes the
+     * evidence). Forbidden wins over available — the suite loud-skips exactly
+     * like a browser-less host, so the non-run stays visible and greppable.
+     * Under {@code BREWSHOT_REQUIRE_CHROME} the build-level no-skip guard still
+     * fails such a run: forbid+require is a contradictory operator instruction
+     * and the build refuses to report green on it.
+     *
+     * <p>NOTE the env var must reach the forked test JVM: Gradle forks tests
+     * from the daemon, so either export it before the daemon starts or run
+     * with {@code --no-daemon}.
+     */
+    static void requireChromeOrLoudSkip(String suiteName, boolean chromeAvailable,
+                                        boolean launchForbidden) {
+        if (launchForbidden) {
+            String banner = """
+
+                ============================================================
+                SKIPPED %s — CHROME LAUNCH FORBIDDEN BY OPERATOR
+                ------------------------------------------------------------
+                BREWSHOT_FORBID_CHROME is set: this host may well have a
+                browser, but the operator forbade launching it, so this
+                browser-dependent suite did NOT run. A green build here
+                tested NOTHING browser-side.
+
+                Unset BREWSHOT_FORBID_CHROME to run it.
+                ============================================================
+                """.formatted(suiteName);
+            System.err.println(banner);
+            Assumptions.abort("SKIPPED " + suiteName
+                + " — Chrome launch forbidden by operator (BREWSHOT_FORBID_CHROME)");
+        }
         if (chromeAvailable) { return; }
         String banner = """
 
