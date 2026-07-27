@@ -500,8 +500,16 @@ never "green that tested nothing."
 The load/navigation wait budget defaults to 15s; raise it for a heavy page with
 `BREWSHOT_TIMEOUT_MS` or per-instance `shot.navTimeout(ms)`.
 
-Two further resource bounds, each a separate axis:
+Three further resource bounds, each a separate axis:
 
+- **CDP inbox budgets** — every complete DevTools message is measured as exact
+  UTF-8 while its WebSocket fragments are reassembled
+  (`-Dbrewshot.maxCdpMessageBytes`, default 32 MiB). The undrained queue is
+  independently capped by regular-message count
+  (`-Dbrewshot.maxInboxMessages`, default 4096) and aggregate exact UTF-8 bytes
+  (`-Dbrewshot.maxInboxBytes`, default 32 MiB). Dequeue returns byte capacity;
+  these are live retained-content bounds, not lifetime traffic quotas. One
+  extra physical queue slot remains reserved for socket closure.
 - **Per-CDP-call budget** — how long one DevTools round-trip may take (a
   full-page screenshot of a tall document is the motivating case: navigation was
   fast, the single capture call wasn't). `BREWSHOT_COMMAND_TIMEOUT_MS` or

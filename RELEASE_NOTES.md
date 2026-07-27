@@ -32,11 +32,17 @@
 - **Real resource bounds on the CDP transport, captures, and recordings.** Advertised
   bounds are now enforced rather than assumed. The CDP inbox is a finite queue
   (`brewshot.maxInboxMessages`, default 4096) sized one slot beyond its cap so the
-  close/error sentinel always has a home; oversized single messages are dropped at
-  reassembly (`brewshot.maxCdpMessageBytes`); console/error retention is clamped to a
-  byte budget; screenshot captures are refused from their decoded size before anything
-  is written; and GIF recording checks frame dimensions and a decoded working-set budget
-  before decode. Every refusal and drop is **announced once and counted**, never silent.
+  close/error sentinel always has a home; oversized single messages are dropped during
+  reassembly against their exact UTF-8 encoding (`brewshot.maxCdpMessageBytes`), including
+  surrogate pairs split between WebSocket callbacks. Undrained regular messages also
+  share an exact cumulative UTF-8 budget (`brewshot.maxInboxBytes`, default 32 MiB) whose
+  capacity is returned on dequeue, so the count and per-message ceilings can no longer
+  multiply into an implausible retained heap bound. `maxInboxMessages` now fails
+  configuration above `Integer.MAX_VALUE - 1` before its reserved-slot addition can
+  overflow. Console/error retention is clamped to a byte budget; screenshot captures are
+  refused from their decoded size before anything is written; and GIF recording checks
+  frame dimensions and a decoded working-set budget before decode. Every refusal and drop
+  is **announced once and counted**, never silent.
   **Terminal transport state is now durable:** a nonblocking drain — reachable from
   `console()`, `errors()`, `freshNavigation()` and `waitForNetworkIdle()` — used to
   consume the close sentinel and leave later callers unable to learn the socket had died,

@@ -29,16 +29,23 @@ output, a huge `eval` result, a giant screenshot, a long recording. Those paths
 are bounded so a chatty or hostile page degrades loudly instead of OOMing the
 harness:
 
-- **CDP ingress** is bounded on **two** axes. *Per message*
-  (`brewshot.maxCdpMessageBytes`, default 32 MB): a message that would exceed the
-  ceiling is dropped — its reassembly buffer released, never materialized as a
-  giant `String`. *Cumulatively* (`brewshot.maxInboxMessages`, default 4096): the
-  ingress queue holds at most this many undrained messages, so a page that emits a
-  flood of individually-small messages while the command thread is busy can no
-  longer grow the inbox without bound — the newest messages are dropped once the
-  cap is reached. One queue slot is reserved for the socket close/error signal, so
-  that poison is never lost to a full inbox (a stalled caller still fails fast).
-  Both drops are announced once and counted, never silent.
+- **CDP ingress** is bounded on **three** axes. *Per message*
+  (`brewshot.maxCdpMessageBytes`, default 32 MiB): a message that would exceed the
+  exact UTF-8 ceiling is dropped — its reassembly buffer released, never
+  materialized as a giant `String`. Counting is incremental and preserves an
+  encoded code point even when a WebSocket callback splits its UTF-16 surrogate
+  pair. *Queued message count* (`brewshot.maxInboxMessages`, default 4096): the
+  ingress queue holds at most this many undrained regular messages. *Queued
+  encoded content* (`brewshot.maxInboxBytes`, default 32 MiB): the prospective
+  exact UTF-8 aggregate is checked before retaining each completed message, and
+  dequeuing returns its reservation. A flood of individually-small messages
+  therefore cannot multiply the per-message ceiling by the count ceiling; the
+  byte bound applies to live undrained content, not lifetime traffic. One queue
+  slot is reserved for the socket close/error signal, so that poison is never
+  lost to a full inbox (a stalled caller still fails fast). Every drop class is
+  announced once and counted, never silent. Invalid/nonpositive byte settings
+  and a message-count setting above `Integer.MAX_VALUE - 1` fail configuration
+  before queue construction.
 - **Console/error retention** is bounded on **two** axes: entry count (1000)
   **and** a retained-byte budget (`brewshot.maxConsoleBytes`, default 1 MB), so
   a single multi-MB console entry can no longer be kept whole. Over-budget

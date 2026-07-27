@@ -190,7 +190,7 @@ class BrewShotResourceCapsTest {
         LinkedBlockingQueue<String> q = new LinkedBlockingQueue<>();
         BrewShot.Accumulator acc = new BrewShot.Accumulator(q, 100, 4096);
 
-        // One 250-char message split across partials: crosses the 100-char ceiling → dropped.
+        // One 250-byte ASCII message split across partials crosses the 100-byte ceiling.
         acc.accept("x".repeat(60), false);
         acc.accept("y".repeat(60), false);
         acc.accept("z".repeat(130), true);
@@ -201,6 +201,66 @@ class BrewShotResourceCapsTest {
         acc.accept("{\"ok\":1}", true);
         assertEquals("{\"ok\":1}", q.poll(), "an in-ceiling message is enqueued whole");
         assertEquals(1, acc.dropped(), "the in-ceiling message adds no drop");
+    }
+
+    @Test
+    void cdpMessageCeilingCountsExactUtf8BytesAcrossWebSocketFragments() {
+        LinkedBlockingQueue<String> q = new LinkedBlockingQueue<>();
+        BrewShot.Accumulator acc = new BrewShot.Accumulator(q, 4, 4096);
+
+        // A WebSocket callback may split one supplementary code point between its
+        // UTF-16 surrogates. The complete emoji is exactly four UTF-8 bytes and must
+        // be admitted at equality even though it arrives in two callbacks.
+        String emoji = "\uD83D\uDE00";
+        acc.accept(emoji.substring(0, 1), false);
+        acc.accept(emoji.substring(1), true);
+        assertEquals(emoji, q.poll(), "split surrogate pair is measured as one code point");
+
+        // Three UTF-16 units, but six UTF-8 bytes. The old CharSequence.length()
+        // implementation admits this under a 4-byte setting; this is the causal
+        // discriminator for the lying maxCdpMessageBytes contract.
+        acc.accept("ééé", true);
+        assertNull(q.poll(), "encoded bytes, not UTF-16 units, enforce the byte ceiling");
+        assertEquals(1, acc.dropped(), "the over-byte message is counted as dropped");
+
+        // Paired control: equality remains inclusive for ordinary ASCII too.
+        acc.accept("abcd", true);
+        assertEquals("abcd", q.poll());
+        assertEquals(1, acc.dropped());
+    }
+
+    @Test
+    void allocationFreeUtf8MeterMatchesTheJdkEncoder() {
+        String[] samples = {
+            "", "plain ASCII", "é", "€", "\uD83D\uDE00", "x\uD83D\uDE00y",
+            "\uD83D", "\uDE00", "\uD83Dé\uDE00"
+        };
+        for (String sample : samples) {
+            assertEquals(sample.getBytes(StandardCharsets.UTF_8).length,
+                BrewShot.utf8Length(sample), "UTF-8 length drift for " + sample);
+        }
+    }
+
+    @Test
+    void incrementalUtf8MeterMatchesWholeEncodingAtEveryFragmentBoundary() {
+        String[] samples = {
+            "abc", "éa€", "\uD83D\uDE00", "a\uD83D\uDE00éz",
+            "\uD83D", "\uDE00", "\uD83Dé\uDE00"
+        };
+        for (String sample : samples) {
+            long exactBytes = sample.getBytes(StandardCharsets.UTF_8).length;
+            for (int split = 0; split <= sample.length(); split++) {
+                LinkedBlockingQueue<String> q = new LinkedBlockingQueue<>();
+                BrewShot.Accumulator acc =
+                    new BrewShot.Accumulator(q, exactBytes, 4);
+                acc.accept(sample.substring(0, split), false);
+                acc.accept(sample.substring(split), true);
+                assertEquals(sample, q.poll(),
+                    "exact-byte message rejected at UTF-16 split " + split
+                        + " of " + sample.length());
+                assertEquals(0, acc.dropped());
+            }
+        }
     }
 
     @Test

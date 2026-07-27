@@ -135,6 +135,105 @@ class CdpInboxWiringTest {
         }
     }
 
+    @Test
+    void theWiredCumulativeByteBudgetRejectsBeforeTheMessageCountCap(@TempDir Path temp)
+            throws Exception {
+        String countKey = "brewshot.maxInboxMessages";
+        String bytesKey = "brewshot.maxInboxBytes";
+        String priorCount = System.getProperty(countKey);
+        String priorBytes = System.getProperty(bytesKey);
+        try {
+            System.setProperty(countKey, "10");
+            System.setProperty(bytesKey, "5");
+            BrewShot.Accumulator limited = captureProductionAccumulator(
+                Files.createDirectory(temp.resolve("profile-byte-cap")));
+
+            limited.accept("éé", true); // 4 UTF-8 bytes
+            limited.accept("aa", true); // prospective aggregate 6 > 5
+            assertEquals(1, limited.sink().size(),
+                "the byte budget must reject while the ten-message count cap still has room");
+            assertEquals("éé", limited.sink().poll(), "the earlier in-budget message is retained");
+            assertEquals(1, limited.inboxDropped(), "the cumulative-byte drop is counted");
+
+            // Equality control on fresh production wiring: 4 + 2 == 6 is admitted.
+            System.setProperty(bytesKey, "6");
+            BrewShot.Accumulator exact = captureProductionAccumulator(
+                Files.createDirectory(temp.resolve("profile-byte-equality")));
+            exact.accept("éé", true);
+            exact.accept("aa", true);
+            assertEquals(2, exact.sink().size(), "the cumulative byte ceiling is inclusive");
+            assertEquals(0, exact.inboxDropped());
+        } finally {
+            restoreProperty(countKey, priorCount);
+            restoreProperty(bytesKey, priorBytes);
+        }
+    }
+
+    @Test
+    void maxInboxMessagesRejectsTheCapPlusOneOverflowBoundary() throws Exception {
+        String key = "brewshot.maxInboxMessages";
+        String prior = System.getProperty(key);
+        try {
+            System.setProperty(key, Integer.toString(Integer.MAX_VALUE));
+            IllegalArgumentException failure = assertThrows(IllegalArgumentException.class,
+                BrewShot::maxInboxMessages);
+            assertTrue(failure.getMessage().contains(key)
+                    && failure.getMessage().contains(Integer.toString(Integer.MAX_VALUE - 1)),
+                "the refusal names the property and safe upper bound: " + failure.getMessage());
+
+            System.setProperty(key, Integer.toString(Integer.MAX_VALUE - 1));
+            assertEquals(Integer.MAX_VALUE - 1, BrewShot.maxInboxMessages(),
+                "the largest cap whose reserved-slot addition cannot overflow is accepted");
+        } finally {
+            restoreProperty(key, prior);
+        }
+    }
+
+    @Test
+    void bothConsumerPollPathsReturnCumulativeByteCapacity(@TempDir Path temp)
+            throws Exception {
+        // Nonblocking diagnostic/event drain.
+        LinkedBlockingQueue<String> drainQueue = new LinkedBlockingQueue<>(5);
+        BrewShot.InboxBudget drainBudget = new BrewShot.InboxBudget(5);
+        BrewShot.Accumulator drainAccumulator =
+            new BrewShot.Accumulator(drainQueue, 100, 4, drainBudget);
+        drainAccumulator.accept("{}", true);
+        assertEquals(2, drainBudget.retainedBytes(), "producer reserved the exact bytes");
+        try (BrewShot shot = new BrewShot(new FakeProcess(),
+                Files.createDirectory(temp.resolve("profile-release-drain")),
+                new SilentWebSocket(), drainQueue, 40L, drainBudget)) {
+            shot.console();
+            assertEquals(0, drainBudget.retainedBytes(),
+                "nonblocking drain returns the dequeued message's reservation");
+            drainAccumulator.accept("12345", true);
+            assertEquals(1, drainQueue.size(),
+                "all five bytes are reusable after the drain rather than a lifetime quota");
+        }
+
+        // Blocking command/response poll.
+        LinkedBlockingQueue<String> commandQueue = new LinkedBlockingQueue<>(5);
+        BrewShot.InboxBudget commandBudget = new BrewShot.InboxBudget(1_000);
+        BrewShot.Accumulator commandAccumulator =
+            new BrewShot.Accumulator(commandQueue, 1_000, 4, commandBudget);
+        commandAccumulator.accept("{\"id\":1,\"result\":{\"result\":{\"value\":7}}}", true);
+        assertTrue(commandBudget.retainedBytes() > 0);
+        try (BrewShot shot = new BrewShot(new FakeProcess(),
+                Files.createDirectory(temp.resolve("profile-release-command")),
+                new SilentWebSocket(), commandQueue, 40L, commandBudget)) {
+            assertEquals(7.0, ((Number) shot.eval("1")).doubleValue(), 0.001);
+            assertEquals(0, commandBudget.retainedBytes(),
+                "command response polling returns the same shared reservation");
+        }
+    }
+
+    private static void restoreProperty(String key, String prior) {
+        if (prior == null) {
+            System.clearProperty(key);
+        } else {
+            System.setProperty(key, prior);
+        }
+    }
+
     // ---- review brewshot/249: a CALLER must be able to observe the close ---------
 
     /**
