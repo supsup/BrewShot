@@ -111,6 +111,23 @@ public final class BrewShot implements AutoCloseable {
     /** Poison message the listener enqueues on close/error so a blocked caller fails fast. */
     private static final String SOCKET_CLOSED = "{\"brewshotSocketClosed\":true}";
 
+    /**
+     * DURABLE record that the transport reached its terminal state.
+     *
+     * <p>The reserved-slot invariant guarantees the close sentinel always gets INTO the
+     * inbox. It did not guarantee a caller could ever OBSERVE it: every nonblocking
+     * drain — reached from console(), consoleDropped(), errors(), errorsDropped(),
+     * freshNavigation() and waitForNetworkIdle() — used to poll the sentinel and return,
+     * consuming the only copy. A later command then waited out its full timeout while
+     * Chrome was still alive, instead of failing fast with a closed-socket reason. That
+     * is the exact stall the bound exists to prevent (review brewshot/249).
+     *
+     * <p>Latched rather than re-queued: a queue slot can be consumed exactly once, so a
+     * flag is the only representation that survives an arbitrary number of drains by an
+     * arbitrary number of callers. Once true it never clears — the socket does not reopen.
+     */
+    private volatile boolean socketClosed;
+
     /** One shared client for all launches — no selector-thread accumulation per launch. */
     private static final HttpClient HTTP = HttpClient.newHttpClient();
 
@@ -1608,6 +1625,14 @@ public final class BrewShot implements AutoCloseable {
     /** Send one CDP command and block for its id-matched result. */
     @SuppressWarnings("unchecked")
     private Map<String, Object> command(String method, String paramsJson) {
+        // FAIL FAST on a transport already known dead. Without this the latch would be
+        // a flag nobody reads: a caller whose drain consumed the sentinel would still
+        // spend the full commandTimeout waiting for a response that can never arrive.
+        // The point of the reserved slot was never "the sentinel is in the queue" — it
+        // was "a blocked caller fails fast instead of sleeping out the timeout".
+        if (socketClosed) {
+            throw new IllegalStateException(chromeDeathReason(method));
+        }
         int id = nextId++;
         StringBuilder msg = new StringBuilder(128)
             .append("{\"id\":").append(id)
@@ -1879,6 +1904,7 @@ public final class BrewShot implements AutoCloseable {
                 throw new IllegalStateException("CDP timeout waiting for " + waitingFor);
             }
             if (SOCKET_CLOSED.equals(raw)) {
+                socketClosed = true;
                 throw new IllegalStateException(chromeDeathReason(waitingFor));
             }
             return (Map<String, Object>) MiniJson.parse(raw);
@@ -2124,11 +2150,17 @@ public final class BrewShot implements AutoCloseable {
         return errorLog.dropped();
     }
 
-    /** Pull any already-arrived messages through the router without blocking. */
+    /**
+     * Pull any already-arrived messages through the router without blocking.
+     *
+     * <p>Seeing the close sentinel LATCHES {@link #socketClosed} before returning. It
+     * used to just return, which consumed the queue's only sentinel and left every
+     * later caller unable to learn the socket had closed.
+     */
     private void drainInboxNonBlocking() {
         String raw;
         while ((raw = inbox.poll()) != null) {
-            if (SOCKET_CLOSED.equals(raw)) { return; }
+            if (SOCKET_CLOSED.equals(raw)) { socketClosed = true; return; }
             @SuppressWarnings("unchecked")
             Map<String, Object> m = (Map<String, Object>) MiniJson.parse(raw);
             if (m.get("id") == null) { routeEvent(m); }

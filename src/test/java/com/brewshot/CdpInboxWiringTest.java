@@ -135,6 +135,110 @@ class CdpInboxWiringTest {
         }
     }
 
+    // ---- review brewshot/249: a CALLER must be able to observe the close ---------
+
+    /**
+     * Build a real client over a known inbox — no Chrome, no socket. This is the level
+     * the review said was missing: proving the {@code Accumulator} can PLACE the poison
+     * does not prove a caller can ever SEE it.
+     */
+    private static BrewShot clientOver(LinkedBlockingQueue<String> inbox, Path profile) {
+        // A SENDABLE stub socket, not null. With null the client cannot send at all, so
+        // any failure satisfies the assertions and the test cannot tell "failed because
+        // the socket closed" from "failed because there is no socket" — it passed against
+        // the known-broken drain until this was fixed.
+        return new BrewShot(new FakeProcess(), profile, new SilentWebSocket(), inbox, 40L);
+    }
+
+    /** Accepts sends and never replies: the only fast failure can be the closed-state latch. */
+    private static final class SilentWebSocket implements WebSocket {
+        @Override public CompletableFuture<WebSocket> sendText(CharSequence d, boolean last) {
+            return CompletableFuture.completedFuture(this);
+        }
+        @Override public CompletableFuture<WebSocket> sendBinary(java.nio.ByteBuffer d, boolean last) {
+            return CompletableFuture.completedFuture(this);
+        }
+        @Override public CompletableFuture<WebSocket> sendPing(java.nio.ByteBuffer m) {
+            return CompletableFuture.completedFuture(this);
+        }
+        @Override public CompletableFuture<WebSocket> sendPong(java.nio.ByteBuffer m) {
+            return CompletableFuture.completedFuture(this);
+        }
+        @Override public CompletableFuture<WebSocket> sendClose(int code, String reason) {
+            return CompletableFuture.completedFuture(this);
+        }
+        @Override public void request(long n) { }
+        @Override public String getSubprotocol() { return ""; }
+        @Override public boolean isOutputClosed() { return false; }
+        @Override public boolean isInputClosed() { return false; }
+        @Override public void abort() { }
+    }
+
+    @Test
+    void aNonblockingDrainMustNotSwallowTheCloseSentinel(@TempDir Path temp) throws Exception {
+        // MARLOW'S REPRODUCTION (brewshot/249). drainInboxNonBlocking polled the
+        // sentinel and returned, consuming the queue's only copy. It is reached from
+        // console(), consoleDropped(), errors(), errorsDropped(), freshNavigation() and
+        // waitForNetworkIdle() — so any of those running after close left every later
+        // caller unable to learn the socket had died. The observable symptom was a full
+        // command timeout with Chrome still alive, instead of an immediate closed-socket
+        // failure. That is precisely the stall the reserved slot exists to prevent.
+        Path profile = Files.createDirectory(temp.resolve("profile-drain"));
+        LinkedBlockingQueue<String> inbox = new LinkedBlockingQueue<>(8);
+        BrewShot shot = clientOver(inbox, profile);
+
+        // The Accumulator wired to this exact queue announces the close.
+        new BrewShot.Accumulator(inbox, 1_000, 4).onClose(null, 1000, "bye");
+        assertEquals(1, inbox.size(), "precondition: the sentinel is in the queue");
+
+        // A nonblocking drain runs first and empties the queue.
+        shot.console();
+        assertEquals(0, inbox.size(), "precondition: the drain consumed the queue");
+
+        // The caller must STILL learn the socket is closed, and must not wait it out.
+        long startedAtNanos = System.nanoTime();
+        IllegalStateException failure =
+            assertThrows(IllegalStateException.class, () -> shot.eval("1"));
+        long elapsedMillis = (System.nanoTime() - startedAtNanos) / 1_000_000L;
+
+        assertTrue(failure.getMessage().toLowerCase().contains("closed")
+                || failure.getMessage().toLowerCase().contains("socket"),
+            "must fail with a closed-socket reason, got: " + failure.getMessage());
+        assertTrue(elapsedMillis < 20L,
+            "must fail FAST, not spend the command budget (took " + elapsedMillis + " ms)");
+    }
+
+    @Test
+    void theTerminalStateSurvivesRepeatedDrainsByDifferentCallers(@TempDir Path temp)
+            throws Exception {
+        // A queue slot is consumable exactly once, so re-queueing the sentinel would
+        // still lose it to the SECOND drain. Latched state is the only representation
+        // that survives an arbitrary number of drains by an arbitrary number of callers.
+        Path profile = Files.createDirectory(temp.resolve("profile-repeat"));
+        LinkedBlockingQueue<String> inbox = new LinkedBlockingQueue<>(8);
+        BrewShot shot = clientOver(inbox, profile);
+
+        new BrewShot.Accumulator(inbox, 1_000, 4).onClose(null, 1000, "bye");
+        shot.console();
+        shot.errors();
+        shot.consoleDropped();
+        shot.errorsDropped();
+
+        // Assert the REASON and the SPEED, not merely that something threw. Under the
+        // broken drain this still throws IllegalStateException — a CDP timeout — so an
+        // exception-type-only assertion passes against the very bug it targets.
+        long startedAtNanos = System.nanoTime();
+        IllegalStateException failure =
+            assertThrows(IllegalStateException.class, () -> shot.eval("1"));
+        long elapsedMillis = (System.nanoTime() - startedAtNanos) / 1_000_000L;
+        assertTrue(failure.getMessage().toLowerCase().contains("closed")
+                || failure.getMessage().toLowerCase().contains("socket"),
+            "four drains later the caller must still get a CLOSED-SOCKET reason, not a "
+                + "timeout; got: " + failure.getMessage());
+        assertTrue(elapsedMillis < 20L,
+            "and must still fail fast (took " + elapsedMillis + " ms)");
+    }
+
     /** A process that is alive until destroyed; no Chrome, no ports, no I/O. */
     private static final class FakeProcess extends Process {
         private final AtomicBoolean alive = new AtomicBoolean(true);

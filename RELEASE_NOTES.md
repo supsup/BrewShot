@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- **Real resource bounds on the CDP transport, captures, and recordings.** Advertised
+  bounds are now enforced rather than assumed. The CDP inbox is a finite queue
+  (`brewshot.maxInboxMessages`, default 1024) sized one slot beyond its cap so the
+  close/error sentinel always has a home; oversized single messages are dropped at
+  reassembly (`brewshot.maxCdpMessageBytes`); console/error retention is clamped to a
+  byte budget; screenshot captures are refused from their decoded size before anything
+  is written; and GIF recording checks frame dimensions and a decoded working-set budget
+  before decode. Every refusal and drop is **announced once and counted**, never silent.
+  **Terminal transport state is now durable:** a nonblocking drain — reachable from
+  `console()`, `errors()`, `freshNavigation()` and `waitForNetworkIdle()` — used to
+  consume the close sentinel and leave later callers unable to learn the socket had died,
+  so a command waited out its full timeout with Chrome still alive; the closed state is
+  now latched and every subsequent command fails fast with a closed-socket reason.
+  Tradeoffs, stated because they are real: the new defaults can refuse very large captures
+  and recordings that previously succeeded (all are `-D` overridable), and a saturated
+  inbox can drop a solicited response and surface it as a command timeout. These are
+  bounds for the trusted-page model — not a defence against a hostile page.
+
 - **Docker watched folders without sacrificing the CLI.** The Java 25 image
   still defaults to BrewShot's original argv/stdin/stdout CLI and now accepts
   `cli` as an explicit spelling plus a long-running `watch` mode over
