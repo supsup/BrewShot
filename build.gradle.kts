@@ -64,10 +64,16 @@ fun org.gradle.api.tasks.testing.Test.configureBrewShotTests() {
     // catches any future test that forgets the gate and skips on its own.
     val requireChrome = System.getenv("BREWSHOT_REQUIRE_CHROME")
         ?.let { it == "1" || it.equals("true", true) || it.equals("yes", true) } ?: false
+    if (requireChrome) {
+        failOnSkippedTests("BREWSHOT_REQUIRE_CHROME is set")
+    }
+}
+
+fun org.gradle.api.tasks.testing.Test.failOnSkippedTests(reason: String) {
     afterSuite(KotlinClosure2<TestDescriptor, TestResult, Unit>({ desc, result ->
-        if (desc.parent == null && requireChrome && result.skippedTestCount > 0) {
+        if (desc.parent == null && result.skippedTestCount > 0) {
             throw GradleException(
-                "BREWSHOT_REQUIRE_CHROME is set but ${result.skippedTestCount} test(s) were " +
+                "$reason but ${result.skippedTestCount} test(s) were " +
                 "SKIPPED — a required run must execute or fail every test, never skip " +
                 "(green-that-tested-nothing guard)."
             )
@@ -133,9 +139,12 @@ val unitTest by tasks.registering(org.gradle.api.tasks.testing.Test::class) {
     filter {
         chromeTests.forEach { excludeTestsMatching(it) }
     }
-    // This becomes a second fail-safe when the operator kill-switch branch
-    // lands; the method filter already prevents Chrome launch on current main.
+    // FORBID proves this lane cannot launch Chrome. REQUIRE turns every skip
+    // into a failure, so a future browser test that escapes the source-derived
+    // filter cannot disappear from both CI lanes as a green assumption skip.
     environment("BREWSHOT_FORBID_CHROME", "1")
+    environment("BREWSHOT_REQUIRE_CHROME", "1")
+    failOnSkippedTests("unitTest requires every browser-free test to execute")
 }
 
 val chromeTest by tasks.registering(org.gradle.api.tasks.testing.Test::class) {
