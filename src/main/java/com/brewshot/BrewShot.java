@@ -3468,8 +3468,6 @@ public final class BrewShot implements AutoCloseable {
         private final InboxBudget inboxBudget;
         private final StringBuilder buf = new StringBuilder();
         private long bufferedUtf8Bytes;
-        /** A terminal high surrogate was already counted as replacement in the prior chunk. */
-        private boolean trailingHighSurrogate;
         private boolean overflowed;
         private long dropped;
         private long inboxDropped;
@@ -3505,7 +3503,9 @@ public final class BrewShot implements AutoCloseable {
         void accept(CharSequence data, boolean last) {
             Objects.requireNonNull(data, "data");
             if (!overflowed) {
-                long addedBytes = encodedBytesInNextChunk(data, last);
+                // WebSocket.Listener guarantees every callback is a legal UTF-16
+                // sequence, so exact per-callback lengths compose without boundary state.
+                long addedBytes = utf8Length(data);
                 if (addedBytes > maxMessageBytes - bufferedUtf8Bytes) {
                     overflowed = true;
                     resetBuffer(); // release the partial NOW — this is the whole point
@@ -3531,32 +3531,9 @@ public final class BrewShot implements AutoCloseable {
             }
         }
 
-        /**
-         * Count one callback without allocating encoded bytes. A surrogate pair split
-         * between callbacks is counted by correcting the two replacement widths to one
-         * four-byte scalar when the low surrogate arrives.
-         */
-        private long encodedBytesInNextChunk(CharSequence data, boolean last) {
-            long bytes = utf8Length(data);
-            if (trailingHighSurrogate && data.length() > 0) {
-                if (Character.isLowSurrogate(data.charAt(0))) {
-                    bytes += 4L - 2L * UTF8_REPLACEMENT_BYTES;
-                }
-                trailingHighSurrogate = false;
-            }
-            if (last) {
-                trailingHighSurrogate = false;
-            } else if (data.length() > 0) {
-                trailingHighSurrogate =
-                    Character.isHighSurrogate(data.charAt(data.length() - 1));
-            }
-            return bytes;
-        }
-
         private void resetBuffer() {
             buf.setLength(0);
             bufferedUtf8Bytes = 0;
-            trailingHighSurrogate = false;
         }
 
         /**

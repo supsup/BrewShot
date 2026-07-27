@@ -32,9 +32,9 @@ harness:
 - **CDP ingress** is bounded on **three** axes. *Per message*
   (`brewshot.maxCdpMessageBytes`, default 32 MiB): a message that would exceed the
   exact UTF-8 ceiling is dropped — its reassembly buffer released, never
-  materialized as a giant `String`. Counting is incremental and preserves an
-  encoded code point even when a WebSocket callback splits its UTF-16 surrogate
-  pair. *Queued message count* (`brewshot.maxInboxMessages`, default 4096): the
+  materialized as a giant `String`. Counting is incremental across the legal
+  UTF-16 sequences guaranteed for each WebSocket callback. *Queued message
+  count* (`brewshot.maxInboxMessages`, default 4096): the
   ingress queue holds at most this many undrained regular messages. *Queued
   encoded content* (`brewshot.maxInboxBytes`, default 32 MiB): the prospective
   exact UTF-8 aggregate is checked before retaining each completed message, and

@@ -204,17 +204,16 @@ class BrewShotResourceCapsTest {
     }
 
     @Test
-    void cdpMessageCeilingCountsExactUtf8BytesAcrossWebSocketFragments() {
+    void cdpMessageCeilingCountsExactUtf8BytesAcrossLegalWebSocketFragments() {
         LinkedBlockingQueue<String> q = new LinkedBlockingQueue<>();
         BrewShot.Accumulator acc = new BrewShot.Accumulator(q, 4, 4096);
 
-        // A WebSocket callback may split one supplementary code point between its
-        // UTF-16 surrogates. The complete emoji is exactly four UTF-8 bytes and must
-        // be admitted at equality even though it arrives in two callbacks.
+        // WebSocket.Listener guarantees each callback is a legal UTF-16 sequence.
+        // A complete supplementary code point is exactly four UTF-8 bytes and must
+        // be admitted at equality.
         String emoji = "\uD83D\uDE00";
-        acc.accept(emoji.substring(0, 1), false);
-        acc.accept(emoji.substring(1), true);
-        assertEquals(emoji, q.poll(), "split surrogate pair is measured as one code point");
+        acc.accept(emoji, true);
+        assertEquals(emoji, q.poll(), "supplementary code point is measured exactly");
 
         // Three UTF-16 units, but six UTF-8 bytes. The old CharSequence.length()
         // implementation admits this under a 4-byte setting; this is the causal
@@ -242,14 +241,18 @@ class BrewShotResourceCapsTest {
     }
 
     @Test
-    void incrementalUtf8MeterMatchesWholeEncodingAtEveryFragmentBoundary() {
+    void incrementalUtf8MeterMatchesWholeEncodingAtEveryLegalFragmentBoundary() {
         String[] samples = {
-            "abc", "éa€", "\uD83D\uDE00", "a\uD83D\uDE00éz",
-            "\uD83D", "\uDE00", "\uD83Dé\uDE00"
+            "abc", "éa€", "\uD83D\uDE00", "a\uD83D\uDE00éz"
         };
         for (String sample : samples) {
             long exactBytes = sample.getBytes(StandardCharsets.UTF_8).length;
             for (int split = 0; split <= sample.length(); split++) {
+                if (split > 0 && split < sample.length()
+                        && Character.isHighSurrogate(sample.charAt(split - 1))
+                        && Character.isLowSurrogate(sample.charAt(split))) {
+                    continue; // onText never exposes an illegal UTF-16 callback
+                }
                 LinkedBlockingQueue<String> q = new LinkedBlockingQueue<>();
                 BrewShot.Accumulator acc =
                     new BrewShot.Accumulator(q, exactBytes, 4);
