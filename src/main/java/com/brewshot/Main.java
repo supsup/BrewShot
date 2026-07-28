@@ -459,6 +459,44 @@ public final class Main {
         } catch (IllegalArgumentException | java.io.IOException aliasFailure) {
             return err(aliasFailure.getMessage());
         }
+        // Same no-write preflight window: refuse an oversized input from its HEADER,
+        // before any job decodes pixels. Batched here rather than per-job so an
+        // oversized second job cannot be reached only after the first has already
+        // allocated and written.
+        long maxDimension;
+        long maxPixels;
+        try {
+            // Resolve the ceilings ONCE, before any probe. A malformed ceiling is a
+            // configuration error and must refuse loudly here rather than silently
+            // reverting to the default mid-batch (review brewshot/242 finding 2).
+            maxDimension = positiveLimitProperty(DIMENSION_LIMIT_PROPERTY, DEFAULT_MAX_DIMENSION);
+            maxPixels = positiveLimitProperty(PIXELS_LIMIT_PROPERTY, DEFAULT_MAX_PIXELS);
+        } catch (IllegalArgumentException badLimit) {
+            return err(badLimit.getMessage());
+        }
+        // Probe EVERY input before deciding. The catch sits inside the loop, per
+        // input, because an early header failure must not cancel the remaining
+        // probes: review brewshot/242 finding 1 proved that a malformed first input
+        // let a declared-huge LATER input reach ImageIO.read and write its sidecar,
+        // defeating the whole bound. An unreadable header is not a usage error — it
+        // is recorded and skipped so readImage still reports it canonically as exit 1.
+        ImageTooLargeException oversized = null;
+        for (DiffJob job : jobs) {
+            for (Path input : java.util.List.of(job.a(), job.b())) {
+                try {
+                    requireImageWithinLimits(input, maxDimension, maxPixels);
+                } catch (ImageTooLargeException tooLarge) {
+                    if (oversized == null) {
+                        oversized = tooLarge;   // first offender wins, deterministically
+                    }
+                } catch (java.io.IOException probeFailure) {
+                    // Contained per input; keep probing the rest of the batch.
+                }
+            }
+        }
+        if (oversized != null) {
+            return err(oversized.getMessage());
+        }
 
         int worst = 0;
         for (DiffJob job : jobs) {
@@ -523,6 +561,114 @@ public final class Main {
         return worst;
     }
 
+    /** A diff input whose DECLARED dimensions blow a configured ceiling (usage error, exit 2). */
+    private static final class ImageTooLargeException extends Exception {
+        ImageTooLargeException(String message) { super(message); }
+    }
+
+    static final String DIMENSION_LIMIT_PROPERTY = "brewshot.maxImageDimension";
+    static final String PIXELS_LIMIT_PROPERTY = "brewshot.maxImagePixels";
+
+    /** Max px per axis for a diff input; override -Dbrewshot.maxImageDimension=N. */
+    private static final long DEFAULT_MAX_DIMENSION = 16_384L;
+
+    /** Max total area (w*h) for a diff input; override -Dbrewshot.maxImagePixels=N. */
+    private static final long DEFAULT_MAX_PIXELS = 67_108_864L;
+
+    /**
+     * Read a safety ceiling STRICTLY: absent means the default, but anything present
+     * must be a positive integer.
+     *
+     * <p>{@link Long#getLong(String, long)} returns the fallback for a MALFORMED value
+     * exactly as it does for a missing one, which makes a typo indistinguishable from
+     * absence — an operator who sets {@code -Dbrewshot.maxImageDimension=8l92} believes
+     * a custom ceiling is active while the default silently applies. That is fail-open
+     * configuration on a safety boundary (review brewshot/242 finding 2), so a present
+     * value that is malformed, zero, or negative is a named refusal instead.
+     *
+     * <p>Read fresh per call rather than cached, so a late {@code System.setProperty}
+     * takes effect.
+     */
+    private static long positiveLimitProperty(String name, long fallback) {
+        String raw = System.getProperty(name);
+        if (raw == null) {
+            return fallback;
+        }
+        String trimmed = raw.trim();
+        long parsed;
+        try {
+            parsed = Long.parseLong(trimmed);
+        } catch (NumberFormatException notANumber) {
+            throw new IllegalArgumentException(
+                name + " must be a positive whole number, got: " + raw
+                    + " — remove it to use the default (" + fallback + ")");
+        }
+        if (parsed <= 0) {
+            throw new IllegalArgumentException(
+                name + " must be greater than 0, got: " + parsed
+                    + " — remove it to use the default (" + fallback + ")");
+        }
+        return parsed;
+    }
+
+    /**
+     * Refuse an oversized diff INPUT from its header, BEFORE the full decode.
+     *
+     * <p>{@link javax.imageio.ImageIO#read} allocates a {@code w*h} raster as its first
+     * act, so by the time a decompression-bomb-scale PNG fails it has already tried to
+     * take the memory — a 100000x100000 declared image asks for 40 GB from a 26-byte
+     * file. This reads only {@code getWidth(0)}/{@code getHeight(0)} off an
+     * {@link javax.imageio.ImageReader}, which parses the header and decodes no pixels,
+     * so the refusal costs nothing.
+     *
+     * <p>The ceilings are RESOLVED ONCE PER BATCH by the caller and passed in, so every
+     * input in one run is judged against the same values and a malformed ceiling refuses
+     * before any probe rather than mid-batch. They are still read fresh per RUN rather
+     * than cached in a static, so a caller (or test) that sets the property late sees the
+     * new value on the next invocation. The comparison is strictly {@code >}: an
+     * exactly-at-limit input is accepted.
+     *
+     * <p>Deliberately NOT this method's job: deciding that a file is not an image. When
+     * no reader is registered, or the stream cannot be opened, it returns quietly and
+     * leaves {@link #readImage} to report it canonically as exit 1 — so this guard can
+     * only ever turn a would-be decode into a usage refusal, never change the "not an
+     * image" path.
+     */
+    private static void requireImageWithinLimits(Path p, long maxDimension, long maxPixels)
+            throws ImageTooLargeException, java.io.IOException {
+        try (javax.imageio.stream.ImageInputStream stream =
+                 javax.imageio.ImageIO.createImageInputStream(p.toFile())) {
+            if (stream == null) {
+                return;
+            }
+            java.util.Iterator<javax.imageio.ImageReader> readers =
+                javax.imageio.ImageIO.getImageReaders(stream);
+            if (!readers.hasNext()) {
+                return;
+            }
+            javax.imageio.ImageReader reader = readers.next();
+            try {
+                reader.setInput(stream, true, true);
+                long width = reader.getWidth(0);
+                long height = reader.getHeight(0);
+                if (width > maxDimension || height > maxDimension) {
+                    throw new ImageTooLargeException(p + ": " + width + "x" + height
+                        + " exceeds the per-axis limit brewshot.maxImageDimension="
+                        + maxDimension + " px — raise it with -Dbrewshot.maxImageDimension=N");
+                }
+                // Both operands are already <= maxDimension (16384 by default), so the
+                // product cannot overflow a long even at the widest accepted input.
+                if (width * height > maxPixels) {
+                    throw new ImageTooLargeException(p + ": " + width + "x" + height + " = "
+                        + (width * height) + " px exceeds the area limit brewshot.maxImagePixels="
+                        + maxPixels + " — raise it with -Dbrewshot.maxImagePixels=N");
+                }
+            } finally {
+                reader.dispose();
+            }
+        }
+    }
+
     private static java.awt.image.BufferedImage readImage(Path p) throws java.io.IOException {
         java.awt.image.BufferedImage img;
         try {
@@ -559,7 +705,12 @@ public final class Main {
 
             A size mismatch renders an explicit sizeMismatch verdict (never a crash);
             under any --fail-* gate it exits 4. Uses ImageIO (JVM/jar path — the same
-            caveat as GIF recording; not the macOS native binary).""");
+            caveat as GIF recording; not the macOS native binary).
+
+            Inputs are size-checked from their header BEFORE any decode and refused
+            with exit 2 if over: -Dbrewshot.maxImageDimension (default 16384 px per
+            axis) and -Dbrewshot.maxImagePixels (default 67108864 total). Both bounds
+            are inclusive; raise either when you genuinely have a larger image.""");
     }
 
     /** The machine-readable sidecar CI/agent wrappers want beside the PNG. */
