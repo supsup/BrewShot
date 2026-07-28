@@ -108,7 +108,7 @@ public final class BrewShot implements AutoCloseable {
     private static final long SHUTDOWN_ATTEMPT_TIMEOUT_MS = 500;
     private static final int SHUTDOWN_CLEANUP_MAX_PASSES = 3;
     private static final int CONSOLE_CAP = 1_000;
-    /** Poison message the listener enqueues on close/error so a blocked caller fails fast. */
+    /** Diagnostic body carried by the typed close message. */
     private static final String SOCKET_CLOSED = "{\"brewshotSocketClosed\":true}";
 
     /**
@@ -153,7 +153,9 @@ public final class BrewShot implements AutoCloseable {
     // Kept as a direct field for ShutdownHookProbeMain's stable reflection contract.
     private final Path profileDir;
     private final WebSocket ws;
-    private final LinkedBlockingQueue<String> inbox;
+    private final LinkedBlockingQueue<InboxMessage> inbox;
+    /** Shared with the production Accumulator so dequeues return retained-byte capacity. */
+    private final InboxBudget inboxBudget;
     private final long closeTimeoutMs;
     private final AtomicBoolean closed = new AtomicBoolean();
     /** Only awaitable events are kept here (Page.loadEventFired) — bounded by design. */
@@ -284,13 +286,15 @@ public final class BrewShot implements AutoCloseable {
     static final int DEFAULT_MAX_IMAGE_DIMENSION = 16_384;
     /** Default max total pixels (w*h) for a captured screenshot, 64 MP. -Dbrewshot.maxImagePixels. */
     static final long DEFAULT_MAX_IMAGE_PIXELS = 67_108_864L;
-    /** Default per-CDP-message byte/char ceiling, 32 MB. -Dbrewshot.maxCdpMessageBytes. */
+    /** Default per-CDP-message exact UTF-8 byte ceiling, 32 MiB. */
     static final long DEFAULT_MAX_CDP_MESSAGE_BYTES = 33_554_432L;
     /** Default CUMULATIVE cap on queued (undrained) CDP messages, 4096. -Dbrewshot.maxInboxMessages.
      *  Bounds the whole ingress queue, not just each message: a chatty page emitting a flood
      *  of individually-small messages while no thread is draining can no longer grow the inbox
      *  without bound. See {@link Accumulator}. */
     static final int DEFAULT_MAX_INBOX_MESSAGES = 4096;
+    /** Default exact UTF-8 bytes retained across all undrained regular CDP messages. */
+    static final long DEFAULT_MAX_INBOX_BYTES = DEFAULT_MAX_CDP_MESSAGE_BYTES;
     /** Default per-log retained-byte budget for console/error text, 1 MB. -Dbrewshot.maxConsoleBytes. */
     static final long DEFAULT_MAX_CONSOLE_BYTES = 1_048_576L;
 
@@ -312,6 +316,42 @@ public final class BrewShot implements AutoCloseable {
         return dflt;
     }
 
+    private static int boundedPositiveIntProp(String key, int dflt, int max) {
+        String raw = System.getProperty(key);
+        if (raw == null) { return dflt; }
+        int value;
+        try {
+            value = Integer.parseInt(raw.trim());
+        } catch (NumberFormatException e) {
+            throw invalidBound(key, raw, "an integer from 1 through " + max);
+        }
+        if (value <= 0 || value > max) {
+            throw invalidBound(key, raw, "an integer from 1 through " + max);
+        }
+        return value;
+    }
+
+    private static long positiveLongProp(String key, long dflt) {
+        String raw = System.getProperty(key);
+        if (raw == null) { return dflt; }
+        long value;
+        try {
+            value = Long.parseLong(raw.trim());
+        } catch (NumberFormatException e) {
+            throw invalidBound(key, raw, "a positive integer");
+        }
+        if (value <= 0) {
+            throw invalidBound(key, raw, "a positive integer");
+        }
+        return value;
+    }
+
+    private static IllegalArgumentException invalidBound(
+            String key, String raw, String expected) {
+        return new IllegalArgumentException(
+            key + " must be " + expected + "; got \"" + raw + "\"");
+    }
+
     private static int maxImageDimension() {
         return intProp("brewshot.maxImageDimension", DEFAULT_MAX_IMAGE_DIMENSION);
     }
@@ -321,11 +361,17 @@ public final class BrewShot implements AutoCloseable {
     }
 
     private static long maxCdpMessageBytes() {
-        return longProp("brewshot.maxCdpMessageBytes", DEFAULT_MAX_CDP_MESSAGE_BYTES);
+        return positiveLongProp("brewshot.maxCdpMessageBytes", DEFAULT_MAX_CDP_MESSAGE_BYTES);
     }
 
-    private static int maxInboxMessages() {
-        return intProp("brewshot.maxInboxMessages", DEFAULT_MAX_INBOX_MESSAGES);
+    static int maxInboxMessages() {
+        // finishLaunch reserves one physical queue slot for SOCKET_CLOSED.
+        return boundedPositiveIntProp("brewshot.maxInboxMessages",
+            DEFAULT_MAX_INBOX_MESSAGES, Integer.MAX_VALUE - 1);
+    }
+
+    private static long maxInboxBytes() {
+        return positiveLongProp("brewshot.maxInboxBytes", DEFAULT_MAX_INBOX_BYTES);
     }
 
     private static long maxConsoleBytes() {
@@ -334,9 +380,10 @@ public final class BrewShot implements AutoCloseable {
 
     /**
      * Reject a captured image whose DECODED dimensions exceed the configured
-     * ceiling, inspected via an {@link ImageReader} on the RETURNED bytes — only
-     * the header is read, no full pixel array is allocated — so the refusal is
-     * loud and cheap and lands BEFORE any downstream full-pixel decode. Enforced
+     * ceiling, inspected via an {@link ImageReader} on the RETURNED bytes — the
+     * Base64 string and decoded compressed byte array already exist, but no full
+     * pixel raster is decoded here — so refusal lands BEFORE any downstream
+     * full-pixel decode or artifact write. Enforced
      * on the {@code screenshot}/{@code screenshotClip} capture paths. Bytes whose
      * header is unreadable are left alone (decodability is a different concern,
      * handled by the consumer). Package-private for browser-free unit testing.
@@ -517,25 +564,39 @@ public final class BrewShot implements AutoCloseable {
     // ---- lifecycle ---------------------------------------------------------
 
     private BrewShot(Process chrome, Path profileDir, WebSocket ws,
-                     LinkedBlockingQueue<String> inbox) {
+                     LinkedBlockingQueue<InboxMessage> inbox) {
         this(chrome, profileDir, ws, inbox, DEFAULT_CLOSE_TIMEOUT_MS);
     }
 
     /** Package-private timeout seam for pure transport tests (no Chrome process). */
     BrewShot(Process chrome, Path profileDir, WebSocket ws,
-             LinkedBlockingQueue<String> inbox, long closeTimeoutMs) {
+             LinkedBlockingQueue<InboxMessage> inbox, long closeTimeoutMs) {
+        this(chrome, profileDir, ws, inbox, closeTimeoutMs, InboxBudget.untracked());
+    }
+
+    /** Package-private shared-budget seam for pure transport tests (no Chrome process). */
+    BrewShot(Process chrome, Path profileDir, WebSocket ws,
+             LinkedBlockingQueue<InboxMessage> inbox, long closeTimeoutMs,
+             InboxBudget inboxBudget) {
         this(registerContainedLaunchLeaseForTests(
                 chrome, profileDir, BrewShot::deleteRecursively),
-            ws, inbox, closeTimeoutMs);
+            ws, inbox, closeTimeoutMs, inboxBudget);
     }
 
     BrewShot(ResourceLease lease, WebSocket ws,
-             LinkedBlockingQueue<String> inbox, long closeTimeoutMs) {
+             LinkedBlockingQueue<InboxMessage> inbox, long closeTimeoutMs) {
+        this(lease, ws, inbox, closeTimeoutMs, InboxBudget.untracked());
+    }
+
+    BrewShot(ResourceLease lease, WebSocket ws,
+             LinkedBlockingQueue<InboxMessage> inbox, long closeTimeoutMs,
+             InboxBudget inboxBudget) {
         this.lease = lease;
         this.chrome = lease.process;
         this.profileDir = lease.profileDir;
         this.ws = ws;
         this.inbox = inbox;
+        this.inboxBudget = Objects.requireNonNull(inboxBudget, "inboxBudget");
         this.closeTimeoutMs = Math.max(1, closeTimeoutMs);
         lease.transferToClient();
     }
@@ -1047,20 +1108,26 @@ public final class BrewShot implements AutoCloseable {
         // physical slot reserved so the close/error sentinel (SOCKET_CLOSED) can NEVER
         // be lost to a full inbox — a blocked caller still fails fast instead of
         // sleeping out the timeout. See Accumulator.
-        int inboxCap = maxInboxMessages();
-        LinkedBlockingQueue<String> inbox = new LinkedBlockingQueue<>(inboxCap + 1);
         WebSocket socket = null;
         BrewShot c = null;
-        long boundedConnectTimeoutMs = Math.max(1, connectTimeoutMs);
-        Deadline connectDeadline = Deadline.afterMillis(boundedConnectTimeoutMs);
         try {
+            // Validate every configured bound before allocating or contacting Chrome.
+            int inboxCap = maxInboxMessages();
+            long maxMessageBytes = maxCdpMessageBytes();
+            long maxRetainedBytes = maxInboxBytes();
+            InboxBudget inboxBudget = new InboxBudget(maxRetainedBytes);
+            LinkedBlockingQueue<InboxMessage> inbox =
+                new LinkedBlockingQueue<>(inboxCap + 1);
+            long boundedConnectTimeoutMs = Math.max(1, connectTimeoutMs);
+            Deadline connectDeadline = Deadline.afterMillis(boundedConnectTimeoutMs);
             CompletableFuture<WebSocket> connecting =
                 connector.connect(URI.create(wsUrl),
-                    new Accumulator(inbox, maxCdpMessageBytes(), inboxCap),
+                    new Accumulator(inbox, maxMessageBytes, inboxCap, inboxBudget),
                     Duration.ofMillis(boundedConnectTimeoutMs));
             socket = awaitConnection(
                 connecting, connectDeadline, boundedConnectTimeoutMs);
-            c = new BrewShot(lease, socket, inbox, DEFAULT_CLOSE_TIMEOUT_MS);
+            c = new BrewShot(
+                lease, socket, inbox, DEFAULT_CLOSE_TIMEOUT_MS, inboxBudget);
             // Browser-scope bootstrap (sessionId == null): open a tab, attach flat.
             Map<String, Object> created =
                 c.command("Target.createTarget", "{\"url\":\"about:blank\"}");
@@ -1909,9 +1976,9 @@ public final class BrewShot implements AutoCloseable {
     @SuppressWarnings("unchecked")
     private Map<String, Object> nextMessageNanos(long waitNanos, String waitingFor) {
         try {
-            String raw = waitNanos > 0
+            InboxMessage message = waitNanos > 0
                 ? inbox.poll(waitNanos, TimeUnit.NANOSECONDS) : null;
-            if (raw == null) {
+            if (message == null) {
                 // Distinguish a dead Chrome from a merely slow page.
                 if (!chrome.isAlive()) {
                     throw new IllegalStateException("Chrome exited (code "
@@ -1919,10 +1986,12 @@ public final class BrewShot implements AutoCloseable {
                 }
                 throw new IllegalStateException("CDP timeout waiting for " + waitingFor);
             }
-            if (SOCKET_CLOSED.equals(raw)) {
+            releaseInboxBudget(message);
+            if (message.socketClosed()) {
                 socketClosed = true;
                 throw new IllegalStateException(chromeDeathReason(waitingFor));
             }
+            String raw = message.raw();
             return (Map<String, Object>) MiniJson.parse(raw);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -1936,6 +2005,11 @@ public final class BrewShot implements AutoCloseable {
             return "Chrome exited (code " + chrome.exitValue() + ") while " + doing;
         }
         return "DevTools socket closed while " + doing;
+    }
+
+    /** Return the exact reservation measured by the producer; close messages reserve zero. */
+    private void releaseInboxBudget(InboxMessage message) {
+        inboxBudget.release(message.reservedBytes());
     }
 
     // ---- the harness surface ----------------------------------------------
@@ -2167,6 +2241,29 @@ public final class BrewShot implements AutoCloseable {
     }
 
     /**
+     * Total CDP messages rejected because the undrained inbox hit either its
+     * message-count or retained-byte ceiling. This counter is monotonic for the client.
+     */
+    public long inboxDropped() {
+        return inboxBudget.inboxDropped();
+    }
+
+    /** CDP messages rejected specifically by {@code brewshot.maxInboxMessages}. */
+    public long inboxCountDropped() {
+        return inboxBudget.inboxCountDropped();
+    }
+
+    /** CDP messages rejected specifically by {@code brewshot.maxInboxBytes}. */
+    public long inboxByteDropped() {
+        return inboxBudget.inboxByteDropped();
+    }
+
+    /** Package-private production-wiring discriminator. */
+    InboxBudget inboxBudget() {
+        return inboxBudget;
+    }
+
+    /**
      * Pull any already-arrived messages through the router without blocking.
      *
      * <p>Seeing the close sentinel LATCHES {@link #socketClosed} before returning. It
@@ -2174,9 +2271,11 @@ public final class BrewShot implements AutoCloseable {
      * later caller unable to learn the socket had closed.
      */
     private void drainInboxNonBlocking() {
-        String raw;
-        while ((raw = inbox.poll()) != null) {
-            if (SOCKET_CLOSED.equals(raw)) { socketClosed = true; return; }
+        InboxMessage message;
+        while ((message = inbox.poll()) != null) {
+            releaseInboxBudget(message);
+            if (message.socketClosed()) { socketClosed = true; return; }
+            String raw = message.raw();
             @SuppressWarnings("unchecked")
             Map<String, Object> m = (Map<String, Object>) MiniJson.parse(raw);
             if (m.get("id") == null) { routeEvent(m); }
@@ -2332,7 +2431,7 @@ public final class BrewShot implements AutoCloseable {
             "{" + captureFormatParams(fmt, quality) + ",\"captureBeyondViewport\":true}");
         String b64 = (String) r.get("data");
         byte[] bytes = Base64.getDecoder().decode(b64);
-        enforceCaptureBounds(bytes); // loud, header-only, before writing the file
+        enforceCaptureBounds(bytes); // compressed bytes exist; bound before raster decode/write
         // Bound FIRST, then hand the accepted bytes to main's atomic writer: an
         // over-bound capture must be refused before anything reaches the target,
         // so a rejected re-shoot still leaves the previous good artifact intact.
@@ -2471,7 +2570,7 @@ public final class BrewShot implements AutoCloseable {
                 + ",\"width\":" + width + ",\"height\":" + height
                 + ",\"scale\":" + scale + "}}");
         byte[] bytes = Base64.getDecoder().decode((String) r.get("data"));
-        enforceCaptureBounds(bytes); // loud, header-only, before the frame enters any GIF buffer
+        enforceCaptureBounds(bytes); // compressed bytes exist; bound before GIF retention/decode
         return bytes;
     }
 
@@ -3277,43 +3376,200 @@ public final class BrewShot implements AutoCloseable {
         } catch (IOException ignored) { }
     }
 
+    /** Number of bytes the JDK UTF-8 encoder emits for an unpaired surrogate. */
+    private static final int UTF8_REPLACEMENT_BYTES =
+        StandardCharsets.UTF_8.newEncoder().replacement().length;
+
+    /**
+     * Exact allocation-free length of the JDK UTF-8 encoding of {@code value}.
+     * Valid surrogate pairs count as four bytes; isolated surrogates use the same
+     * replacement width as {@link String#getBytes(java.nio.charset.Charset)}.
+     */
+    static long utf8Length(CharSequence value) {
+        Objects.requireNonNull(value, "value");
+        long bytes = 0;
+        for (int i = 0; i < value.length(); i++) {
+            char ch = value.charAt(i);
+            if (ch <= 0x7f) {
+                bytes++;
+            } else if (ch <= 0x7ff) {
+                bytes += 2;
+            } else if (Character.isHighSurrogate(ch)
+                    && i + 1 < value.length()
+                    && Character.isLowSurrogate(value.charAt(i + 1))) {
+                bytes += 4;
+                i++;
+            } else if (Character.isSurrogate(ch)) {
+                bytes += UTF8_REPLACEMENT_BYTES;
+            } else {
+                bytes += 3;
+            }
+        }
+        return bytes;
+    }
+
+    /**
+     * One queued transport item and the exact producer-side byte reservation it owns.
+     *
+     * <p>The reservation is data, not something the consumer reconstructs from
+     * {@link #raw}. That matters when a surrogate pair straddles WebSocket callbacks:
+     * summing callback encodings and re-encoding the completed String are not generally
+     * interchangeable. A typed terminal bit also prevents ordinary CDP text that happens
+     * to equal {@link #SOCKET_CLOSED} from impersonating the close signal.
+     */
+    static record InboxMessage(String raw, long reservedBytes, boolean socketClosed) {
+        InboxMessage {
+            Objects.requireNonNull(raw, "raw");
+            if (reservedBytes < 0) {
+                throw new IllegalArgumentException("reservedBytes must be non-negative");
+            }
+            if (socketClosed && reservedBytes != 0) {
+                throw new IllegalArgumentException("a close message cannot reserve bytes");
+            }
+        }
+
+        static InboxMessage regular(String raw, long reservedBytes) {
+            return new InboxMessage(raw, reservedBytes, false);
+        }
+
+        /** Test seam for manually injected messages that have no tracked reservation. */
+        static InboxMessage untracked(String raw) {
+            return regular(raw, 0);
+        }
+
+        static InboxMessage closed() {
+            return new InboxMessage(SOCKET_CLOSED, 0, true);
+        }
+    }
+
+    /**
+     * Exact UTF-8 budget shared by the producer and consumer sides of one inbox.
+     * Reservation and release are synchronized because the WebSocket callback and
+     * command/drain caller are different threads.
+     */
+    static final class InboxBudget {
+        private final long maxBytes;
+        private final boolean tracked;
+        private long retainedBytes;
+        private long inboxDropped;
+        private long inboxCountDropped;
+        private long inboxByteDropped;
+
+        InboxBudget(long maxBytes) {
+            this(maxBytes, true);
+        }
+
+        private InboxBudget(long maxBytes, boolean tracked) {
+            if (maxBytes <= 0) {
+                throw new IllegalArgumentException("maxBytes must be positive");
+            }
+            this.maxBytes = maxBytes;
+            this.tracked = tracked;
+        }
+
+        static InboxBudget untracked() {
+            return new InboxBudget(Long.MAX_VALUE, false);
+        }
+
+        synchronized boolean tryRetain(long bytes) {
+            if (bytes < 0) {
+                throw new IllegalArgumentException("bytes must be non-negative");
+            }
+            if (!tracked) { return true; }
+            if (bytes > maxBytes - retainedBytes) { return false; }
+            retainedBytes += bytes;
+            return true;
+        }
+
+        synchronized void release(long bytes) {
+            if (!tracked) { return; }
+            if (bytes < 0 || bytes > retainedBytes) {
+                throw new IllegalStateException(
+                    "CDP inbox byte accounting underflow: retained=" + retainedBytes
+                        + ", release=" + bytes);
+            }
+            retainedBytes -= bytes;
+        }
+
+        synchronized void recordCountDrop() {
+            inboxDropped++;
+            inboxCountDropped++;
+        }
+
+        synchronized void recordByteDrop() {
+            inboxDropped++;
+            inboxByteDropped++;
+        }
+
+        long maxBytes() { return maxBytes; }
+
+        synchronized long retainedBytes() { return retainedBytes; }
+
+        synchronized long inboxDropped() { return inboxDropped; }
+
+        synchronized long inboxCountDropped() { return inboxCountDropped; }
+
+        synchronized long inboxByteDropped() { return inboxByteDropped; }
+    }
+
     /**
      * WebSocket listener reassembling partial text frames into whole messages.
      * On close/error it enqueues a poison message so a blocked caller fails
      * fast ("Chrome exited") instead of sleeping out the full timeout.
      *
-     * <p>Two independent F-01 ingress bounds are enforced here, both on the single
+     * <p>Three independent F-01 ingress bounds are enforced here, all on the single
      * (serialized) WebSocket callback thread:
      * <ol>
      *   <li><b>Per-message</b> ({@link #maxMessageBytes}): a message whose reassembly
      *       buffer would cross the ceiling is dropped, its partial buffer released the
      *       moment it overflows — never materialized as a giant String.</li>
-     *   <li><b>Cumulative</b> ({@link #maxInboxMessages}): the ingress queue only ever
+     *   <li><b>Queued message count</b> ({@link #maxInboxMessages}): the ingress queue only ever
      *       holds up to {@code maxInboxMessages} regular messages. A page emitting a
      *       flood of individually-small messages while the command thread is not draining
      *       used to grow the (default-unbounded) inbox without bound; now the newest
      *       message is DROPPED once the cap is reached. The sink's physical capacity is
      *       {@code maxInboxMessages + 1}, so one slot is always reserved for the
      *       close/error sentinel — the poison signal can never be lost to a full inbox.</li>
+     *   <li><b>Queued UTF-8 bytes</b> ({@link InboxBudget#maxBytes()}): the prospective
+     *       exact encoded aggregate is checked before a completed message is retained.
+     *       Dequeue returns its reservation, so this bounds undrained content rather than
+     *       imposing a lifetime traffic quota.</li>
      * </ol>
-     * Both drops are announced once + counted, never silent.
+     * Every drop class is announced once + counted, never silent.
      */
     static final class Accumulator implements WebSocket.Listener {
-        private final LinkedBlockingQueue<String> sink;
+        private final LinkedBlockingQueue<InboxMessage> sink;
         private final long maxMessageBytes;
         /** Cumulative cap on queued regular messages; one further slot in {@link #sink}
          *  is reserved for the close/error sentinel. */
         private final int maxInboxMessages;
+        private final InboxBudget inboxBudget;
         private final StringBuilder buf = new StringBuilder();
+        private long bufferedUtf8Bytes;
+        /** A terminal high surrogate was counted as replacement in the prior chunk. */
+        private boolean trailingHighSurrogate;
         private boolean overflowed;
         private long dropped;
-        private long inboxDropped;
-        private boolean inboxDropAnnounced;
+        private boolean inboxCountDropAnnounced;
+        private boolean inboxByteDropAnnounced;
 
-        Accumulator(LinkedBlockingQueue<String> sink, long maxMessageBytes, int maxInboxMessages) {
-            this.sink = sink;
+        Accumulator(LinkedBlockingQueue<InboxMessage> sink, long maxMessageBytes,
+                    int maxInboxMessages) {
+            this(sink, maxMessageBytes, maxInboxMessages, InboxBudget.untracked());
+        }
+
+        Accumulator(LinkedBlockingQueue<InboxMessage> sink, long maxMessageBytes,
+                    int maxInboxMessages, InboxBudget inboxBudget) {
+            this.sink = Objects.requireNonNull(sink, "sink");
+            if (maxMessageBytes <= 0) {
+                throw new IllegalArgumentException("maxMessageBytes must be positive");
+            }
+            if (maxInboxMessages <= 0) {
+                throw new IllegalArgumentException("maxInboxMessages must be positive");
+            }
             this.maxMessageBytes = maxMessageBytes;
             this.maxInboxMessages = maxInboxMessages;
+            this.inboxBudget = Objects.requireNonNull(inboxBudget, "inboxBudget");
         }
 
         /**
@@ -3324,25 +3580,60 @@ public final class BrewShot implements AutoCloseable {
          * {@link #maxInboxMessages} (cumulative drop) — either drop counted.
          */
         void accept(CharSequence data, boolean last) {
-            if (!overflowed && buf.length() + (long) data.length() > maxMessageBytes) {
-                overflowed = true;
-                buf.setLength(0); // release the partial NOW — this is the whole point
+            Objects.requireNonNull(data, "data");
+            if (!overflowed) {
+                long addedBytes = encodedBytesInNextChunk(data, last);
+                if (addedBytes > maxMessageBytes - bufferedUtf8Bytes) {
+                    overflowed = true;
+                    resetBuffer(); // release the partial NOW — this is the whole point
+                } else {
+                    bufferedUtf8Bytes += addedBytes;
+                    buf.append(data);
+                }
             }
-            if (!overflowed) { buf.append(data); }
             if (last) {
                 if (overflowed) {
                     dropped++;
                     if (dropped == 1) {
                         System.err.println("brewshot: dropped an oversized CDP message (exceeds "
-                            + maxMessageBytes + "-char ceiling; brewshot.maxCdpMessageBytes)."
+                            + maxMessageBytes + "-byte UTF-8 ceiling; "
+                            + "brewshot.maxCdpMessageBytes)."
                             + " Further such drops are counted, not re-announced.");
                     }
                     overflowed = false;
                 } else {
-                    enqueue(buf.toString());
+                    enqueue(buf.toString(), bufferedUtf8Bytes);
                 }
-                buf.setLength(0);
+                resetBuffer();
             }
+        }
+
+        /**
+         * Count one callback without allocating encoded bytes. A surrogate pair split
+         * between callbacks is counted by correcting the two replacement widths to one
+         * four-byte scalar when the low surrogate arrives.
+         */
+        private long encodedBytesInNextChunk(CharSequence data, boolean last) {
+            long bytes = utf8Length(data);
+            if (trailingHighSurrogate && data.length() > 0) {
+                if (Character.isLowSurrogate(data.charAt(0))) {
+                    bytes += 4L - 2L * UTF8_REPLACEMENT_BYTES;
+                }
+                trailingHighSurrogate = false;
+            }
+            if (last) {
+                trailingHighSurrogate = false;
+            } else if (data.length() > 0) {
+                trailingHighSurrogate =
+                    Character.isHighSurrogate(data.charAt(data.length() - 1));
+            }
+            return bytes;
+        }
+
+        private void resetBuffer() {
+            buf.setLength(0);
+            bufferedUtf8Bytes = 0;
+            trailingHighSurrogate = false;
         }
 
         /**
@@ -3354,18 +3645,41 @@ public final class BrewShot implements AutoCloseable {
          * a race. FIFO order is preserved (sentinel goes to the tail like today), so a
          * closed socket still flushes already-queued events before the poison.
          */
-        private void enqueue(String msg) {
+        private void enqueue(String msg, long encodedBytes) {
             if (sink.size() >= maxInboxMessages) {
-                inboxDropped++;
-                if (!inboxDropAnnounced) {
-                    inboxDropAnnounced = true;
-                    System.err.println("brewshot: CDP inbox full at " + maxInboxMessages
-                        + " queued messages — dropping newer messages (brewshot.maxInboxMessages)."
-                        + " Further drops are counted, not re-announced.");
-                }
+                recordCountDrop();
                 return;
             }
-            sink.offer(msg); // reserved-slot invariant guarantees room; offer never blocks
+            if (!inboxBudget.tryRetain(encodedBytes)) {
+                recordByteDrop();
+                return;
+            }
+            if (!sink.offer(InboxMessage.regular(msg, encodedBytes))) {
+                // A mismatched test/custom sink must not leak a byte reservation.
+                inboxBudget.release(encodedBytes);
+                recordCountDrop();
+            }
+        }
+
+        private void recordCountDrop() {
+            inboxBudget.recordCountDrop();
+            if (!inboxCountDropAnnounced) {
+                inboxCountDropAnnounced = true;
+                System.err.println("brewshot: CDP inbox full at " + maxInboxMessages
+                    + " queued messages — dropping newer messages (brewshot.maxInboxMessages)."
+                    + " Further count-cap drops are counted, not re-announced.");
+            }
+        }
+
+        private void recordByteDrop() {
+            inboxBudget.recordByteDrop();
+            if (!inboxByteDropAnnounced) {
+                inboxByteDropAnnounced = true;
+                System.err.println("brewshot: CDP inbox retained-byte budget full at "
+                    + inboxBudget.maxBytes() + " UTF-8 bytes — dropping newer messages "
+                    + "(brewshot.maxInboxBytes). Further byte-cap drops are counted, "
+                    + "not re-announced.");
+            }
         }
 
         /** Enqueue the poison sentinel into the reserved slot — never dropped even
@@ -3373,14 +3687,20 @@ public final class BrewShot implements AutoCloseable {
         private void signalClosed() {
             // Regular messages never exceed maxInboxMessages, so with capacity
             // maxInboxMessages + 1 this offer always succeeds.
-            sink.offer(SOCKET_CLOSED);
+            sink.offer(InboxMessage.closed());
         }
 
         /** Count of CDP messages dropped for exceeding the per-message byte ceiling. */
         long dropped() { return dropped; }
 
         /** Count of whole messages dropped for exceeding the cumulative inbox cap. */
-        long inboxDropped() { return inboxDropped; }
+        long inboxDropped() { return inboxBudget.inboxDropped(); }
+
+        /** Count of cumulative drops caused specifically by the message-count cap. */
+        long inboxCountDropped() { return inboxBudget.inboxCountDropped(); }
+
+        /** Count of the cumulative drops caused specifically by the retained-byte cap. */
+        long inboxByteDropped() { return inboxBudget.inboxByteDropped(); }
 
         /**
          * Test seam: the sink this Accumulator was actually WIRED to.
@@ -3392,10 +3712,13 @@ public final class BrewShot implements AutoCloseable {
          * its own correctly-sized queue can never catch that; it has to inspect the one
          * production built. Package-private and read-only, like the drop counters.
          */
-        LinkedBlockingQueue<String> sink() { return sink; }
+        LinkedBlockingQueue<InboxMessage> sink() { return sink; }
 
         /** Test seam: the cumulative regular-message cap this Accumulator was built with. */
         int inboxCap() { return maxInboxMessages; }
+
+        /** Test seam: the production byte tracker shared with its eventual client. */
+        InboxBudget inboxBudget() { return inboxBudget; }
 
         @Override
         public CompletionStage<?> onText(WebSocket webSocket, CharSequence data, boolean last) {

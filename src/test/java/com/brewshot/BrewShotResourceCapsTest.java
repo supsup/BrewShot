@@ -92,7 +92,7 @@ class BrewShotResourceCapsTest {
         List<byte[]> frames = List.of(png(100, 100), png(100, 100), png(100, 100));
         IOException e = assertThrows(IOException.class,
             () -> GifWriter.write(frames, 100, dir.resolve("over-decoded.gif")));
-        assertTrue(e.getMessage().contains("decoded working set")
+        assertTrue(e.getMessage().contains("decoded raster accounting")
                 && e.getMessage().contains("maxDecodedBytes"),
             "the refusal names the decoded-byte budget: " + e.getMessage());
     }
@@ -187,10 +187,10 @@ class BrewShotResourceCapsTest {
 
     @Test
     void anOversizedCdpMessageIsDroppedNotBuffered() {
-        LinkedBlockingQueue<String> q = new LinkedBlockingQueue<>();
+        LinkedBlockingQueue<BrewShot.InboxMessage> q = new LinkedBlockingQueue<>();
         BrewShot.Accumulator acc = new BrewShot.Accumulator(q, 100, 4096);
 
-        // One 250-char message split across partials: crosses the 100-char ceiling → dropped.
+        // One 250-byte ASCII message split across partials crosses the 100-byte ceiling.
         acc.accept("x".repeat(60), false);
         acc.accept("y".repeat(60), false);
         acc.accept("z".repeat(130), true);
@@ -199,8 +199,67 @@ class BrewShotResourceCapsTest {
 
         // Control on the SAME accumulator: an in-ceiling message flows through intact.
         acc.accept("{\"ok\":1}", true);
-        assertEquals("{\"ok\":1}", q.poll(), "an in-ceiling message is enqueued whole");
+        assertEquals("{\"ok\":1}", q.poll().raw(),
+            "an in-ceiling message is enqueued whole");
         assertEquals(1, acc.dropped(), "the in-ceiling message adds no drop");
+    }
+
+    @Test
+    void cdpMessageCeilingCountsExactUtf8BytesAcrossLegalWebSocketFragments() {
+        LinkedBlockingQueue<BrewShot.InboxMessage> q = new LinkedBlockingQueue<>();
+        BrewShot.Accumulator acc = new BrewShot.Accumulator(q, 4, 4096);
+
+        // A complete supplementary code point is exactly four UTF-8 bytes and must
+        // be admitted at equality, including across a callback boundary.
+        String emoji = "\uD83D\uDE00";
+        acc.accept(emoji, true);
+        assertEquals(emoji, q.poll().raw(), "supplementary code point is measured exactly");
+
+        // Three UTF-16 units, but six UTF-8 bytes. The old CharSequence.length()
+        // implementation admits this under a 4-byte setting; this is the causal
+        // discriminator for the lying maxCdpMessageBytes contract.
+        acc.accept("ééé", true);
+        assertNull(q.poll(), "encoded bytes, not UTF-16 units, enforce the byte ceiling");
+        assertEquals(1, acc.dropped(), "the over-byte message is counted as dropped");
+
+        // Paired control: equality remains inclusive for ordinary ASCII too.
+        acc.accept("abcd", true);
+        assertEquals("abcd", q.poll().raw());
+        assertEquals(1, acc.dropped());
+    }
+
+    @Test
+    void allocationFreeUtf8MeterMatchesTheJdkEncoder() {
+        String[] samples = {
+            "", "plain ASCII", "é", "€", "\uD83D\uDE00", "x\uD83D\uDE00y",
+            "\uD83D", "\uDE00", "\uD83Dé\uDE00"
+        };
+        for (String sample : samples) {
+            assertEquals(sample.getBytes(StandardCharsets.UTF_8).length,
+                BrewShot.utf8Length(sample), "UTF-8 length drift for " + sample);
+        }
+    }
+
+    @Test
+    void incrementalUtf8MeterMatchesWholeEncodingAtEveryFragmentBoundary() {
+        String[] samples = {
+            "abc", "éa€", "\uD83D\uDE00", "a\uD83D\uDE00éz"
+        };
+        for (String sample : samples) {
+            long exactBytes = sample.getBytes(StandardCharsets.UTF_8).length;
+            for (int split = 0; split <= sample.length(); split++) {
+                LinkedBlockingQueue<BrewShot.InboxMessage> q =
+                    new LinkedBlockingQueue<>();
+                BrewShot.Accumulator acc =
+                    new BrewShot.Accumulator(q, exactBytes, 4);
+                acc.accept(sample.substring(0, split), false);
+                acc.accept(sample.substring(split), true);
+                assertEquals(sample, q.poll().raw(),
+                    "exact-byte message rejected at UTF-16 split " + split
+                        + " of " + sample.length());
+                assertEquals(0, acc.dropped());
+            }
+        }
     }
 
     @Test
@@ -210,7 +269,8 @@ class BrewShotResourceCapsTest {
         // 20000 one-char messages → queued=20000). The cumulative cap now bounds the whole
         // queue. Mirror production: capacity is cap + 1 (one slot reserved for the sentinel).
         int cap = 8;
-        LinkedBlockingQueue<String> q = new LinkedBlockingQueue<>(cap + 1);
+        LinkedBlockingQueue<BrewShot.InboxMessage> q =
+            new LinkedBlockingQueue<>(cap + 1);
         BrewShot.Accumulator acc = new BrewShot.Accumulator(q, 1_000, cap);
 
         int flood = 20_000;
@@ -228,7 +288,8 @@ class BrewShotResourceCapsTest {
         // messages are being DROPPED, the close/error poison still gets a home — a blocked
         // caller fails fast instead of sleeping out the timeout.
         int cap = 4;
-        LinkedBlockingQueue<String> q = new LinkedBlockingQueue<>(cap + 1);
+        LinkedBlockingQueue<BrewShot.InboxMessage> q =
+            new LinkedBlockingQueue<>(cap + 1);
         BrewShot.Accumulator acc = new BrewShot.Accumulator(q, 1_000, cap);
 
         for (int i = 0; i < cap + 50; i++) { acc.accept("m", true); } // saturate + overflow
@@ -240,9 +301,10 @@ class BrewShotResourceCapsTest {
         assertEquals(cap + 1, q.size(), "the reserved slot admits the close sentinel");
 
         // Drain: the last element is the poison signal, intact.
-        String last = null;
-        for (String s = q.poll(); s != null; s = q.poll()) { last = s; }
-        assertTrue(last != null && last.contains("brewshotSocketClosed"),
+        BrewShot.InboxMessage last = null;
+        for (BrewShot.InboxMessage s = q.poll(); s != null; s = q.poll()) { last = s; }
+        assertTrue(last != null && last.socketClosed()
+                && last.raw().contains("brewshotSocketClosed"),
             "the close signal arrived even though the inbox was full: " + last);
     }
 

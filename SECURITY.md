@@ -1,9 +1,10 @@
 # Security model
 
-Short version: **BrewShot hands your input to Chromium and reads back bytes and
-JSON — it never interprets page content itself.** A malicious page is
-Chromium's threat model, not BrewShot's. The real risks are the ordinary ones
-that come with driving a browser, listed at the end.
+Short version: **BrewShot hands your input to Chromium and reads back structured
+JSON and encoded images; it does not execute page content in Java.** It parses
+CDP JSON and image header metadata, while Chromium remains the component that
+interprets HTML, CSS, and JavaScript. The real risks are the ordinary ones that
+come with driving a browser, listed at the end.
 
 ## What actually happens to page content
 
@@ -12,7 +13,7 @@ WebSocket, and consumes exactly three things back from the page:
 
 | From the page | BrewShot does | Risk |
 | --- | --- | --- |
-| screenshot | `Base64.decode` → `Files.write` | opaque bytes, never decoded/parsed by us |
+| screenshot | `Base64.decode` → ImageIO header/dimension read → atomic file write | compressed bytes are allocated before the dimension check; still-image pixels are not fully decoded by BrewShot |
 | `eval` result | `MiniJson.parse` → typed value | the one place page **data** enters Java — see below |
 | CDP events | routed by method name; console/errors kept as text | bounded by entry count **and** a retained-byte ceiling; CDP ingress itself is byte-bounded; never executed |
 
@@ -29,30 +30,47 @@ output, a huge `eval` result, a giant screenshot, a long recording. Those paths
 are bounded so a chatty or hostile page degrades loudly instead of OOMing the
 harness:
 
-- **CDP ingress** is bounded on **two** axes. *Per message*
-  (`brewshot.maxCdpMessageBytes`, default 32 MB): a message that would exceed the
-  ceiling is dropped — its reassembly buffer released, never materialized as a
-  giant `String`. *Cumulatively* (`brewshot.maxInboxMessages`, default 4096): the
-  ingress queue holds at most this many undrained messages, so a page that emits a
-  flood of individually-small messages while the command thread is busy can no
-  longer grow the inbox without bound — the newest messages are dropped once the
-  cap is reached. One queue slot is reserved for the socket close/error signal, so
-  that poison is never lost to a full inbox (a stalled caller still fails fast).
-  Both drops are announced once and counted, never silent.
+- **CDP ingress** is bounded on **three** axes. *Per message*
+  (`brewshot.maxCdpMessageBytes`, default 32 MiB): a message that would exceed the
+  exact UTF-8 ceiling is dropped — its reassembly buffer released, never
+  materialized as a giant `String`. Counting is incremental across callbacks,
+  including a surrogate pair split at a callback boundary. *Queued message
+  count* (`brewshot.maxInboxMessages`, default 4096): the
+  ingress queue holds at most this many undrained regular messages. *Queued
+  encoded content* (`brewshot.maxInboxBytes`, default 32 MiB): the prospective
+  exact UTF-8 aggregate is checked before retaining each completed message, and
+  dequeuing returns its reservation. A flood of individually-small messages
+  therefore cannot multiply the per-message ceiling by the count ceiling; the
+  byte bound applies to live undrained content, not lifetime traffic. The
+  per-message and aggregate byte properties are independent; raising one
+  does not implicitly raise the other. One queue
+  slot is reserved for the typed socket close/error signal, so that signal is never
+  lost to a full inbox (a stalled caller still fails fast). Every drop class is
+  announced once and counted, never silent. The final cumulative total and its
+  count-cap/byte-cap components are available from `inboxDropped()`,
+  `inboxCountDropped()`, and `inboxByteDropped()`. Invalid/nonpositive byte settings
+  and a message-count setting above `Integer.MAX_VALUE - 1` fail configuration
+  before queue construction.
 - **Console/error retention** is bounded on **two** axes: entry count (1000)
   **and** a retained-byte budget (`brewshot.maxConsoleBytes`, default 1 MB), so
   a single multi-MB console entry can no longer be kept whole. Over-budget
   entries are truncated/dropped and the dropped count is exposed.
-- **Screenshot capture** is refused, header-only and before any full-pixel
-  allocation, above `brewshot.maxImageDimension` (16384 px/axis) or
-  `brewshot.maxImagePixels` (64 MP).
-- **GIF assembly** is refused, before decode, above `brewshot.gif.maxFrames`
-  (1000), `brewshot.gif.maxFrameDimension` (4096 px/axis), or
-  `brewshot.gif.maxDecodedBytes` (512 MB of decoded working set = Σ w·h·4).
+- **Screenshot capture** first receives the CDP Base64 string and allocates its
+  decoded compressed byte array. BrewShot then parses image header metadata and
+  refuses dimensions above `brewshot.maxImageDimension` (16384 px/axis) or
+  `brewshot.maxImagePixels` (64 MP) before writing the artifact or performing a
+  downstream full-raster decode. The transport's per-message UTF-8 ceiling bounds
+  the earlier CDP response allocation; the dimension ceiling does not precede it.
+- **GIF assembly** reads frame headers before its full decode and refuses above
+  `brewshot.gif.maxFrames` (1000), `brewshot.gif.maxFrameDimension` (4096 px/axis),
+  or `brewshot.gif.maxDecodedBytes` (512 MiB of decoded-raster accounting,
+  `Σ width * height * 4`). That sum is an accounting ceiling for nominal raster
+  bytes, not a complete encoder peak: compressed input frames, Java image objects,
+  palette/histogram state, indexed frames, and encoder buffers are additional.
 
-All limits are `-D` overridable and enforced BEFORE the large allocation, and a
-breach is loud (a thrown error or an announced+counted drop) — never a silent
-truncation.
+All limits are `-D` overridable. Each check runs before the allocation it claims
+to guard, and a breach is loud (a thrown error or an announced+counted drop) —
+never a silent truncation.
 
 ### The one ingestion point: `MiniJson`
 

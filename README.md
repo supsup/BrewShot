@@ -525,8 +525,22 @@ for those fixtures. That refusal occurs without launching Chrome.
 The load/navigation wait budget defaults to 15s; raise it for a heavy page with
 `BREWSHOT_TIMEOUT_MS` or per-instance `shot.navTimeout(ms)`.
 
-Two further resource bounds, each a separate axis:
+Resource controls, each a separate axis:
 
+- **CDP inbox budgets** — every complete DevTools message is measured as exact
+  UTF-8 while its WebSocket fragments are reassembled
+  (`-Dbrewshot.maxCdpMessageBytes`, default 32 MiB). The undrained queue is
+  independently capped by regular-message count
+  (`-Dbrewshot.maxInboxMessages`, default 4096) and aggregate exact UTF-8 bytes
+  (`-Dbrewshot.maxInboxBytes`, default 32 MiB). Dequeue returns byte capacity;
+  these are live retained-content bounds, not lifetime traffic quotas. The
+  message and aggregate byte properties are independently configured: raising
+  one does not implicitly raise the other. One extra physical queue slot
+  remains reserved for typed socket closure. The
+  producer-measured reservation travels with each queued message, including
+  across a split surrogate-pair callback boundary. Operators can retrieve the
+  total and per-cause drop counters with `shot.inboxDropped()`,
+  `shot.inboxCountDropped()`, and `shot.inboxByteDropped()`.
 - **Per-CDP-call budget** — how long one DevTools round-trip may take (a
   full-page screenshot of a tall document is the motivating case: navigation was
   fast, the single capture call wasn't). `BREWSHOT_COMMAND_TIMEOUT_MS` or
@@ -537,6 +551,19 @@ Two further resource bounds, each a separate axis:
   `BREWSHOT_MAX_RECORDING_BYTES` (default 256 MiB; `shot.recordingHeapBudget(bytes)`),
   write the frames captured so far, and say so on stderr — a truncated GIF that
   announces itself beats both an OOM and a silently short one.
+- **Still-image dimensions** — Chrome's Base64 CDP result and BrewShot's decoded
+  compressed byte array already exist when BrewShot reads the image header.
+  `-Dbrewshot.maxImageDimension` (default 16384/axis) and
+  `-Dbrewshot.maxImagePixels` (default 64 MP) refuse the image before artifact
+  write or downstream full-raster decode; they do not claim to precede the CDP or
+  Base64 allocations.
+- **GIF decoded-raster accounting** — before full frame decode,
+  `-Dbrewshot.gif.maxFrames` (default 1000),
+  `-Dbrewshot.gif.maxFrameDimension` (default 4096/axis), and
+  `-Dbrewshot.gif.maxDecodedBytes` (default 512 MiB) inspect frame headers and
+  bound `Σ width * height * 4`. The last value is a raster accounting proxy, not
+  total encoder heap: compressed frames, Java objects, palette/index buffers,
+  and encoder state are additional.
 
 ## Docs
 

@@ -64,7 +64,7 @@ final class GifWriter {
     static final int DEFAULT_MAX_FRAME_DIMENSION = 4096;
     /** Default max number of frames in one GIF. -Dbrewshot.gif.maxFrames. */
     static final int DEFAULT_MAX_FRAMES = 1000;
-    /** Default decoded working-set budget (bytes = Σ w*h*4), 512 MB. -Dbrewshot.gif.maxDecodedBytes. */
+    /** Default decoded-raster accounting ceiling (Σ w*h*4), 512 MiB. */
     static final long DEFAULT_MAX_DECODED_BYTES = 536_870_912L;
 
     private static int maxFrameDimension() {
@@ -98,8 +98,10 @@ final class GifWriter {
     }
 
     /**
-     * Reject a frame set whose DECODED working set would blow the budget, BEFORE
-     * any full decode. Reads only each PNG's header dimensions via an
+     * Reject a frame set whose decoded-raster accounting would exceed the budget,
+     * BEFORE any full decode. This Σ w*h*4 ceiling does not include compressed
+     * inputs, Java image objects, palette/index state, or encoder buffers. Reads
+     * only each PNG's header dimensions via an
      * {@link ImageReader} (no pixel array is allocated), so an over-dimension /
      * over-frame-count / over-decoded-budget input fails loud and cheap instead
      * of OOMing in {@link #write}'s decode loop. Package-private so it is unit-
@@ -141,7 +143,7 @@ final class GifWriter {
             }
             decoded += (long) w * h * 4;
             if (decoded > maxDecoded) {
-                throw new IOException("gif refused: decoded working set reaches " + decoded
+                throw new IOException("gif refused: decoded raster accounting reaches " + decoded
                     + " bytes by frame " + i + " of " + pngFrames.size() + ", exceeds "
                     + maxDecoded + " (brewshot.gif.maxDecodedBytes)");
             }
@@ -169,8 +171,9 @@ final class GifWriter {
         BrewShot.effectiveGifDelayMs(frameDelayMs);
         BrewShot.effectiveGifDelayMs(firstFrameDelayMs);
 
-        // Bound the DECODED working set BEFORE the decode loop below — header-only
-        // inspection, loud on breach. This is the single chokepoint every GIF path
+        // Bound decoded-raster accounting BEFORE the decode loop below — header-only
+        // inspection, loud on breach. This is not a claim about total encoder heap.
+        // This is the single chokepoint every GIF path
         // (poll recorders, screencast, and the static BrewShot.gif() entry point)
         // funnels through, so it closes the gif() budget-bypass too.
         enforceDecodeBounds(pngFrames);
