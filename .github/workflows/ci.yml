@@ -77,5 +77,8 @@ jobs:
           chmod 0644 "$smoke_dir/page.html"
           docker run --rm --volume "$smoke_dir:/work" brewshot:ci \
             page.html --settle 100 -o page.png
-          test -s "$smoke_dir/page.png"
-          test "$(od -An -t x1 -N 8 "$smoke_dir/page.png" | tr -d ' \n')" = "89504e470d0a1a0a"
+          docker run --rm --volume "$smoke_dir:/work:ro" \
+            --entrypoint /bin/sh brewshot:ci -eu -c '
+              test -s /work/page.png
+              test "$(od -An -t x1 -N 8 /work/page.png | tr -d " \n")" = "89504e470d0a1a0a"
+            '

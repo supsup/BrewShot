@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **Container smoke validates secure outputs at the correct identity** (plan
+  2f42a765). The Docker capture gate now checks the generated PNG from a
+  read-only second invocation of the same pinned runtime image. This preserves
+  BrewShot's fixed non-root user and owner-only atomic-output permissions while
+  avoiding the invalid host-runner read that made successful captures report a
+  permission-denied CI failure.
 - **`diff` inputs are size-bounded before they are decoded.** `ImageIO.read`
   allocates a `width × height` raster as its first act, so a PNG that merely
   *declares* 40000×40000 — a few hundred bytes on disk — used to take the memory
