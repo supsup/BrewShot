@@ -2,6 +2,7 @@ package com.brewshot;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -11,6 +12,7 @@ import java.io.OutputStream;
 import java.net.http.WebSocket;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -70,7 +72,7 @@ class CdpInboxWiringTest {
         Path profile = Files.createDirectory(temp.resolve("profile-capacity"));
         BrewShot.Accumulator accumulator = captureProductionAccumulator(profile);
 
-        LinkedBlockingQueue<String> sink = accumulator.sink();
+        LinkedBlockingQueue<BrewShot.InboxMessage> sink = accumulator.sink();
         int cap = accumulator.inboxCap();
 
         // The invariant, asserted against the two values production actually chose
@@ -87,7 +89,7 @@ class CdpInboxWiringTest {
         BrewShot.Accumulator accumulator = captureProductionAccumulator(profile);
 
         int cap = accumulator.inboxCap();
-        LinkedBlockingQueue<String> sink = accumulator.sink();
+        LinkedBlockingQueue<BrewShot.InboxMessage> sink = accumulator.sink();
 
         // Saturate the regular band and push well past it, exactly as a chatty page would.
         for (int i = 0; i < cap + 50; i++) {
@@ -101,12 +103,12 @@ class CdpInboxWiringTest {
 
         assertEquals(cap + 1, sink.size(),
             "the reserved slot must admit the close sentinel even at full inbox");
-        String last = null;
-        for (String s = sink.poll(); s != null; s = sink.poll()) {
+        BrewShot.InboxMessage last = null;
+        for (BrewShot.InboxMessage s = sink.poll(); s != null; s = sink.poll()) {
             last = s;
         }
         assertNotNull(last, "the drained sink must not be empty");
-        assertTrue(last.contains("brewshotSocketClosed"),
+        assertTrue(last.socketClosed() && last.raw().contains("brewshotSocketClosed"),
             "a caller blocked on a saturated inbox must still receive the close signal, "
                 + "got: " + last);
     }
@@ -123,7 +125,7 @@ class CdpInboxWiringTest {
             BrewShot.Accumulator accumulator = captureProductionAccumulator(profile);
             assertEquals(7, accumulator.inboxCap(),
                 "the launch-side cap must read the configured property");
-            LinkedBlockingQueue<String> sink = accumulator.sink();
+            LinkedBlockingQueue<BrewShot.InboxMessage> sink = accumulator.sink();
             assertEquals(8, sink.size() + sink.remainingCapacity(),
                 "and the sink must still be one slot larger than that configured cap");
         } finally {
@@ -152,7 +154,8 @@ class CdpInboxWiringTest {
             limited.accept("aa", true); // prospective aggregate 6 > 5
             assertEquals(1, limited.sink().size(),
                 "the byte budget must reject while the ten-message count cap still has room");
-            assertEquals("éé", limited.sink().poll(), "the earlier in-budget message is retained");
+            assertEquals("éé", limited.sink().poll().raw(),
+                "the earlier in-budget message is retained");
             assertEquals(1, limited.inboxDropped(), "the cumulative-byte drop is counted");
 
             // Equality control on fresh production wiring: 4 + 2 == 6 is admitted.
@@ -166,6 +169,27 @@ class CdpInboxWiringTest {
         } finally {
             restoreProperty(countKey, priorCount);
             restoreProperty(bytesKey, priorBytes);
+        }
+    }
+
+    @Test
+    void theConfiguredMessageCeilingCountsUtf8BytesNotUtf16Units(@TempDir Path temp)
+            throws Exception {
+        String key = "brewshot.maxCdpMessageBytes";
+        String prior = System.getProperty(key);
+        try {
+            System.setProperty(key, "4");
+            BrewShot.Accumulator accumulator = captureProductionAccumulator(
+                Files.createDirectory(temp.resolve("profile-message-byte-cap")));
+
+            accumulator.accept("éé", true);  // 4 UTF-8 bytes: equality admitted
+            accumulator.accept("ééé", true); // 3 UTF-16 units, 6 UTF-8 bytes: refused
+            assertEquals(1, accumulator.sink().size());
+            assertEquals("éé", accumulator.sink().poll().raw());
+            assertEquals(1, accumulator.dropped(),
+                "a UTF-16-unit ceiling would incorrectly admit the six-byte control");
+        } finally {
+            restoreProperty(key, prior);
         }
     }
 
@@ -193,7 +217,8 @@ class CdpInboxWiringTest {
     void bothConsumerPollPathsReturnCumulativeByteCapacity(@TempDir Path temp)
             throws Exception {
         // Nonblocking diagnostic/event drain.
-        LinkedBlockingQueue<String> drainQueue = new LinkedBlockingQueue<>(5);
+        LinkedBlockingQueue<BrewShot.InboxMessage> drainQueue =
+            new LinkedBlockingQueue<>(5);
         BrewShot.InboxBudget drainBudget = new BrewShot.InboxBudget(5);
         BrewShot.Accumulator drainAccumulator =
             new BrewShot.Accumulator(drainQueue, 100, 4, drainBudget);
@@ -211,7 +236,8 @@ class CdpInboxWiringTest {
         }
 
         // Blocking command/response poll.
-        LinkedBlockingQueue<String> commandQueue = new LinkedBlockingQueue<>(5);
+        LinkedBlockingQueue<BrewShot.InboxMessage> commandQueue =
+            new LinkedBlockingQueue<>(5);
         BrewShot.InboxBudget commandBudget = new BrewShot.InboxBudget(1_000);
         BrewShot.Accumulator commandAccumulator =
             new BrewShot.Accumulator(commandQueue, 1_000, 4, commandBudget);
@@ -223,6 +249,92 @@ class CdpInboxWiringTest {
             assertEquals(7.0, ((Number) shot.eval("1")).doubleValue(), 0.001);
             assertEquals(0, commandBudget.retainedBytes(),
                 "command response polling returns the same shared reservation");
+        }
+    }
+
+    @Test
+    void splitSurrogateReservationIsCarriedExactlyThroughTheBlockingConsumer(
+            @TempDir Path temp) throws Exception {
+        String raw = "{\"id\":1,\"result\":{\"result\":{\"value\":\"\uD83D\uDE00\"}}}";
+        int split = raw.indexOf('\uD83D') + 1;
+        long exactBytes = BrewShot.utf8Length(raw);
+        LinkedBlockingQueue<BrewShot.InboxMessage> queue = new LinkedBlockingQueue<>(5);
+        BrewShot.InboxBudget budget = new BrewShot.InboxBudget(exactBytes);
+        BrewShot.Accumulator accumulator =
+            new BrewShot.Accumulator(queue, exactBytes, 4, budget);
+
+        // This callback boundary used to reserve the two encoder replacements while
+        // dequeue re-encoded the completed pair as four bytes, causing an underflow.
+        accumulator.accept(raw.substring(0, split), false);
+        accumulator.accept(raw.substring(split), true);
+        assertEquals(exactBytes, queue.element().reservedBytes(),
+            "the queued item carries the exact completed-message reservation");
+        assertEquals(exactBytes, budget.retainedBytes());
+
+        try (BrewShot shot = new BrewShot(new FakeProcess(),
+                Files.createDirectory(temp.resolve("profile-split-surrogate")),
+                new SilentWebSocket(), queue, 40L, budget)) {
+            assertEquals("\uD83D\uDE00", shot.eval("1"));
+            assertEquals(0, budget.retainedBytes(),
+                "consumer releases the carried reservation without re-encoding");
+        }
+    }
+
+    @Test
+    void ordinaryPayloadCannotImpersonateTheTypedCloseMessage(@TempDir Path temp)
+            throws Exception {
+        LinkedBlockingQueue<BrewShot.InboxMessage> queue = new LinkedBlockingQueue<>(4);
+        queue.add(BrewShot.InboxMessage.untracked("{\"brewshotSocketClosed\":true}"));
+        queue.add(BrewShot.InboxMessage.untracked(
+            "{\"id\":1,\"result\":{\"result\":{\"value\":7}}}"));
+        try (BrewShot shot = new BrewShot(new FakeProcess(),
+                Files.createDirectory(temp.resolve("profile-sentinel-collision")),
+                new SilentWebSocket(), queue, 40L)) {
+            assertEquals(7.0, ((Number) shot.eval("1")).doubleValue(), 0.001,
+                "terminal state is carried by type, not spoofable payload text");
+        }
+    }
+
+    @Test
+    void completedLaunchSharesBudgetAndExposesBothDropCauses(@TempDir Path temp)
+            throws Exception {
+        String countKey = "brewshot.maxInboxMessages";
+        String bytesKey = "brewshot.maxInboxBytes";
+        String priorCount = System.getProperty(countKey);
+        String priorBytes = System.getProperty(bytesKey);
+        AtomicReference<BrewShot.Accumulator> captured = new AtomicReference<>();
+        try {
+            System.setProperty(countKey, "2");
+            System.setProperty(bytesKey, "200");
+            Path profile = Files.createDirectory(temp.resolve("profile-complete-launch"));
+            FakeProcess process = new FakeProcess();
+            try (BrewShot shot = BrewShot.finishLaunch(process, profile,
+                    "ws://127.0.0.1:1/devtools/browser/fake",
+                    (uri, listener, timeout) -> {
+                        BrewShot.Accumulator accumulator = (BrewShot.Accumulator) listener;
+                        captured.set(accumulator);
+                        return CompletableFuture.completedFuture(
+                            new BootstrapWebSocket(accumulator));
+                    }, 1_000)) {
+                BrewShot.Accumulator accumulator = captured.get();
+                assertNotNull(accumulator);
+                assertSame(accumulator.inboxBudget(), shot.inboxBudget(),
+                    "the production producer and returned client share one budget");
+
+                accumulator.accept("a".repeat(150), true); // retained
+                accumulator.accept("b".repeat(100), true); // byte cap
+                accumulator.accept("c", true);             // retained, count now two
+                accumulator.accept("d", true);             // count cap
+
+                assertEquals(2, shot.inboxDropped());
+                assertEquals(1, shot.inboxCountDropped());
+                assertEquals(1, shot.inboxByteDropped());
+                assertEquals(shot.inboxDropped(),
+                    shot.inboxCountDropped() + shot.inboxByteDropped());
+            }
+        } finally {
+            restoreProperty(countKey, priorCount);
+            restoreProperty(bytesKey, priorBytes);
         }
     }
 
@@ -241,7 +353,8 @@ class CdpInboxWiringTest {
      * the review said was missing: proving the {@code Accumulator} can PLACE the poison
      * does not prove a caller can ever SEE it.
      */
-    private static BrewShot clientOver(LinkedBlockingQueue<String> inbox, Path profile) {
+    private static BrewShot clientOver(
+            LinkedBlockingQueue<BrewShot.InboxMessage> inbox, Path profile) {
         // A SENDABLE stub socket, not null. With null the client cannot send at all, so
         // any failure satisfies the assertions and the test cannot tell "failed because
         // the socket closed" from "failed because there is no socket" — it passed against
@@ -250,7 +363,7 @@ class CdpInboxWiringTest {
     }
 
     /** Accepts sends and never replies: the only fast failure can be the closed-state latch. */
-    private static final class SilentWebSocket implements WebSocket {
+    private static class SilentWebSocket implements WebSocket {
         @Override public CompletableFuture<WebSocket> sendText(CharSequence d, boolean last) {
             return CompletableFuture.completedFuture(this);
         }
@@ -273,6 +386,28 @@ class CdpInboxWiringTest {
         @Override public void abort() { }
     }
 
+    /** Auto-replies to the five bootstrap commands so finishLaunch returns a real client. */
+    private static final class BootstrapWebSocket extends SilentWebSocket {
+        private final WebSocket.Listener listener;
+
+        BootstrapWebSocket(WebSocket.Listener listener) {
+            this.listener = listener;
+        }
+
+        @Override public CompletableFuture<WebSocket> sendText(CharSequence data, boolean last) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> sent = (Map<String, Object>) MiniJson.parse(data.toString());
+            int id = ((Number) sent.get("id")).intValue();
+            String result = switch (String.valueOf(sent.get("method"))) {
+                case "Target.createTarget" -> "{\"targetId\":\"target\"}";
+                case "Target.attachToTarget" -> "{\"sessionId\":\"session\"}";
+                default -> "{}";
+            };
+            listener.onText(this, "{\"id\":" + id + ",\"result\":" + result + "}", true);
+            return CompletableFuture.completedFuture(this);
+        }
+    }
+
     @Test
     void aNonblockingDrainMustNotSwallowTheCloseSentinel(@TempDir Path temp) throws Exception {
         // MARLOW'S REPRODUCTION (brewshot/249). drainInboxNonBlocking polled the
@@ -283,7 +418,7 @@ class CdpInboxWiringTest {
         // command timeout with Chrome still alive, instead of an immediate closed-socket
         // failure. That is precisely the stall the reserved slot exists to prevent.
         Path profile = Files.createDirectory(temp.resolve("profile-drain"));
-        LinkedBlockingQueue<String> inbox = new LinkedBlockingQueue<>(8);
+        LinkedBlockingQueue<BrewShot.InboxMessage> inbox = new LinkedBlockingQueue<>(8);
         BrewShot shot = clientOver(inbox, profile);
 
         // The Accumulator wired to this exact queue announces the close.
@@ -314,7 +449,7 @@ class CdpInboxWiringTest {
         // still lose it to the SECOND drain. Latched state is the only representation
         // that survives an arbitrary number of drains by an arbitrary number of callers.
         Path profile = Files.createDirectory(temp.resolve("profile-repeat"));
-        LinkedBlockingQueue<String> inbox = new LinkedBlockingQueue<>(8);
+        LinkedBlockingQueue<BrewShot.InboxMessage> inbox = new LinkedBlockingQueue<>(8);
         BrewShot shot = clientOver(inbox, profile);
 
         new BrewShot.Accumulator(inbox, 1_000, 4).onClose(null, 1000, "bye");

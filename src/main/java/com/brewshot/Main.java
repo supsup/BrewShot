@@ -839,6 +839,17 @@ public final class Main {
                            once, exit 1 if nothing matches); composes with --scale
               --version    print the version and exit
 
+            JVM resource ceilings (-D):
+              brewshot.maxCdpMessageBytes  exact UTF-8 bytes per complete CDP message
+              brewshot.maxInboxMessages / brewshot.maxInboxBytes
+                           undrained message count / exact retained UTF-8 bytes
+              brewshot.maxImageDimension / maxImagePixels
+                           image-header dimension checks after Base64 decode, before
+                           artifact write or downstream full-raster decode
+              brewshot.gif.maxDecodedBytes
+                           Σ width*height*4 decoded-raster accounting before full
+                           frame decode; not total GIF encoder heap
+
             subcommands:
               diff a.png b.png   pixel diff -> citable verdict + threshold gate
                                  (see 'brewshot diff --help'; no Chrome needed)

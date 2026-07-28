@@ -115,7 +115,7 @@ class BrewShotTransportDeadlineTest {
     @Test
     void neverCompletingSendUsesCommandBudgetAndCancelsTransport(@TempDir Path temp)
             throws Exception {
-        LinkedBlockingQueue<String> inbox = new LinkedBlockingQueue<>();
+        LinkedBlockingQueue<BrewShot.InboxMessage> inbox = new LinkedBlockingQueue<>();
         FakeWebSocket socket = new FakeWebSocket();
         CompletableFuture<WebSocket> stuckSend = new CompletableFuture<>();
         socket.onSend = ignored -> stuckSend;
@@ -144,7 +144,7 @@ class BrewShotTransportDeadlineTest {
     @Test
     void sendTimeIsSpentFromTheSameDeadlineAsTheResponse(@TempDir Path temp)
             throws Exception {
-        LinkedBlockingQueue<String> inbox = new LinkedBlockingQueue<>();
+        LinkedBlockingQueue<BrewShot.InboxMessage> inbox = new LinkedBlockingQueue<>();
         FakeWebSocket socket = new FakeWebSocket();
         // Send consumes 180ms of a 250ms command budget. No response follows.
         // A reset-after-send implementation takes about 430ms; one deadline
@@ -170,14 +170,14 @@ class BrewShotTransportDeadlineTest {
 
     @Test
     void successfulCommandSurvivesASaturatedTimeout(@TempDir Path temp) throws Exception {
-        LinkedBlockingQueue<String> inbox = new LinkedBlockingQueue<>();
+        LinkedBlockingQueue<BrewShot.InboxMessage> inbox = new LinkedBlockingQueue<>();
         FakeWebSocket socket = new FakeWebSocket();
         socket.onSend = text -> {
             @SuppressWarnings("unchecked")
             Map<String, Object> sent = (Map<String, Object>) MiniJson.parse(text);
             int id = ((Number) sent.get("id")).intValue();
-            inbox.add("{\"id\":" + id
-                + ",\"result\":{\"result\":{\"value\":\"still-ok\"}}}");
+            inbox.add(BrewShot.InboxMessage.untracked("{\"id\":" + id
+                + ",\"result\":{\"result\":{\"value\":\"still-ok\"}}}"));
             return CompletableFuture.completedFuture(socket);
         };
         BrewShot shot = new BrewShot(
@@ -195,7 +195,7 @@ class BrewShotTransportDeadlineTest {
     @Test
     void waitForUsesSaturatedMonotonicDeadlineAtLongMax(
             @TempDir Path temp) throws Exception {
-        LinkedBlockingQueue<String> inbox = new LinkedBlockingQueue<>();
+        LinkedBlockingQueue<BrewShot.InboxMessage> inbox = new LinkedBlockingQueue<>();
         FakeWebSocket socket = new FakeWebSocket();
         AtomicInteger polls = new AtomicInteger();
         socket.onSend = text -> {
@@ -203,8 +203,8 @@ class BrewShotTransportDeadlineTest {
             Map<String, Object> sent = (Map<String, Object>) MiniJson.parse(text);
             int id = ((Number) sent.get("id")).intValue();
             boolean ready = polls.incrementAndGet() >= 2;
-            inbox.add("{\"id\":" + id
-                + ",\"result\":{\"result\":{\"value\":" + ready + "}}}");
+            inbox.add(BrewShot.InboxMessage.untracked("{\"id\":" + id
+                + ",\"result\":{\"result\":{\"value\":" + ready + "}}}"));
             return CompletableFuture.completedFuture(socket);
         };
         BrewShot shot = new BrewShot(
@@ -225,11 +225,13 @@ class BrewShotTransportDeadlineTest {
     @Test
     void networkIdleUsesSaturatedMonotonicDeadlineAtLongMax(
             @TempDir Path temp) throws Exception {
-        LinkedBlockingQueue<String> inbox = new LinkedBlockingQueue<>();
-        inbox.add("{\"method\":\"Network.requestWillBeSent\","
-            + "\"params\":{\"requestId\":\"request-1\"}}");
-        inbox.add("{\"method\":\"Network.loadingFinished\","
-            + "\"params\":{\"requestId\":\"request-1\"}}");
+        LinkedBlockingQueue<BrewShot.InboxMessage> inbox = new LinkedBlockingQueue<>();
+        inbox.add(BrewShot.InboxMessage.untracked(
+            "{\"method\":\"Network.requestWillBeSent\","
+                + "\"params\":{\"requestId\":\"request-1\"}}"));
+        inbox.add(BrewShot.InboxMessage.untracked(
+            "{\"method\":\"Network.loadingFinished\","
+                + "\"params\":{\"requestId\":\"request-1\"}}"));
         BrewShot shot = new BrewShot(
             new FakeProcess(true), profile(temp, "network-idle-max"),
             new FakeWebSocket(), inbox, 40);

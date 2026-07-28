@@ -1,6 +1,7 @@
 package com.brewshot;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -14,6 +15,25 @@ import org.junit.jupiter.api.io.TempDir;
 
 /** CLI arg handling — no Chrome needed: every case exits before launch. */
 class MainCliTest {
+
+    @Test
+    void helpStatesTheExactByteAndImageAllocationContracts() throws Exception {
+        ByteArrayOutputStream errors = new ByteArrayOutputStream();
+        PrintStream original = System.err;
+        int code;
+        try {
+            System.setErr(new PrintStream(errors));
+            code = Main.run(new String[] {"--help"});
+        } finally {
+            System.setErr(original);
+        }
+        String help = errors.toString();
+        assertEquals(0, code);
+        assertTrue(help.contains("brewshot.maxCdpMessageBytes")
+                && help.contains("exact UTF-8 bytes per complete CDP message"), help);
+        assertTrue(help.contains("image-header dimension checks after Base64 decode"), help);
+        assertTrue(help.contains("not total GIF encoder heap"), help);
+    }
 
     @Test
     void exitCodes() throws Exception {
