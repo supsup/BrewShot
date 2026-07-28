@@ -39,6 +39,27 @@ class TestChromeTest {
     }
 
     @Test
+    void operatorForbidWinsOverAvailableChromeAndAbortsAsSkip() {
+        PrintStream realErr = System.err;
+        ByteArrayOutputStream captured = new ByteArrayOutputStream();
+        System.setErr(new PrintStream(captured, true, StandardCharsets.UTF_8));
+        try {
+            // chromeAvailable=true + launchForbidden=true: the operator kill
+            // switch must win — skip loudly even though a browser exists.
+            assertThrows(TestAbortedException.class,
+                () -> TestChrome.requireChromeOrLoudSkip("MyDemoSuite", true, true));
+        } finally {
+            System.setErr(realErr);
+        }
+        String banner = captured.toString(StandardCharsets.UTF_8);
+        assertTrue(banner.contains("SKIPPED MyDemoSuite"),
+            "banner must name the skipped suite; got: " + banner);
+        assertTrue(banner.contains("FORBIDDEN BY OPERATOR"), banner);
+        assertTrue(banner.contains("BREWSHOT_FORBID_CHROME"),
+            "banner must name the kill switch so the skip is greppable; got: " + banner);
+    }
+
+    @Test
     void availableChromeReturnsQuietlyWithoutBanner() {
         PrintStream realErr = System.err;
         ByteArrayOutputStream captured = new ByteArrayOutputStream();

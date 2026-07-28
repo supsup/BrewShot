@@ -1,5 +1,6 @@
 package com.brewshot;
 
+import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
@@ -24,6 +25,7 @@ import java.util.Deque;
 import java.util.EnumMap;
 import java.util.EnumSet;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -39,6 +41,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.IntConsumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import javax.imageio.ImageIO;
+import javax.imageio.ImageReader;
+import javax.imageio.stream.ImageInputStream;
 
 /**
  * BrewShot — Java brews screenshots. A self-contained Chrome DevTools Protocol
@@ -106,6 +111,23 @@ public final class BrewShot implements AutoCloseable {
     /** Poison message the listener enqueues on close/error so a blocked caller fails fast. */
     private static final String SOCKET_CLOSED = "{\"brewshotSocketClosed\":true}";
 
+    /**
+     * DURABLE record that the transport reached its terminal state.
+     *
+     * <p>The reserved-slot invariant guarantees the close sentinel always gets INTO the
+     * inbox. It did not guarantee a caller could ever OBSERVE it: every nonblocking
+     * drain — reached from console(), consoleDropped(), errors(), errorsDropped(),
+     * freshNavigation() and waitForNetworkIdle() — used to poll the sentinel and return,
+     * consuming the only copy. A later command then waited out its full timeout while
+     * Chrome was still alive, instead of failing fast with a closed-socket reason. That
+     * is the exact stall the bound exists to prevent (review brewshot/249).
+     *
+     * <p>Latched rather than re-queued: a queue slot can be consumed exactly once, so a
+     * flag is the only representation that survives an arbitrary number of drains by an
+     * arbitrary number of callers. Once true it never clears — the socket does not reopen.
+     */
+    private volatile boolean socketClosed;
+
     /** One shared client for all launches — no selector-thread accumulation per launch. */
     private static final HttpClient HTTP = HttpClient.newHttpClient();
 
@@ -136,9 +158,11 @@ public final class BrewShot implements AutoCloseable {
     private final AtomicBoolean closed = new AtomicBoolean();
     /** Only awaitable events are kept here (Page.loadEventFired) — bounded by design. */
     private final Deque<Map<String, Object>> pendingEvents = new ArrayDeque<>();
-    /** Console messages + uncaught exceptions since the last open()/html(). Bounded. */
-    private final List<String> consoleLog = new ArrayList<>();
-    private final List<String> errorLog = new ArrayList<>();
+    /** Console messages + uncaught exceptions since the last open()/html(). Bounded by
+     *  BOTH entry count (CONSOLE_CAP) and an encoded-byte budget (brewshot.maxConsoleBytes),
+     *  so a single multi-MB console entry can no longer be retained whole. */
+    private final BoundedLog consoleLog = new BoundedLog();
+    private final BoundedLog errorLog = new BoundedLog();
     private final Map<String, String> extraHeaders = new java.util.LinkedHashMap<>();
     private boolean captureConsole = true;
     // Emulated media state (plan 02af3a3d) — null means "no override, whatever the browser
@@ -248,6 +272,103 @@ public final class BrewShot implements AutoCloseable {
             catch (NumberFormatException ignored) { /* fall through to default */ }
         }
         return DEFAULT_TIMEOUT_MS;
+    }
+
+    // ---- resource bounds: capture size, CDP ingress, console retention ------
+    // System-property-backed limits, read FRESH at the point of use so a -D
+    // override (or a test's System.setProperty) takes effect. These are read
+    // INDEPENDENTLY here — deliberately NOT sharing a file with the diff side,
+    // which owns its own copies of the same-named screenshot limits.
+
+    /** Default max px per axis for a captured screenshot. -Dbrewshot.maxImageDimension. */
+    static final int DEFAULT_MAX_IMAGE_DIMENSION = 16_384;
+    /** Default max total pixels (w*h) for a captured screenshot, 64 MP. -Dbrewshot.maxImagePixels. */
+    static final long DEFAULT_MAX_IMAGE_PIXELS = 67_108_864L;
+    /** Default per-CDP-message byte/char ceiling, 32 MB. -Dbrewshot.maxCdpMessageBytes. */
+    static final long DEFAULT_MAX_CDP_MESSAGE_BYTES = 33_554_432L;
+    /** Default CUMULATIVE cap on queued (undrained) CDP messages, 4096. -Dbrewshot.maxInboxMessages.
+     *  Bounds the whole ingress queue, not just each message: a chatty page emitting a flood
+     *  of individually-small messages while no thread is draining can no longer grow the inbox
+     *  without bound. See {@link Accumulator}. */
+    static final int DEFAULT_MAX_INBOX_MESSAGES = 4096;
+    /** Default per-log retained-byte budget for console/error text, 1 MB. -Dbrewshot.maxConsoleBytes. */
+    static final long DEFAULT_MAX_CONSOLE_BYTES = 1_048_576L;
+
+    private static int intProp(String key, int dflt) {
+        String v = System.getProperty(key);
+        if (v != null) {
+            try { int n = Integer.parseInt(v.trim()); if (n > 0) { return n; } }
+            catch (NumberFormatException ignored) { /* fall through to default */ }
+        }
+        return dflt;
+    }
+
+    private static long longProp(String key, long dflt) {
+        String v = System.getProperty(key);
+        if (v != null) {
+            try { long n = Long.parseLong(v.trim()); if (n > 0) { return n; } }
+            catch (NumberFormatException ignored) { /* fall through to default */ }
+        }
+        return dflt;
+    }
+
+    private static int maxImageDimension() {
+        return intProp("brewshot.maxImageDimension", DEFAULT_MAX_IMAGE_DIMENSION);
+    }
+
+    private static long maxImagePixels() {
+        return longProp("brewshot.maxImagePixels", DEFAULT_MAX_IMAGE_PIXELS);
+    }
+
+    private static long maxCdpMessageBytes() {
+        return longProp("brewshot.maxCdpMessageBytes", DEFAULT_MAX_CDP_MESSAGE_BYTES);
+    }
+
+    private static int maxInboxMessages() {
+        return intProp("brewshot.maxInboxMessages", DEFAULT_MAX_INBOX_MESSAGES);
+    }
+
+    private static long maxConsoleBytes() {
+        return longProp("brewshot.maxConsoleBytes", DEFAULT_MAX_CONSOLE_BYTES);
+    }
+
+    /**
+     * Reject a captured image whose DECODED dimensions exceed the configured
+     * ceiling, inspected via an {@link ImageReader} on the RETURNED bytes — only
+     * the header is read, no full pixel array is allocated — so the refusal is
+     * loud and cheap and lands BEFORE any downstream full-pixel decode. Enforced
+     * on the {@code screenshot}/{@code screenshotClip} capture paths. Bytes whose
+     * header is unreadable are left alone (decodability is a different concern,
+     * handled by the consumer). Package-private for browser-free unit testing.
+     */
+    static void enforceCaptureBounds(byte[] imageBytes) {
+        int maxDim = maxImageDimension();
+        long maxPixels = maxImagePixels();
+        int w;
+        int h;
+        try (ImageInputStream iis =
+                 ImageIO.createImageInputStream(new ByteArrayInputStream(imageBytes))) {
+            Iterator<ImageReader> readers = iis == null ? null : ImageIO.getImageReaders(iis);
+            if (readers == null || !readers.hasNext()) { return; }
+            ImageReader reader = readers.next();
+            try {
+                reader.setInput(iis, true, true);
+                w = reader.getWidth(0);
+                h = reader.getHeight(0);
+            } finally {
+                reader.dispose();
+            }
+        } catch (IOException unreadable) {
+            return; // not a size problem; leave decode errors to the consumer
+        }
+        if (w > maxDim || h > maxDim) {
+            throw new IllegalStateException("capture refused: image is " + w + "x" + h
+                + ", exceeds max axis " + maxDim + " (brewshot.maxImageDimension)");
+        }
+        if ((long) w * h > maxPixels) {
+            throw new IllegalStateException("capture refused: image is " + w + "x" + h + " = "
+                + ((long) w * h) + " px, exceeds " + maxPixels + " (brewshot.maxImagePixels)");
+        }
     }
 
     // ---- discovery ---------------------------------------------------------
@@ -487,6 +608,11 @@ public final class BrewShot implements AutoCloseable {
         private ProcessHandle parentHandle;
         private final List<ProcessHandle> descendantHandles = new ArrayList<>();
         private Owner owner = Owner.LAUNCH;
+        /** The argv sweep enumerates every process on the host (~30ms here), so
+         *  it runs ONCE per lease rather than on every retry pass: reparenting
+         *  happens at most once per launch, and a per-pass sweep would spend a
+         *  meaningful slice of the bounded cleanup budget re-proving it. */
+        private boolean orphanSweepDone;
 
         private ResourceLease(Process process, Path profileDir,
                               ProfileDeleter profileDeleter,
@@ -533,8 +659,19 @@ public final class BrewShot implements AutoCloseable {
             boolean processTreeReaped = terminateProcess(
                 process, parentHandle, List.copyOf(descendantHandles),
                 gracefulFirst, deadline);
+            // Runs BEFORE the release gate and the delete: a helper that was
+            // reparented out of every handle snapshot is invisible to
+            // terminateProcess, and it recreates the directory we are about to
+            // remove. Its liveness also gates release — a known argv-matching
+            // survivor is positive evidence that containment is NOT closed.
+            boolean orphansReaped = true;
+            if (!orphanSweepDone) {
+                orphanSweepDone = true;
+                orphansReaped =
+                    allHandlesDead(sweepOrphansByProfilePath(profileDir, deadline));
+            }
             boolean releaseProven =
-                processTreeReaped && processTreeReleaseSafe();
+                processTreeReaped && orphansReaped && processTreeReleaseSafe();
             if (releaseProven) {
                 try { profileDeleter.delete(profileDir); }
                 catch (RuntimeException ignored) {
@@ -903,14 +1040,23 @@ public final class BrewShot implements AutoCloseable {
     static BrewShot finishLaunch(ResourceLease lease, String wsUrl,
                                  WebSocketConnector connector, long connectTimeoutMs)
             throws IOException {
-        LinkedBlockingQueue<String> inbox = new LinkedBlockingQueue<>();
+        // F-01 (audit): the CDP inbox is the one unbounded ingress point — Chrome is
+        // the producer and it is not rate-limited by us, so an unbounded queue lets a
+        // chatty or hostile page grow it without ceiling. Capacity is cap + 1: the
+        // Accumulator enqueues at most `inboxCap` regular messages, keeping the last
+        // physical slot reserved so the close/error sentinel (SOCKET_CLOSED) can NEVER
+        // be lost to a full inbox — a blocked caller still fails fast instead of
+        // sleeping out the timeout. See Accumulator.
+        int inboxCap = maxInboxMessages();
+        LinkedBlockingQueue<String> inbox = new LinkedBlockingQueue<>(inboxCap + 1);
         WebSocket socket = null;
         BrewShot c = null;
         long boundedConnectTimeoutMs = Math.max(1, connectTimeoutMs);
         Deadline connectDeadline = Deadline.afterMillis(boundedConnectTimeoutMs);
         try {
             CompletableFuture<WebSocket> connecting =
-                connector.connect(URI.create(wsUrl), new Accumulator(inbox),
+                connector.connect(URI.create(wsUrl),
+                    new Accumulator(inbox, maxCdpMessageBytes(), inboxCap),
                     Duration.ofMillis(boundedConnectTimeoutMs));
             socket = awaitConnection(
                 connecting, connectDeadline, boundedConnectTimeoutMs);
@@ -1495,6 +1641,14 @@ public final class BrewShot implements AutoCloseable {
     /** Send one CDP command and block for its id-matched result. */
     @SuppressWarnings("unchecked")
     private Map<String, Object> command(String method, String paramsJson) {
+        // FAIL FAST on a transport already known dead. Without this the latch would be
+        // a flag nobody reads: a caller whose drain consumed the sentinel would still
+        // spend the full commandTimeout waiting for a response that can never arrive.
+        // The point of the reserved slot was never "the sentinel is in the queue" — it
+        // was "a blocked caller fails fast instead of sleeping out the timeout".
+        if (socketClosed) {
+            throw new IllegalStateException(chromeDeathReason(method));
+        }
         int id = nextId++;
         StringBuilder msg = new StringBuilder(128)
             .append("{\"id\":").append(id)
@@ -1628,15 +1782,15 @@ public final class BrewShot implements AutoCloseable {
                 if (!captureConsole) { return; }
                 String type = String.valueOf(MiniJson.get(m, "params.type"));
                 String text = consoleArgsText(m);
-                bounded(consoleLog, type + ": " + text);
-                if ("error".equals(type)) { bounded(errorLog, "console.error: " + text); }
+                consoleLog.record(type + ": " + text);
+                if ("error".equals(type)) { errorLog.record("console.error: " + text); }
             }
             case "Runtime.exceptionThrown" -> {
                 if (!captureConsole) { return; }
                 Object desc = MiniJson.get(m,
                     "params.exceptionDetails.exception.description");
                 if (desc == null) { desc = MiniJson.get(m, "params.exceptionDetails.text"); }
-                bounded(errorLog, "uncaught: " + desc);
+                errorLog.record("uncaught: " + desc);
             }
             case "Page.loadEventFired" -> pendingEvents.add(m);
             case "Network.requestWillBeSent" -> {
@@ -1675,9 +1829,71 @@ public final class BrewShot implements AutoCloseable {
         return b.toString();
     }
 
-    private static void bounded(List<String> log, String entry) {
-        if (log.size() < CONSOLE_CAP) { log.add(entry); }
-        else if (log.size() == CONSOLE_CAP) { log.add("... (capped at " + CONSOLE_CAP + ")"); }
+    /**
+     * A console/error buffer bounded on TWO axes: the entry count (CONSOLE_CAP)
+     * AND the retained encoded-byte total (brewshot.maxConsoleBytes). The
+     * byte-axis is the F-01 fix — the old entry-only cap retained a single
+     * multi-MB console string whole, so 1000 huge entries was a gigabyte. A
+     * too-large entry is truncated to the remaining byte budget on a character
+     * boundary and stamped with a marker; once either axis trips, further entries
+     * are dropped and counted. {@code dropped} is exposed via
+     * {@link #consoleDropped()}/{@link #errorsDropped()}.
+     */
+    static final class BoundedLog {
+        private final List<String> entries = new ArrayList<>();
+        private long bytes;
+        private boolean truncated;
+        private long dropped;
+
+        void record(String entry) {
+            long maxBytes = maxConsoleBytes();
+            if (truncated || entries.size() >= CONSOLE_CAP) {
+                if (!truncated) {
+                    entries.add("... (capped at " + CONSOLE_CAP + " entries)");
+                    truncated = true;
+                }
+                dropped++;
+                return;
+            }
+            long entryBytes = entry.getBytes(StandardCharsets.UTF_8).length;
+            if (bytes + entryBytes > maxBytes) {
+                long remaining = Math.max(0, maxBytes - bytes);
+                String clamped = truncateToBytes(entry, remaining);
+                entries.add(clamped + "... (console byte budget " + maxBytes + " reached)");
+                bytes = maxBytes;
+                truncated = true;
+                dropped++;
+                return;
+            }
+            entries.add(entry);
+            bytes += entryBytes;
+        }
+
+        void clear() {
+            entries.clear();
+            bytes = 0;
+            truncated = false;
+            dropped = 0;
+        }
+
+        List<String> view() { return List.copyOf(entries); }
+
+        long dropped() { return dropped; }
+    }
+
+    /** Longest prefix of {@code s} whose UTF-8 encoding is {@code <= maxBytes}, on a char boundary. */
+    private static String truncateToBytes(String s, long maxBytes) {
+        long acc = 0;
+        int i = 0;
+        while (i < s.length()) {
+            int cp = s.codePointAt(i);
+            int cw = Character.charCount(cp);
+            long cb = s.substring(i, i + cw).getBytes(StandardCharsets.UTF_8).length;
+            if (acc + cb > maxBytes) { break; }
+            acc += cb;
+            i += cw;
+        }
+        return s.substring(0, i);
     }
 
     private Map<String, Object> nextMessage(Deadline deadline, String waitingFor) {
@@ -1704,6 +1920,7 @@ public final class BrewShot implements AutoCloseable {
                 throw new IllegalStateException("CDP timeout waiting for " + waitingFor);
             }
             if (SOCKET_CLOSED.equals(raw)) {
+                socketClosed = true;
                 throw new IllegalStateException(chromeDeathReason(waitingFor));
             }
             return (Map<String, Object>) MiniJson.parse(raw);
@@ -1924,7 +2141,13 @@ public final class BrewShot implements AutoCloseable {
      */
     public List<String> console() {
         drainInboxNonBlocking();
-        return List.copyOf(consoleLog);
+        return consoleLog.view();
+    }
+
+    /** Count of console entries dropped/truncated by the entry+byte bounds since the last navigation. */
+    public long consoleDropped() {
+        drainInboxNonBlocking();
+        return consoleLog.dropped();
     }
 
     /**
@@ -1934,14 +2157,26 @@ public final class BrewShot implements AutoCloseable {
      */
     public List<String> errors() {
         drainInboxNonBlocking();
-        return List.copyOf(errorLog);
+        return errorLog.view();
     }
 
-    /** Pull any already-arrived messages through the router without blocking. */
+    /** Count of error entries dropped/truncated by the entry+byte bounds since the last navigation. */
+    public long errorsDropped() {
+        drainInboxNonBlocking();
+        return errorLog.dropped();
+    }
+
+    /**
+     * Pull any already-arrived messages through the router without blocking.
+     *
+     * <p>Seeing the close sentinel LATCHES {@link #socketClosed} before returning. It
+     * used to just return, which consumed the queue's only sentinel and left every
+     * later caller unable to learn the socket had closed.
+     */
     private void drainInboxNonBlocking() {
         String raw;
         while ((raw = inbox.poll()) != null) {
-            if (SOCKET_CLOSED.equals(raw)) { return; }
+            if (SOCKET_CLOSED.equals(raw)) { socketClosed = true; return; }
             @SuppressWarnings("unchecked")
             Map<String, Object> m = (Map<String, Object>) MiniJson.parse(raw);
             if (m.get("id") == null) { routeEvent(m); }
@@ -2096,7 +2331,12 @@ public final class BrewShot implements AutoCloseable {
         Map<String, Object> r = command("Page.captureScreenshot",
             "{" + captureFormatParams(fmt, quality) + ",\"captureBeyondViewport\":true}");
         String b64 = (String) r.get("data");
-        ArtifactWriter.writeBytes(out, Base64.getDecoder().decode(b64));
+        byte[] bytes = Base64.getDecoder().decode(b64);
+        enforceCaptureBounds(bytes); // loud, header-only, before writing the file
+        // Bound FIRST, then hand the accepted bytes to main's atomic writer: an
+        // over-bound capture must be refused before anything reaches the target,
+        // so a rejected re-shoot still leaves the previous good artifact intact.
+        ArtifactWriter.writeBytes(out, bytes);
     }
 
     /**
@@ -2230,7 +2470,9 @@ public final class BrewShot implements AutoCloseable {
                 + "\"x\":" + x + ",\"y\":" + y
                 + ",\"width\":" + width + ",\"height\":" + height
                 + ",\"scale\":" + scale + "}}");
-        return Base64.getDecoder().decode((String) r.get("data"));
+        byte[] bytes = Base64.getDecoder().decode((String) r.get("data"));
+        enforceCaptureBounds(bytes); // loud, header-only, before the frame enters any GIF buffer
+        return bytes;
     }
 
     static void validateClipGeometry(double x, double y, double width,
@@ -2902,6 +3144,9 @@ public final class BrewShot implements AutoCloseable {
     }
 
     private static boolean isAlive(Process process) {
+        // A handle-only teardown (the orphan sweep) has no Process reference;
+        // "no process" is dead, not indeterminate.
+        if (process == null) { return false; }
         try { return process.isAlive(); }
         catch (RuntimeException ignored) { return true; }
     }
@@ -2909,6 +3154,79 @@ public final class BrewShot implements AutoCloseable {
     private static boolean handleAlive(ProcessHandle handle) {
         try { return handle.isAlive(); }
         catch (RuntimeException ignored) { return true; }
+    }
+
+    /**
+     * Reparented-orphan sweep, keyed on this launch's unique profile path.
+     *
+     * <p>The retained-handle snapshot in {@link ResourceLease} covers every
+     * member an enumeration ever OBSERVED. It cannot cover a helper that was
+     * already reparented before the first observation — the shape of a FAILED
+     * bootstrap (Marlow's report, brewshot room 140): Chrome's launcher
+     * re-execs or spawns helpers and the direct child exits ("Chrome exited
+     * without a DevTools listening line") before any {@code descendants()}
+     * walk runs. No walk from a dead root finds those helpers, yet they still
+     * hold and rewrite the profile directory.
+     *
+     * <p>What DOES still identify them is argv: every process of this launch
+     * carries {@code --user-data-dir=<profile>}, and the profile is a fresh
+     * {@link Files#createTempDirectory} name — long, random, never reused — so
+     * a full-path match cannot collide with an unrelated process. Matching on
+     * the path, never on a process name, is what keeps this from being a
+     * "kill anything called chrome" sweep.
+     *
+     * <p>Enumeration and the returned liveness are best effort:
+     * {@code info().commandLine()} is empty for other users' processes, so a
+     * clean sweep is evidence, not proof — which is why the caller still
+     * requires an independent containment proof before releasing the profile.
+     *
+     * @return the handles this sweep signalled, for the caller's liveness gate
+     */
+    private static List<ProcessHandle> sweepOrphansByProfilePath(
+            Path profileDir, Deadline deadline) {
+        String needle;
+        try { needle = profileDir.toAbsolutePath().toString(); }
+        catch (RuntimeException ignored) { return List.of(); }
+        if (needle.isEmpty()) { return List.of(); }
+
+        ProcessHandle self = ProcessHandle.current();
+        List<ProcessHandle> orphans = new ArrayList<>();
+        try (var all = ProcessHandle.allProcesses()) {
+            all.filter(ph -> !ph.equals(self))
+                .filter(ph -> commandLineContains(ph, needle))
+                .forEach(orphans::add);
+        } catch (RuntimeException ignored) {
+            // A racing exit mid-enumeration must not break the rest of cleanup;
+            // whatever was collected before the fault is still worth killing.
+        }
+        for (ProcessHandle orphan : orphans) {
+            try { orphan.destroyForcibly(); }
+            catch (RuntimeException ignored) { /* already gone */ }
+        }
+        if (!orphans.isEmpty()) {
+            boolean[] interrupted = { false };
+            awaitHandles(null, orphans, deadline, interrupted);
+            if (interrupted[0]) { Thread.currentThread().interrupt(); }
+        }
+        return orphans;
+    }
+
+    private static boolean commandLineContains(ProcessHandle handle, String needle) {
+        try {
+            return handle.info().commandLine()
+                .map(commandLine -> commandLine.contains(needle))
+                .orElse(false);
+        } catch (RuntimeException ignored) {
+            // Unreadable process info is not a match claim.
+            return false;
+        }
+    }
+
+    private static boolean allHandlesDead(List<ProcessHandle> handles) {
+        for (ProcessHandle handle : handles) {
+            if (handleAlive(handle)) { return false; }
+        }
+        return true;
     }
 
     private static boolean allProcessesDead(
@@ -2963,33 +3281,138 @@ public final class BrewShot implements AutoCloseable {
      * WebSocket listener reassembling partial text frames into whole messages.
      * On close/error it enqueues a poison message so a blocked caller fails
      * fast ("Chrome exited") instead of sleeping out the full timeout.
+     *
+     * <p>Two independent F-01 ingress bounds are enforced here, both on the single
+     * (serialized) WebSocket callback thread:
+     * <ol>
+     *   <li><b>Per-message</b> ({@link #maxMessageBytes}): a message whose reassembly
+     *       buffer would cross the ceiling is dropped, its partial buffer released the
+     *       moment it overflows — never materialized as a giant String.</li>
+     *   <li><b>Cumulative</b> ({@link #maxInboxMessages}): the ingress queue only ever
+     *       holds up to {@code maxInboxMessages} regular messages. A page emitting a
+     *       flood of individually-small messages while the command thread is not draining
+     *       used to grow the (default-unbounded) inbox without bound; now the newest
+     *       message is DROPPED once the cap is reached. The sink's physical capacity is
+     *       {@code maxInboxMessages + 1}, so one slot is always reserved for the
+     *       close/error sentinel — the poison signal can never be lost to a full inbox.</li>
+     * </ol>
+     * Both drops are announced once + counted, never silent.
      */
-    private static final class Accumulator implements WebSocket.Listener {
+    static final class Accumulator implements WebSocket.Listener {
         private final LinkedBlockingQueue<String> sink;
+        private final long maxMessageBytes;
+        /** Cumulative cap on queued regular messages; one further slot in {@link #sink}
+         *  is reserved for the close/error sentinel. */
+        private final int maxInboxMessages;
         private final StringBuilder buf = new StringBuilder();
+        private boolean overflowed;
+        private long dropped;
+        private long inboxDropped;
+        private boolean inboxDropAnnounced;
 
-        Accumulator(LinkedBlockingQueue<String> sink) { this.sink = sink; }
+        Accumulator(LinkedBlockingQueue<String> sink, long maxMessageBytes, int maxInboxMessages) {
+            this.sink = sink;
+            this.maxMessageBytes = maxMessageBytes;
+            this.maxInboxMessages = maxInboxMessages;
+        }
+
+        /**
+         * The accumulation seam, split out from {@link #onText} so it is testable
+         * without a live WebSocket. Appends {@code data}; on {@code last}, enqueues
+         * the whole message — UNLESS the buffer crossed {@link #maxMessageBytes}
+         * (dropped, buffer already released) or the inbox is already at
+         * {@link #maxInboxMessages} (cumulative drop) — either drop counted.
+         */
+        void accept(CharSequence data, boolean last) {
+            if (!overflowed && buf.length() + (long) data.length() > maxMessageBytes) {
+                overflowed = true;
+                buf.setLength(0); // release the partial NOW — this is the whole point
+            }
+            if (!overflowed) { buf.append(data); }
+            if (last) {
+                if (overflowed) {
+                    dropped++;
+                    if (dropped == 1) {
+                        System.err.println("brewshot: dropped an oversized CDP message (exceeds "
+                            + maxMessageBytes + "-char ceiling; brewshot.maxCdpMessageBytes)."
+                            + " Further such drops are counted, not re-announced.");
+                    }
+                    overflowed = false;
+                } else {
+                    enqueue(buf.toString());
+                }
+                buf.setLength(0);
+            }
+        }
+
+        /**
+         * Enqueue one whole (in-ceiling) message under the cumulative cap. Only
+         * {@code sink.size() < maxInboxMessages} admits it; the last physical slot of
+         * {@code sink} (capacity {@code maxInboxMessages + 1}) is left free so the
+         * sentinel in {@link #signalClosed()} always has a home. Runs only on the
+         * serialized WebSocket callback thread, so the size-check / offer pair is not
+         * a race. FIFO order is preserved (sentinel goes to the tail like today), so a
+         * closed socket still flushes already-queued events before the poison.
+         */
+        private void enqueue(String msg) {
+            if (sink.size() >= maxInboxMessages) {
+                inboxDropped++;
+                if (!inboxDropAnnounced) {
+                    inboxDropAnnounced = true;
+                    System.err.println("brewshot: CDP inbox full at " + maxInboxMessages
+                        + " queued messages — dropping newer messages (brewshot.maxInboxMessages)."
+                        + " Further drops are counted, not re-announced.");
+                }
+                return;
+            }
+            sink.offer(msg); // reserved-slot invariant guarantees room; offer never blocks
+        }
+
+        /** Enqueue the poison sentinel into the reserved slot — never dropped even
+         *  when the regular inbox is full. */
+        private void signalClosed() {
+            // Regular messages never exceed maxInboxMessages, so with capacity
+            // maxInboxMessages + 1 this offer always succeeds.
+            sink.offer(SOCKET_CLOSED);
+        }
+
+        /** Count of CDP messages dropped for exceeding the per-message byte ceiling. */
+        long dropped() { return dropped; }
+
+        /** Count of whole messages dropped for exceeding the cumulative inbox cap. */
+        long inboxDropped() { return inboxDropped; }
+
+        /**
+         * Test seam: the sink this Accumulator was actually WIRED to.
+         *
+         * <p>The reserved-slot invariant is a relationship between two values decided in
+         * two different places — the queue capacity chosen at launch and the cap handed
+         * to this Accumulator — and {@link #signalClosed()} discards {@code offer}'s
+         * boolean, so a mismatch loses the close sentinel SILENTLY. A test that builds
+         * its own correctly-sized queue can never catch that; it has to inspect the one
+         * production built. Package-private and read-only, like the drop counters.
+         */
+        LinkedBlockingQueue<String> sink() { return sink; }
+
+        /** Test seam: the cumulative regular-message cap this Accumulator was built with. */
+        int inboxCap() { return maxInboxMessages; }
 
         @Override
         public CompletionStage<?> onText(WebSocket webSocket, CharSequence data, boolean last) {
-            buf.append(data);
-            if (last) {
-                sink.add(buf.toString());
-                buf.setLength(0);
-            }
+            accept(data, last);
             webSocket.request(1);
             return null;
         }
 
         @Override
         public CompletionStage<?> onClose(WebSocket webSocket, int statusCode, String reason) {
-            sink.add(SOCKET_CLOSED);
+            signalClosed();
             return null;
         }
 
         @Override
         public void onError(WebSocket webSocket, Throwable error) {
-            sink.add(SOCKET_CLOSED);
+            signalClosed();
         }
     }
 }
