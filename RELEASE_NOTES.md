@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **Split, fail-loud test lanes and pinned release gates** (plan d66e6bbe).
+  `unitTest` runs the browser-free suite under an explicitly headless JVM and
+  combines the Chrome-forbid switch with the no-skip guard, so a future
+  misclassified browser method fails instead of disappearing as a green skip.
+  `chromeTest` derives its method catalog from BrewShot's mandatory real-Chrome
+  gate, while the historical `test` task remains the aggregate union. CI now
+  runs the browser-free lane on current Temurin 21 and 25 patch releases, the
+  real-browser lane against an exact Chromium/font set, a GraalVM native build
+  plus CLI smoke, and a final-image real-PNG capture. Action implementations
+  and the Gradle distribution are checksum/commit pinned; Docker build/runtime
+  stages are digest pinned; Alpine browser/font packages are version pinned and
+  fail closed when the repository no longer carries them. The Temurin 21/25
+  compatibility matrix intentionally follows current patch releases within
+  those feature lines rather than pretending to be a reproducible image pin.
 - **Reparented-orphan sweep before profile release** (plan 735951a2; Marlow's
   report-only evidence, brewshot room 140): `ResourceLease` cleanup force-kills
   every process-tree member an enumeration ever OBSERVED, but a helper that was

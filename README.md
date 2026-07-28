@@ -340,12 +340,15 @@ client (≈1,300 with the CLI and JSON codec), and it intends to stay lean.
 
 ## Metrics — jar vs native binary
 
-Measured on an Apple-silicon Mac (GraalVM CE for JDK 25, `./gradlew nativeImage`),
-same tiny page, identical PNG output from both:
+Artifact sizes were reproduced on 2026-07-27 from this source tree on an
+Apple-silicon Mac with GraalVM CE 25+37.1 using
+`./gradlew clean jar nativeImage`. The startup/capture timings and
+byte-identical PNG observation are the existing same-hardware benchmark, not a
+CI performance gate:
 
 | | `brewshot.jar` | `build/brewshot` (native) |
 | --- | --- | --- |
-| artifact size | **17 KB** (+ a JVM on the machine) | 32 MB, fully self-contained |
+| artifact size | **119,754 B (117 KiB)** (+ a JVM on the machine) | **36,738,360 B (35.0 MiB)**, fully self-contained |
 | CLI startup (`--help`, warm) | ~20 ms | **~3 ms** |
 | full shot (launch Chrome → render → PNG) | ~2.0 s | **~1.7 s** |
 | needs a JVM installed | yes | **no** |
@@ -355,7 +358,7 @@ The honest read: **Chrome launch dominates a full shot** (~1.4 s), so the
 native win there is modest (~0.3 s of skipped JVM warm-up). Where the binary
 earns its keep is deployment — one file, no JVM, instant startup — which is
 exactly the shape a pipeline step or an agent tool wants. The jar earns its
-keep at 17 KB with full GIF support. Ship both, pick per context.
+keep at about 117 KiB with full GIF support. Ship both, pick per context.
 
 First run of a fresh binary pays macOS code-signature verification (~0.3 s,
 once). PNG outputs are byte-identical across modes.
@@ -370,9 +373,11 @@ entirely in the second one.
 
 ## Running in a container
 
-The repo ships a self-contained Java 25 image with Chromium and fonts. It runs
-as fixed non-root user `10001:10001`, keeps immutable jars under
-`/opt/brewshot`, and offers two modes:
+The repo ships a self-contained Java 25 image with Chromium and fonts. Its
+Temurin stages are pinned by digest and its Chromium/font packages by exact
+Alpine version; an unavailable pin fails the build instead of silently
+substituting different bytes. It runs as fixed non-root user `10001:10001`,
+keeps immutable jars under `/opt/brewshot`, and offers two modes:
 
 - the original one-shot CLI (still the default; `cli` is an optional explicit
   spelling), including URL, stdin, PNG/JPEG/PDF, GIF, diff, and advanced flags;
@@ -473,7 +478,8 @@ things not to do: **[SECURITY.md](SECURITY.md)**.
 
 ## Requirements
 
-- JDK 21+ (built with 25)
+- JDK 21+ (bytecode targets 21; CI executes the browser-free lane on Temurin
+  21 and 25)
 - A local Chrome or Chromium (auto-discovered; override with `BREWSHOT_CHROME`)
 
 On macOS, the execution context is part of the browser requirement. A normal
@@ -492,10 +498,21 @@ names process exit, alive timeout, malformed endpoint, or disagreement and may
 include only bounded sanitized stream tails. BrewShot never uses the operator's
 default Chrome profile or blanket-terminates unrelated Chrome processes.
 
-Locally, the Chrome-driving tests loud-skip when no Chrome is found. In CI they
-must not: the reference workflow sets `BREWSHOT_REQUIRE_CHROME=1`, which turns any
-skip into a failure — so a green build proves the end-to-end suite actually ran,
-never "green that tested nothing."
+The test lanes are explicit:
+
+- `./gradlew unitTest` runs every browser-free method with AWT headless and
+  sets both `BREWSHOT_FORBID_CHROME=1` and `BREWSHOT_REQUIRE_CHROME=1`. Chrome
+  cannot launch, and any skipped or misclassified browser test fails the lane.
+- `./gradlew chromeTest` runs only the methods discovered from BrewShot's one
+  mandatory Chrome gate. The reference CI runs this lane in the pinned
+  Chromium container with `BREWSHOT_REQUIRE_CHROME=1`, so a green browser lane
+  executed rather than skipped.
+- `./gradlew test` remains the backward-compatible aggregate suite.
+
+The browser-free lane still includes descendant-process teardown fixtures. An
+inherited macOS Codex Seatbelt can deny the JDK's `ProcessHandle` enumeration
+through `sysctl`; use a normal Terminal or a Linux control with a PID-1 reaper
+for those fixtures. That refusal occurs without launching Chrome.
 
 The load/navigation wait budget defaults to 15s; raise it for a heavy page with
 `BREWSHOT_TIMEOUT_MS` or per-instance `shot.navTimeout(ms)`.
