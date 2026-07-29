@@ -285,9 +285,12 @@ largest cluster at 173,203 (43x17, 20% of the change) — in the body.
 
 - **Anti-aliasing forgiveness is ON by default** — a raw AA diff of two
   re-renders is a noise wall (font hinting shifts every glyph edge a pixel).
-  A 3×3 shifted-edge heuristic forgives those, and everything it forgives is
-  **counted and printed** in the verdict — nothing is silently eaten.
-  `--pixel-exact` opts out for byte-faithful comparison.
+  A luminance-slope and same-color-neighborhood discriminator forgives soft
+  coverage/hinting changes while keeping coherent opaque edge movement
+  gate-relevant. Everything it forgives is **counted and printed** in the
+  verdict — nothing is silently eaten. `--pixel-exact` disables forgiveness
+  and forces tolerance zero, regardless of flag order, for byte-faithful
+  comparison.
 - **Threshold gate**: `--fail-over 0.5` (percent) / `--fail-pixels 100` →
   **exit 4 with the verdict and artifacts still written** — the same
   evidence-first contract as `--fail-js`. Percent thresholds are bounded to

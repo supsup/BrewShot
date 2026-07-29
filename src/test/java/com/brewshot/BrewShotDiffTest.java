@@ -21,11 +21,13 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /**
- * The diff engine + CLI gate (plan 84f468d0). Pure JDK — no Chrome, no skips: every
+ * The diff engine + CLI gate (plans 84f468d0 and ac1851a6). Pure JDK — no Chrome,
+ * no skips: every
  * test always runs, in CI and everywhere else. Assertions follow the acceptance list
  * in the plan: identical -> 0.0%/exit 0; a real 1-px edit is COUNTED (never eaten by
- * the AA heuristic); a shifted-edge pair is AA-forgiven by default but counted under
- * --pixel-exact; masking a dynamic region converges an otherwise-different pair;
+ * the AA heuristic); a soft antialiased edge shift is forgiven by default while a
+ * hard-edged translation is counted; --pixel-exact counts every byte-level delta;
+ * masking a dynamic region converges an otherwise-different pair;
  * size mismatch is an explicit verdict; the gate exits 4 with the verdict still
  * written.
  */
@@ -90,7 +92,7 @@ class BrewShotDiffTest {
     @Test
     void singlePixelEditSurvivesTheAntialiasingHeuristic() {
         // The plan's acceptance pin: a genuine 1-pixel change must stay counted under
-        // the DEFAULT AA-ignore (the new color exists in neither 3x3 neighborhood).
+        // the DEFAULT AA-ignore (an isolated new color has no luminance slope).
         BufferedImage a = solid(50, 50, Color.WHITE);
         BufferedImage b = solid(50, 50, Color.WHITE);
         b.setRGB(25, 25, Color.RED.getRGB());
@@ -100,26 +102,59 @@ class BrewShotDiffTest {
     }
 
     @Test
-    void shiftedEdgeIsForgivenByDefaultButCountedPixelExact() {
-        // A vertical black line shifted right by 1px — the glyph-hinting/AA class.
-        // Both edge columns see their counterpart color in the 3x3 neighborhood, so
-        // the default mode forgives (and COUNTS) them; --pixel-exact counts as change.
+    void softAntialiasedEdgeShiftIsForgivenByDefaultButCountedPixelExact() {
+        // A black-to-white edge with an intermediate coverage value moves right by
+        // one pixel. Each changed pixel sits on a real luminance slope: this is the
+        // soft glyph-hinting/AA class, not an opaque layout translation.
         BufferedImage a = solid(60, 40, Color.WHITE);
-        fill(a, 10, 0, 1, 40, Color.BLACK);
+        fill(a, 0, 0, 20, 40, Color.BLACK);
+        fill(a, 20, 0, 1, 40, new Color(128, 128, 128));
         BufferedImage b = solid(60, 40, Color.WHITE);
-        fill(b, 11, 0, 1, 40, Color.BLACK);
+        fill(b, 0, 0, 21, 40, Color.BLACK);
+        fill(b, 21, 0, 1, 40, new Color(128, 128, 128));
 
         BrewShotDiff.Verdict forgiving = BrewShotDiff.diff(a, b, BrewShotDiff.Options.defaults());
         assertEquals(0, forgiving.changedPixels(),
-            "a 1px edge shift is anti-aliasing noise under the default heuristic");
+            "a soft coverage-ramp shift remains anti-aliasing noise by default");
         assertEquals(80, forgiving.antialiasedIgnored(),
-            "both 40px columns are disclosed as ignored, never silently eaten");
+            "both moved coverage columns are disclosed as ignored");
         assertTrue(forgiving.prose().contains("80 anti-aliasing px ignored"));
 
         BrewShotDiff.Verdict exact = BrewShotDiff.diff(a, b,
-            new BrewShotDiff.Options(BrewShotDiff.DEFAULT_TOLERANCE, false, List.of()));
+            new BrewShotDiff.Options(0, false, List.of()));
         assertEquals(80, exact.changedPixels(), "--pixel-exact counts the shifted edge");
         assertEquals(0, exact.antialiasedIgnored());
+        assertTrue((BrewShotDiff.heatmap(a, b, BrewShotDiff.Options.defaults())
+            .getRGB(20, 20) & 0xFFFFFF) != 0xFF00FF,
+            "forgiven soft-AA pixels stay out of the heatmap change layer");
+    }
+
+    @Test
+    void translatedHardRectangleIsCountedInsteadOfForgiven(@TempDir Path tmp)
+            throws Exception {
+        BufferedImage a = solid(80, 60, Color.WHITE);
+        fill(a, 20, 15, 20, 20, Color.BLACK);
+        BufferedImage b = solid(80, 60, Color.WHITE);
+        fill(b, 21, 15, 20, 20, Color.BLACK);
+
+        BrewShotDiff.Verdict verdict = BrewShotDiff.diff(a, b, BrewShotDiff.Options.defaults());
+
+        assertEquals(40, verdict.changedPixels(),
+            "both opaque columns exposed by the translation must remain gate-relevant");
+        assertEquals(0, verdict.antialiasedIgnored(),
+            "a black/white hard edge has no antialiased luminance slope");
+        assertTrue(verdict.anyChange());
+        assertNotNull(verdict.largestCluster());
+        assertEquals(20, verdict.largestCluster().pixels());
+        assertEquals(0xFF00FF, BrewShotDiff.heatmap(a, b, BrewShotDiff.Options.defaults())
+            .getRGB(20, 20) & 0xFFFFFF,
+            "gate-relevant hard movement must also appear in the heatmap");
+
+        Path pathA = write(tmp, "hard-a.png", a);
+        Path pathB = write(tmp, "hard-b.png", b);
+        assertEquals(4, Main.run(new String[] {"diff", pathA.toString(), pathB.toString(),
+            "--fail-pixels", "0"}),
+            "the default CLI gate must fail on the hard translation");
     }
 
     @Test
@@ -318,6 +353,20 @@ class BrewShotDiffTest {
         assertTrue(Files.exists(json));
         assertTrue(Files.exists(heat));
         assertTrue(Files.readString(json).contains("\"exceeded\": true"));
+    }
+
+    @Test
+    void cliPixelExactForcesZeroToleranceRegardlessOfFlagOrder(@TempDir Path tmp)
+            throws Exception {
+        Path a = write(tmp, "a.png", solid(20, 20, new Color(100, 100, 100)));
+        Path b = write(tmp, "b.png", solid(20, 20, new Color(110, 110, 110)));
+
+        assertEquals(4, Main.run(new String[] {"diff", a.toString(), b.toString(),
+            "--pixel-exact", "--fail-pixels", "0"}));
+        assertEquals(4, Main.run(new String[] {"diff", a.toString(), b.toString(),
+            "--tolerance", "20", "--pixel-exact", "--fail-pixels", "0"}));
+        assertEquals(4, Main.run(new String[] {"diff", a.toString(), b.toString(),
+            "--pixel-exact", "--tolerance", "20", "--fail-pixels", "0"}));
     }
 
     @Test

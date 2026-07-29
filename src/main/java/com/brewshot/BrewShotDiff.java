@@ -39,8 +39,8 @@ public final class BrewShotDiff {
     /**
      * Diff knobs. {@code tolerance} is the per-channel floor (a pixel changes only when
      * {@code max(|dr|,|dg|,|db|) > tolerance}); {@code ignoreAntialiasing} enables the
-     * 3×3 shifted-edge forgiveness (ON by default at the CLI — everything it ignores is
-     * still counted in {@link Verdict#antialiasedIgnored}); {@code masks} are
+     * luminance-slope/sibling-cluster forgiveness (ON by default at the CLI — everything
+     * it ignores is still counted in {@link Verdict#antialiasedIgnored}); {@code masks} are
      * {@code {x,y,w,h}} regions excluded from comparison on BOTH images (dynamic
      * regions — clocks, spinners — so the numbers stay stable and citable).
      * Extents must be positive and non-overflowing. Masks are clipped to image
@@ -173,7 +173,7 @@ public final class BrewShotDiff {
                 if (masked[i] || !differs(pa[i], pb[i], options.tolerance())) {
                     continue;
                 }
-                if (options.ignoreAntialiasing() && looksAntialiased(pa, pb, w, h, x, y, options.tolerance())) {
+                if (options.ignoreAntialiasing() && looksAntialiased(pa, pb, w, h, x, y)) {
                     aaIgnored++;
                     continue;
                 }
@@ -213,35 +213,92 @@ public final class BrewShotDiff {
     }
 
     /**
-     * Shifted-edge forgiveness (the pixelmatch-style heuristic, simplified): a changed
-     * pixel is treated as anti-aliasing/hinting noise when the color pair merely MOVED
-     * within a 3×3 neighborhood — image B still shows A's color right next door, and
-     * image A still shows B's color right next door. A genuine content change (new
-     * color that exists in neither neighborhood) never qualifies, so a real 1-pixel
-     * edit stays counted while a 1-pixel glyph-hinting shift is ignored (and tallied).
+     * Pixelmatch-style edge-context discriminator. A changed pixel is forgivable only
+     * when either image places it on a real luminance slope (both a darker and a lighter
+     * neighbor) and one slope endpoint belongs to a stable same-color neighborhood in
+     * both images. The sibling check makes this cluster-aware instead of accepting any
+     * reciprocal one-pixel color move. Opaque black/white translations have only one
+     * side of a slope and therefore remain gate-relevant; soft coverage ramps qualify.
      */
-    private static boolean looksAntialiased(int[] pa, int[] pb, int w, int h, int x, int y, int tolerance) {
-        return neighborhoodContains(pb, w, h, x, y, pa[y * w + x], tolerance)
-            && neighborhoodContains(pa, w, h, x, y, pb[y * w + x], tolerance);
+    private static boolean looksAntialiased(int[] pa, int[] pb, int w, int h, int x, int y) {
+        return hasAntialiasedEdgeContext(pa, pb, w, h, x, y)
+            || hasAntialiasedEdgeContext(pb, pa, w, h, x, y);
     }
 
-    private static boolean neighborhoodContains(int[] pixels, int w, int h, int x, int y,
-                                                int color, int tolerance) {
-        for (int dy = -1; dy <= 1; dy++) {
-            for (int dx = -1; dx <= 1; dx++) {
-                if (dx == 0 && dy == 0) {
+    private static boolean hasAntialiasedEdgeContext(
+            int[] source, int[] counterpart, int w, int h, int x, int y) {
+        int x0 = Math.max(x - 1, 0), y0 = Math.max(y - 1, 0);
+        int x2 = Math.min(x + 1, w - 1), y2 = Math.min(y + 1, h - 1);
+        int equalBrightness = x == x0 || x == x2 || y == y0 || y == y2 ? 1 : 0;
+        long center = compositedLuminance(source[y * w + x]);
+        long darkestDelta = 0, lightestDelta = 0;
+        int darkestX = x, darkestY = y, lightestX = x, lightestY = y;
+
+        for (int ny = y0; ny <= y2; ny++) {
+            for (int nx = x0; nx <= x2; nx++) {
+                if (nx == x && ny == y) {
                     continue;
                 }
-                int nx = x + dx, ny = y + dy;
-                if (nx < 0 || ny < 0 || nx >= w || ny >= h) {
+                long delta = compositedLuminance(source[ny * w + nx]) - center;
+                if (delta == 0) {
+                    equalBrightness++;
+                    if (equalBrightness > 2) {
+                        return false;
+                    }
+                } else if (delta < darkestDelta) {
+                    darkestDelta = delta;
+                    darkestX = nx;
+                    darkestY = ny;
+                } else if (delta > lightestDelta) {
+                    lightestDelta = delta;
+                    lightestX = nx;
+                    lightestY = ny;
+                }
+            }
+        }
+
+        if (darkestDelta == 0 || lightestDelta == 0) {
+            return false;
+        }
+        return stableSiblingCluster(source, counterpart, w, h, darkestX, darkestY)
+            || stableSiblingCluster(source, counterpart, w, h, lightestX, lightestY);
+    }
+
+    private static boolean stableSiblingCluster(
+            int[] source, int[] counterpart, int w, int h, int x, int y) {
+        return hasManySiblings(source, w, h, x, y)
+            && hasManySiblings(counterpart, w, h, x, y);
+    }
+
+    private static boolean hasManySiblings(int[] pixels, int w, int h, int x, int y) {
+        int x0 = Math.max(x - 1, 0), y0 = Math.max(y - 1, 0);
+        int x2 = Math.min(x + 1, w - 1), y2 = Math.min(y + 1, h - 1);
+        int siblings = x == x0 || x == x2 || y == y0 || y == y2 ? 1 : 0;
+        int color = pixels[y * w + x];
+        for (int ny = y0; ny <= y2; ny++) {
+            for (int nx = x0; nx <= x2; nx++) {
+                if (nx == x && ny == y) {
                     continue;
                 }
-                if (!differs(pixels[ny * w + nx], color, tolerance)) {
+                if (pixels[ny * w + nx] == color && ++siblings > 2) {
                     return true;
                 }
             }
         }
         return false;
+    }
+
+    /** Integer Rec. 601 luminance after alpha-compositing the pixel over white. */
+    private static long compositedLuminance(int argb) {
+        int alpha = (argb >>> 24) & 0xFF;
+        int red = compositeOverWhite((argb >>> 16) & 0xFF, alpha);
+        int green = compositeOverWhite((argb >>> 8) & 0xFF, alpha);
+        int blue = compositeOverWhite(argb & 0xFF, alpha);
+        return 299L * red + 587L * green + 114L * blue;
+    }
+
+    private static int compositeOverWhite(int channel, int alpha) {
+        return 255 + ((channel - 255) * alpha) / 255;
     }
 
     /** BFS connected components (8-connectivity) over the changed mask; keep the largest. */
@@ -372,7 +429,7 @@ public final class BrewShotDiff {
                 int i = y * w + x;
                 boolean isChange = !masked[i] && differs(pa[i], pb[i], options.tolerance())
                     && !(options.ignoreAntialiasing()
-                         && looksAntialiased(pa, pb, w, h, x, y, options.tolerance()));
+                         && looksAntialiased(pa, pb, w, h, x, y));
                 if (isChange) {
                     px[i] = 0xFF00FF;
                 } else {

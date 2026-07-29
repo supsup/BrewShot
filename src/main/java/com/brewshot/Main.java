@@ -430,6 +430,12 @@ public final class Main {
             diffUsage();
             return 2;
         }
+        if (!ignoreAntialiasing) {
+            // Exact means exact regardless of flag order: disabling AA forgiveness
+            // while retaining the default color tolerance would still hide byte-level
+            // pixel differences and contradict the option's contract.
+            tolerance = 0;
+        }
         BrewShotDiff.Options options;
         try {
             options = new BrewShotDiff.Options(
@@ -692,9 +698,9 @@ public final class Main {
 
               --tolerance    per-channel delta floor, 0-254; at/below never
                              counts                                      (default 16)
-              --pixel-exact  DISABLE the default anti-aliasing forgiveness (a 3x3
-                             shifted-edge heuristic; whatever it ignores is counted
-                             and printed in the verdict — nothing is silently eaten)
+              --pixel-exact  byte-faithful comparison: force tolerance 0 and disable
+                             default anti-aliasing forgiveness (whatever forgiveness
+                             ignores is counted and printed in ordinary verdicts)
               --mask         exclude a region on both images (dynamic content —
                              clocks, spinners); repeatable
               --fail-over    exit 4 when changed%% exceeds PCT, 0-100

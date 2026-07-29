@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **AA forgiveness no longer hides hard one-pixel layout movement** (plan
+  ac1851a6). The old reciprocal 3×3 color-presence test could classify an
+  opaque rectangle translated by one pixel as pure rasterizer noise, report
+  zero changed pixels, and let a default threshold gate pass. The replacement
+  requires a real darker-to-lighter luminance slope plus a stable same-color
+  neighborhood in both images, so soft coverage/hinting shifts remain forgiven
+  and disclosed while hard black/white movement stays gate-relevant and appears
+  in the heatmap. `--pixel-exact` now also forces tolerance zero, independent of
+  option order, matching its byte-faithful name. Output and JSON schemas are
+  unchanged.
 - **Container smoke validates secure outputs at the correct identity** (plan
   2f42a765). The Docker capture gate now checks the generated PNG from a
   read-only second invocation of the same pinned runtime image. This preserves

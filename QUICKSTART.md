@@ -155,8 +155,10 @@ brewshot diff golden.png actual.png --fail-over 0.5
 brewshot diff a.png b.png --mask 20,8,140,24 --fail-pixels 0
 ```
 
-Anti-aliasing forgiveness is ON by default (every forgiven pixel is counted in
-the verdict — nothing silently eaten); `--pixel-exact` opts out.
+Anti-aliasing forgiveness is ON by default. It requires a soft luminance slope
+and a stable same-color neighborhood, so opaque one-pixel layout movement still
+counts; every forgiven pixel is disclosed in the verdict. `--pixel-exact`
+disables forgiveness and forces tolerance zero regardless of flag order.
 
 `java -jar brewshot.jar …` works everywhere, GIFs included. The native binary
 (`./gradlew nativeImage`) does PNG + eval everywhere too — its ONE gap: no GIF
