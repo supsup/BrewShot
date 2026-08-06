@@ -1,3 +1,10 @@
 build/
 .gradle/
 *.class
+
+# Agent helper working directory. `ai-bin` writes ai-files/logs/ai-helper-telemetry.log
+# into whatever cwd it runs from, so an agent running any ai command from a brewshot
+# checkout leaves an untracked file that BLOCKS the next `ai land` on "main worktree is
+# dirty". Stafficy ignores this path for the same reason. Observed 2026-08-06: it blocked
+# the smoke-linux-evidence land until the file was moved aside.
+ai-files/
