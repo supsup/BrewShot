@@ -101,7 +101,11 @@ jobs:
       # whose "it does not run" sits on the FOLLOWING line reads, in grep output, as evidence
       # that it DOES. That is the same shape as the missing invocation this comment records:
       # a search answering the opposite of the truth. Every line here that names the script
-      # says on that line that it is not wired in.
+      # AS A SUBJECT says on that line that it is not wired in. The line directly above is the
+      # deliberate exception: it names the string to EXPLAIN the rule, so it necessarily
+      # matches the grep without being a claim about wiring. Stated because an unqualified
+      # "every line" would be a marker asserting more than its mechanism delivers — which is
+      # the exact defect this whole block exists to remove (review brewshot/376).
       #
       # It is REMOVED rather than made non-blocking, deliberately: a smoke test wired in but
       # non-blocking reproduces the original problem with extra steps, and would let this gap
