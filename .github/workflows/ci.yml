@@ -83,24 +83,22 @@ jobs:
               test "$(od -An -t x1 -N 8 /work/page.png | tr -d " \n")" = "89504e470d0a1a0a"
             '
 
-      # The folder worker's OWN smoke test (plan 4124aab6). docker/BrewShotFolderWorker.java is
-      # 891 lines of file locks, atomic renames, inode-identity races, restart recovery and
-      # multi-worker collision handling, and docker/smoke-test.sh is 387 lines that exercise
-      # exactly those races — but a repo-wide grep for "smoke-test" returned ZERO references, so
-      # it ran nowhere. The Dockerfile does compile the worker, so compile breaks were already
-      # caught; what was missing was BEHAVIOURAL coverage of the most intricate concurrency
-      # component in the project.
+      # THE FOLDER-WORKER SMOKE STEP IS TEMPORARILY OUT (plan 4124aab6, brewshot/360).
+      # It was wired in at 741ba49 and RED on the first real main run (31066904386): the run
+      # dies in the relative-output leg of docker/smoke-test.sh, which passes on macOS Docker
+      # and not on ubuntu-latest. The image runs as USER 10001:10001, so the uid/permission
+      # semantics of a bind mount differ between the two, and every measurement backing the
+      # original wiring was macOS-local.
       #
-      # Blocking on purpose. A smoke test wired in but non-blocking would reproduce the original
-      # problem with extra steps.
+      # THIS IS A COVERAGE GAP, RECORDED RATHER THAN SILENT. docker/smoke-test.sh is still the
+      # only behavioural coverage of BrewShotFolderWorker's locks, atomic renames and restart
+      # recovery, and it once again runs nowhere. That is the exact condition plan 4124aab6
+      # exists to end, so this comment is a debt marker, not a decision.
       #
-      # Runs on every push rather than on a schedule or a label: measured at ~67s locally against
-      # a pre-built image, which is cheaper than the image build above it. Gating it would need a
-      # reason, and there is not one — and a gate is how a test quietly stops running.
+      # It is REMOVED rather than made non-blocking, deliberately: a smoke test wired in but
+      # non-blocking reproduces the original problem with extra steps, and would let this gap
+      # masquerade as coverage.
       #
-      # Known rough edge, stated rather than discovered later: the script is `set -eu`, so a
-      # failed assertion aborts with a non-zero exit and NO message naming which one. That is
-      # enough to fail the job correctly, but a red run here means reproducing locally to find
-      # out what broke.
-      - name: Folder-worker concurrency smoke
-        run: sh docker/smoke-test.sh brewshot:ci
+      # Re-landing it needs two things the first attempt lacked: per-assertion failure messages
+      # (the script is `set -eu`, so today a red run names no cause — which is why this revert
+      # was faster than the diagnosis), and evidence from an actual Linux run.
