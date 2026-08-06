@@ -154,7 +154,7 @@ output="$tmp_root/Output"
 mkdir -p "$input" "$output"
 chmod 0777 "$input" "$output"
 
-step "no-mode image shape and explicit `cli` drive real Chromium"
+step 'no-mode image shape and explicit `cli` drive real Chromium'
 # Old no-mode image shape and explicit `cli` both drive real Chromium.
 write_html "$input/cli.html" 'CLI parity' '#f8fafc'
 docker run --rm \
@@ -263,6 +263,15 @@ step "restart recovery of a UUID claim directory"
 # processing entries alone.
 recovery_id=0123456789abcdef0123456789abcdef
 mkdir -p "$input/processing/$recovery_id"
+# MEASURED ON LINUX, NOT ASSUMED (plan 4124aab6). `mkdir -p` creates the INTERMEDIATE and
+# INNERMOST directories at the caller's UMASK -- 0755 under the default 0022 -- and only the
+# path we chmod explicitly gets 0777. The image runs as USER 10001:10001, so on Linux, where a
+# bind mount preserves host ownership, the worker can traverse these but cannot WRITE: archiving
+# the claim fails with AccessDeniedException. On macOS Docker Desktop the bind mount translates
+# UIDs, so the same script passes and the defect is invisible. Every other directory in this
+# file is already chmod'd for exactly this reason; these two were created inside a phase rather
+# than in the setup block and were missed.
+chmod 0777 "$input/processing" "$input/processing/$recovery_id"
 write_html "$input/processing/$recovery_id/recovered.html" 'Recovered' '#ede9fe'
 printf '%s\n' 'not a claim' > "$input/processing/keep-me.txt"
 docker run -d --name "$watch_recovery" \
@@ -390,7 +399,11 @@ unreadable_output="$tmp_root/UnreadableOutput"
 unreadable_id=fedcba9876543210fedcba9876543210
 mkdir -p "$unreadable_input/processing/$unreadable_id" \
     "$unreadable_input/failed" "$unreadable_output"
+# The innermost UUID directory needs it too, for the reason spelled out at the recovery phase
+# above -- listing only its PARENT leaves the leaf at umask, which is the same defect one level
+# down and is why this line names the claim directory explicitly.
 chmod 0777 "$unreadable_input" "$unreadable_input/processing" \
+    "$unreadable_input/processing/$unreadable_id" \
     "$unreadable_input/failed" "$unreadable_output"
 write_html "$unreadable_input/processing/$unreadable_id/unreadable.html" \
     'Unreadable secret' '#fecaca'
