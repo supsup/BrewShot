@@ -42,6 +42,15 @@ tasks.jar {
 
 fun org.gradle.api.tasks.testing.Test.configureBrewShotTests() {
     useJUnitPlatform()
+    // Input for QuickstartTeardownClaimTest: QUICKSTART.md is not a source file, so without
+    // this Gradle holds the test task UP-TO-DATE after a doc-only edit and the guard never
+    // runs — inert exactly when the prose it guards is being changed. Measured on the sibling
+    // Sirentide guard: BUILD SUCCESSFUL in 252ms because the task did not execute.
+    // `inputs.files` (plural) rather than `inputs.file(...).optional(true)`: optional does NOT
+    // tolerate an absent file, it fails at CONFIGURATION time (Fixpoint, sirentide/868).
+    inputs.files(layout.projectDirectory.file("QUICKSTART.md"))
+        .withPropertyName("quickstartDoc")
+        .withPathSensitivity(PathSensitivity.RELATIVE)
     // ImageIO/AWT tests must never initialize the macOS AppKit UI process.
     // Keep the test JVM explicit and deterministic on both desktop and CI hosts.
     systemProperty("java.awt.headless", "true")

@@ -10,11 +10,19 @@ import com.brewshot.BrewShot;
 if (!BrewShot.available()) { return; }        // no local Chrome → bow out
 try (BrewShot shot = BrewShot.launch()) {     // or launch(width, height)
     ...
-}                                             // Chrome + temp profile cleaned up
+}                                             // Chrome killed; profile removed once proven safe
 ```
 
 Chrome is auto-discovered (macOS app path, Linux names). Override:
 `export BREWSHOT_CHROME=/path/to/chrome`.
+
+**On teardown, precisely.** Close always kills the Chrome process tree. The temp profile
+is deleted only when teardown can *prove* containment is closed — the process tree reaped,
+no argv-matching orphan surviving, and the release proof clean. A failed or uncertain proof
+deliberately **retains** the profile rather than deleting a directory a reparented helper
+might still be writing to, and JVM exit leaves an unproven profile on disk. See the 0.9.0
+entry in [RELEASE_NOTES.md](RELEASE_NOTES.md), which corrects the older "no leaked temp
+dirs" claim.
 
 ## Feed it a page — two ways
 
