@@ -85,15 +85,23 @@ jobs:
 
       # THE FOLDER-WORKER SMOKE STEP IS TEMPORARILY OUT (plan 4124aab6, brewshot/360).
       # It was wired in at 741ba49 and RED on the first real main run (31066904386): the run
-      # dies in the relative-output leg of docker/smoke-test.sh, which passes on macOS Docker
+      # dies in the relative-output leg of docker/smoke-test.sh (NOT RUN IN CI), which passes
+      # on macOS Docker
       # and not on ubuntu-latest. The image runs as USER 10001:10001, so the uid/permission
       # semantics of a bind mount differ between the two, and every measurement backing the
       # original wiring was macOS-local.
       #
-      # THIS IS A COVERAGE GAP, RECORDED RATHER THAN SILENT. docker/smoke-test.sh is still the
-      # only behavioural coverage of BrewShotFolderWorker's locks, atomic renames and restart
-      # recovery, and it once again runs nowhere. That is the exact condition plan 4124aab6
-      # exists to end, so this comment is a debt marker, not a decision.
+      # THIS IS A COVERAGE GAP, RECORDED RATHER THAN SILENT: docker/smoke-test.sh RUNS NOWHERE.
+      # It is still the only behavioural coverage of BrewShotFolderWorker's locks, atomic
+      # renames and restart recovery, and nothing invokes it. That is the exact condition plan
+      # 4124aab6 exists to end, so this comment is a debt marker, not a decision.
+      #
+      # THE NEGATION IS ON THE SAME LINE AS THE FILENAME ON PURPOSE (review brewshot/365).
+      # `grep -rn smoke-test` prints ONE line per hit and stops at the newline, so a marker
+      # whose "it does not run" sits on the FOLLOWING line reads, in grep output, as evidence
+      # that it DOES. That is the same shape as the missing invocation this comment records:
+      # a search answering the opposite of the truth. Every line here that names the script
+      # says on that line that it is not wired in.
       #
       # It is REMOVED rather than made non-blocking, deliberately: a smoke test wired in but
       # non-blocking reproduces the original problem with extra steps, and would let this gap
