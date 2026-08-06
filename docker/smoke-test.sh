@@ -16,7 +16,35 @@ watch_unreadable_b="brewshot-smoke-unreadable-b-$name_suffix"
 watch_unreadable_c="brewshot-smoke-unreadable-c-$name_suffix"
 watch_unreadable_d="brewshot-smoke-unreadable-d-$name_suffix"
 
+# THE PHASE TRACKER (plan 4124aab6). `set -eu` aborts on the first failing command and prints
+# NOTHING identifying it, so a red run named no cause at all — three separate diagnostic rounds
+# on 2026-08-06 were spent re-deriving WHERE it died, twice by re-running under `sh -x` because
+# the script itself would not say. `step` costs one line per section and turns a silent exit 1
+# into the name of the phase that failed.
+#
+# It reports the PHASE, not the assertion. That is the deliberate 90% — annotating all 34 bare
+# assertions would be a rewrite of a concurrency harness, and knowing the phase is what actually
+# collapses the search.
+current_step="startup"
+step() {
+    current_step="$1"
+}
+
+# An assertion that names itself. Used where the bare `test`/`grep` gave no clue.
+fail() {
+    echo "brewshot Docker smoke: FAILED — $1" >&2
+    exit 1
+}
+
 cleanup() {
+    # MUST BE THE FIRST LINE: every command below clobbers $?, so capture the real exit status
+    # before doing anything else.
+    smoke_status=$?
+    if [ "$smoke_status" -ne 0 ]; then
+        echo "brewshot Docker smoke: FAILED during phase: ${current_step}" >&2
+        echo "  (exit ${smoke_status}; re-run with \`sh -x docker/smoke-test.sh <image>\` to get" \
+             "the exact command)" >&2
+    fi
     docker rm -f "$watch_one" "$watch_recovery" "$watch_race_a" "$watch_race_b" \
         "$watch_foreign" \
         "$watch_unreadable_a" "$watch_unreadable_b" \
@@ -91,15 +119,24 @@ wait_for_log() {
 
 assert_png() {
     target=$1
-    test -s "$target"
-    file "$target" | grep -q 'PNG image data'
+    if [ ! -s "$target" ]; then
+        fail "expected a PNG at $target — missing or empty"
+    fi
+    if ! file "$target" | grep -q 'PNG image data'; then
+        fail "expected a PNG at $target — file(1) reports: $(file -b "$target")"
+    fi
 }
 
 assert_running() {
     container=$1
-    test "$(docker inspect --format '{{.State.Running}}' "$container")" = true
+    if [ "$(docker inspect --format '{{.State.Running}}' "$container" 2>/dev/null)" != true ]; then
+        echo "container $container is not running; its logs follow" >&2
+        docker logs "$container" >&2 || true
+        fail "expected container $container to still be running"
+    fi
 }
 
+step "runtime contract: fixed non-root identity + immutable artifacts"
 # Runtime contract: fixed non-root identity, immutable artifacts, and fixed
 # mount roots. The real captures below also prove Chromium and fonts work.
 docker run --rm --entrypoint sh "$image" -c '
@@ -117,6 +154,7 @@ output="$tmp_root/Output"
 mkdir -p "$input" "$output"
 chmod 0777 "$input" "$output"
 
+step "no-mode image shape and explicit `cli` drive real Chromium"
 # Old no-mode image shape and explicit `cli` both drive real Chromium.
 write_html "$input/cli.html" 'CLI parity' '#f8fafc'
 docker run --rm \
@@ -134,6 +172,7 @@ assert_png "$output/explicit.png"
 cmp "$output/legacy.png" "$output/explicit.png"
 docker run --rm "$image" cli --version | grep -q '^brewshot 0\.9\.0$'
 
+step "pre-worker /work contract: relative output and default brewshot.png"
 # The pre-worker image contract uses /work as its working directory. Preserve
 # both explicit relative output and the default brewshot.png destination.
 legacy_work="$tmp_root/LegacyWork"
@@ -147,6 +186,7 @@ write_html "$legacy_work/default-relative.html" 'Default CLI' '#e0f2fe'
 docker run --rm -v "$legacy_work:/work" "$image" default-relative.html
 assert_png "$legacy_work/brewshot.png"
 
+step "Linux bind-mount shape overriding the fixed image UID"
 # The documented Linux bind-mount shape may override the fixed image user.
 # That UID still receives a private writable Chromium home.
 docker run --rm --user 12345:12345 \
@@ -156,6 +196,7 @@ docker run --rm --user 12345:12345 \
     -o /brewshot/output/arbitrary-uid.png
 assert_png "$output/arbitrary-uid.png"
 
+step "startup backlog, content-free failure, ignore rules, later progress"
 # Startup backlog, one content-free failure, ignore rules, and later progress.
 write_html "$input/startup page.html" 'Startup' '#dbeafe'
 : > "$input/empty.htm"
@@ -199,6 +240,7 @@ wait_for_path "$input/finished/after-failure.html" "$watch_one"
 assert_png "$output/after-failure.html.png"
 assert_running "$watch_one"
 
+step "output/archive bytes immutable under a same-name resend"
 # Existing output and archive bytes are immutable. A second same-name source
 # with different pixels fails closed and is retained under the failed bucket.
 startup_output_before=$(sha256sum "$output/startup page.html.png" | cut -d ' ' -f 1)
@@ -216,6 +258,7 @@ assert_running "$watch_one"
 docker stop -t 3 "$watch_one" >/dev/null
 docker rm "$watch_one" >/dev/null
 
+step "restart recovery of a UUID claim directory"
 # Restart recovery consumes a valid UUID claim directory and leaves unrelated
 # processing entries alone.
 recovery_id=0123456789abcdef0123456789abcdef
@@ -235,6 +278,7 @@ assert_running "$watch_recovery"
 docker stop -t 3 "$watch_recovery" >/dev/null
 docker rm "$watch_recovery" >/dev/null
 
+step "two workers sharing one mount converge on one success"
 # Two workers sharing one mount converge on one terminal success.
 race_input="$tmp_root/RaceInput"
 race_output="$tmp_root/RaceOutput"
@@ -270,6 +314,7 @@ test "$finished_count" -eq 1
 docker stop -t 3 "$watch_race_a" "$watch_race_b" >/dev/null
 docker rm "$watch_race_a" "$watch_race_b" >/dev/null
 
+step "producer-owned readable file without hard-link permission"
 # A producer-owned readable file must not require hard-link permission from
 # the fixed 10001 worker. Linux protects a root-owned mode-0444 inode from that
 # link, while writable directories still permit the atomic claim/move state
@@ -336,6 +381,7 @@ test -z "$(docker exec "$watch_foreign" find /brewshot/output \
 docker stop -t 3 "$watch_foreign" >/dev/null
 docker rm "$watch_foreign" >/dev/null
 
+step "four workers race one unreadable processing claim"
 # Four recovery workers race one unreadable processing claim. Direct archive
 # and diagnostic collisions are unrelated sentinels: only physical file
 # identity may prove disposition, never the same pathname.
@@ -380,6 +426,7 @@ mv "$unreadable_input/.after-unreadable.html.tmp" \
 wait_for_path "$unreadable_output/after-unreadable.html.png" "$watch_unreadable_a"
 assert_png "$unreadable_output/after-unreadable.html.png"
 
+step "no complete-looking hidden artifacts survive a terminal path"
 # No complete-looking hidden artifacts survive any terminal path.
 test -z "$(find "$output" "$race_output" "$unreadable_output" \
     -maxdepth 1 -type f -name '.brewshot-watch-*' -print -quit)"
