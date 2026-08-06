@@ -82,3 +82,25 @@ jobs:
               test -s /work/page.png
               test "$(od -An -t x1 -N 8 /work/page.png | tr -d " \n")" = "89504e470d0a1a0a"
             '
+
+      # The folder worker's OWN smoke test (plan 4124aab6). docker/BrewShotFolderWorker.java is
+      # 891 lines of file locks, atomic renames, inode-identity races, restart recovery and
+      # multi-worker collision handling, and docker/smoke-test.sh is 387 lines that exercise
+      # exactly those races — but a repo-wide grep for "smoke-test" returned ZERO references, so
+      # it ran nowhere. The Dockerfile does compile the worker, so compile breaks were already
+      # caught; what was missing was BEHAVIOURAL coverage of the most intricate concurrency
+      # component in the project.
+      #
+      # Blocking on purpose. A smoke test wired in but non-blocking would reproduce the original
+      # problem with extra steps.
+      #
+      # Runs on every push rather than on a schedule or a label: measured at ~67s locally against
+      # a pre-built image, which is cheaper than the image build above it. Gating it would need a
+      # reason, and there is not one — and a gate is how a test quietly stops running.
+      #
+      # Known rough edge, stated rather than discovered later: the script is `set -eu`, so a
+      # failed assertion aborts with a non-zero exit and NO message naming which one. That is
+      # enough to fail the job correctly, but a red run here means reproducing locally to find
+      # out what broke.
+      - name: Folder-worker concurrency smoke
+        run: sh docker/smoke-test.sh brewshot:ci
