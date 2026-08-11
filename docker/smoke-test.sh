@@ -3,6 +3,22 @@ set -eu
 
 image=${1:-brewshot:local}
 tmp_root=$(mktemp -d "${TMPDIR:-/tmp}/brewshot-docker-smoke.XXXXXX")
+# TRAVERSAL, not just writability. `mktemp -d` creates 0700 owned by the invoking user, and
+# the image runs as the fixed non-root UID 10001. Every bind mount below lives UNDER this
+# directory, so a container UID that cannot TRAVERSE it cannot reach a child no matter how
+# permissive that child is: `chmod 0777 child` beneath a 0700 parent still denies the write.
+#
+# HARDENING, not the repair for 741ba49 (brewshot/360) -- I checked, and it is not. The
+# mechanism is real and reproduced in a Linux container: parent 0700 + child 0777 -> permission
+# denied; parent 0755 + child 0777 -> writes. But with and without this chmod the suite failed
+# at the SAME phase for the same reason (the worker-temp settle race handled below), so this
+# fixes a latent trap rather than the failure that was actually observed. Docker Desktop
+# translates ownership through its file-sharing layer, which is why the trap is invisible on
+# macOS at all -- keep it closed, just do not credit it with the CI repair.
+#
+# 0755 rather than 0777 on purpose: traversal is all a container UID needs from the PARENT,
+# and the individual mount dirs below already set the modes for the writes they take.
+chmod 0755 "$tmp_root"
 name_suffix=$$
 watch_one="brewshot-smoke-one-$name_suffix"
 watch_recovery="brewshot-smoke-recovery-$name_suffix"
@@ -100,6 +116,27 @@ wait_for_container_path() {
         docker logs "$container" >&2 || true
         return 1
     fi
+}
+
+# Wait until no worker temp remains in the given output dirs. A losing worker
+# publishes nothing but still renders to its own temp, so it holds that temp for
+# a window AFTER the winner's output appears -- measured at ~4.8s on a Linux
+# runner with four racing workers. Callers that inspect an output dir must let
+# that window close first, or they assert against another worker's in-flight
+# state rather than against a terminal one. Bounded, not a fixed sleep: it
+# returns the moment the dirs are clean, and a temp that never goes away still
+# fails (verified with an injected permanent orphan).
+wait_for_no_worker_temps() {
+    attempt=0
+    while [ "$attempt" -lt 400 ]; do
+        leftover=$(find "$@" -maxdepth 1 -type f \
+            -name '.brewshot-watch-*' -print -quit)
+        [ -z "$leftover" ] && return 0
+        sleep 0.05
+        attempt=$((attempt + 1))
+    done
+    echo "worker temp never cleaned up: $leftover" >&2
+    return 1
 }
 
 wait_for_log() {
@@ -320,6 +357,11 @@ finished_count=$(
         | grep -c ' finished$'
 )
 test "$finished_count" -eq 1
+# Let the loser release its temp BEFORE the workers are killed. A SIGKILLed
+# worker cannot clean up, so stopping first would strand a temp here and charge
+# it to the final terminal-path assertion below, which is about what the worker
+# does on its OWN exit paths -- not about what survives an abrupt kill.
+wait_for_no_worker_temps "$race_output"
 docker stop -t 3 "$watch_race_a" "$watch_race_b" >/dev/null
 docker rm "$watch_race_a" "$watch_race_b" >/dev/null
 
@@ -440,8 +482,11 @@ wait_for_path "$unreadable_output/after-unreadable.html.png" "$watch_unreadable_
 assert_png "$unreadable_output/after-unreadable.html.png"
 
 step "no complete-looking hidden artifacts survive a terminal path"
-# No complete-looking hidden artifacts survive any terminal path.
-test -z "$(find "$output" "$race_output" "$unreadable_output" \
-    -maxdepth 1 -type f -name '.brewshot-watch-*' -print -quit)"
+# No complete-looking hidden artifacts survive any terminal path. The preceding
+# phase waits only on the WINNER's output, so three losing workers are still
+# inside their own write-then-delete window when this runs; polling for the
+# window to close is what makes this an assertion about terminal state instead
+# of a race against it.
+wait_for_no_worker_temps "$output" "$race_output" "$unreadable_output"
 
 echo 'brewshot Docker smoke: PASS'
