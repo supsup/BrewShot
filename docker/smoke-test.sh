@@ -68,8 +68,15 @@ cleanup() {
     docker volume rm -f "$foreign_input_volume" "$foreign_output_volume" \
         >/dev/null 2>&1 || true
     if [ -n "$tmp_root" ] && [ "$tmp_root" != "/" ]; then
-        chmod -R u+rwx "$tmp_root" >/dev/null 2>&1 || true
-        rm -rf -- "$tmp_root"
+        # The worker writes artifacts owner-only as ITS uid, so a host that is not that uid can
+        # neither chmod nor unlink them — `rm -rf` left the tree behind on a real CI runner and
+        # printed permission-denied per file. Empty it from inside a container that can, then let
+        # the host remove the now-empty directory it owns. Best-effort: a cleanup that fails must
+        # never turn a PASSING smoke into a failure, which is why the container hop is `|| true`.
+        docker run --rm --user 0:0 --volume "$tmp_root:/cleanup" --entrypoint /bin/sh "$image" \
+            -c 'rm -rf /cleanup/..?* /cleanup/.[!.]* /cleanup/* 2>/dev/null || true' \
+            >/dev/null 2>&1 || true
+        rm -rf -- "$tmp_root" 2>/dev/null || true
     fi
 }
 trap cleanup EXIT INT TERM
@@ -154,13 +161,126 @@ wait_for_log() {
     done
 }
 
+# mkdir -p a path whose PARENT may already be worker-owned, and set its mode, in one hop.
+#
+# The host cannot create a subdirectory inside a directory the worker made: by the time the
+# restart-recovery phase runs, `processing/` exists and is owned by UID 10001, so a plain
+# `mkdir -p` fails with permission denied BEFORE any chmod could help. Ordering a chmod first
+# does not fix it either — the chmod has the same problem for the same reason. Doing both from
+# inside a container removes the host's need for any privilege over the tree at all.
+container_mkdir() {
+    _mk_mode=$1
+    _mk_path=$2
+    _mk_parent=$(dirname "$_mk_path")
+    docker run --rm --user 0:0 --volume "$_mk_parent:/target" --entrypoint /bin/sh "$image" \
+        -c "mkdir -p '/target/$(basename "$_mk_path")' \
+            && chmod $_mk_mode '/target' '/target/$(basename "$_mk_path")'" >/dev/null 2>&1 \
+        || fail "could not create $_mk_path with mode $_mk_mode (container-side)"
+}
+
+# chmod a path that may ALREADY be worker-owned, from inside a container that can.
+#
+# The host creates most of these directories, but a worker may have created them first — it
+# makes `processing/` the moment it claims a file — and then the host cannot chmod them at all.
+# That is what stopped the restart-recovery phase on a non-root runner, one line after a comment
+# explaining a DIFFERENT Linux permission fix on the same statement. Doing it container-side
+# works whether the host or the worker got there first, which removes the ordering dependency
+# rather than papering over one instance of it.
+container_chmod() {
+    _ch_mode=$1
+    shift
+    for _ch_path in "$@"; do
+        docker run --rm --user 0:0 --volume "$(dirname "$_ch_path"):/target" \
+            --entrypoint /bin/sh "$image" \
+            -c "chmod $_ch_mode '/target/$(basename "$_ch_path")'" >/dev/null 2>&1 \
+            || fail "could not chmod $_ch_mode $_ch_path (container-side)"
+    done
+}
+
+# Assert an artifact is OWNER-ONLY (0600) — the property that makes every host-side read fail
+# and therefore the property the container-side readers above quietly depend on.
+#
+# It had NO test. The permission behaviour turned main red once and was still only implicit
+# afterwards, which means a future change could relax outputs to 0644 and every check here would
+# keep passing while the security posture silently weakened. Reading as root is fine for a
+# verifier BECAUSE this exists: the privilege that lets the reader work is exactly the privilege
+# that would hide a regression, so the regression gets its own guard.
+assert_owner_only() {
+    mode=$(docker run --rm --user 0:0 --volume "$(dirname "$1"):/verify:ro" \
+        --entrypoint /bin/sh "$image" -c "stat -c '%a' '/verify/$(basename "$1")'" 2>/dev/null)
+    test "$mode" = "600" \
+        || fail "expected owner-only 0600 on $1, got mode '$mode' — outputs must not be world-readable"
+}
+
+# Read a worker artifact's BYTES from inside the image under test, on stdout.
+#
+# Same reason as assert_png: outputs are owner-only to UID 10001, so ANY host-side content read
+# fails on a runner whose uid differs — and it fails with "permission denied" on a file that is
+# present and correct. Fixing assert_png alone was not enough; the next host-side reader (`cmp`)
+# failed identically one line later, which is why this is a shared helper.
+#
+# An earlier version of this comment claimed the content reads had all been enumerated. They had
+# not: four host-side `sha256sum` calls survived, and the first non-root run found them. The
+# enumeration that missed them searched for readers that LOOK like readers (`cat`, `cmp`); a
+# hashing command reads every byte of a file without resembling one. See container_sha256.
+#
+# DIRECTORY listings are deliberately NOT routed through this: the smoke's mount points are
+# 0777, so `find`/`wc -l` over a directory works from the host and needs no container hop.
+container_cat() {
+    _cc_dir=$(dirname "$1")
+    _cc_base=$(basename "$1")
+    docker run --rm --user 0:0 --volume "$_cc_dir:/verify:ro" --entrypoint /bin/sh "$image" \
+        -c "cat '/verify/$_cc_base'"
+}
+
+# Hash $1 FROM INSIDE A CONTAINER, and refuse to return anything that is not a hash.
+#
+# A host-side `sha256sum` on an owner-only output is worse than a plain read failure. It writes
+# its complaint to stderr and NOTHING to stdout, so the caller's variable is set to the EMPTY
+# STRING rather than left unset. Two such reads then compare equal to each other, and an
+# immutability assertion written as `test "$before" = "$(...)"` passes while proving nothing —
+# a green line whose subject was never read. That is the exact shape this script exists to close,
+# and it survived a review and a self-audit before a non-root run exposed it.
+#
+# The hash is computed container-side rather than by piping container_cat into a host sha256sum,
+# and the difference matters: a failed pipe would produce the hash OF ZERO BYTES — a well-formed
+# 64-character hash that still compares equal to its twin. That is the same vacuity wearing a
+# convincing disguise, and the length check below would not catch it.
+container_sha256() {
+    _cs_dir=$(dirname "$1")
+    _cs_base=$(basename "$1")
+    _cs_out=$(docker run --rm --user 0:0 --volume "$_cs_dir:/verify:ro" --entrypoint /bin/sh \
+        "$image" -c "sha256sum '/verify/$_cs_base'" 2>/dev/null | cut -d ' ' -f 1)
+    test ${#_cs_out} -eq 64 \
+        || fail "container-side sha256 of $1 returned '$_cs_out' (expected 64 hex chars) — a read that yields no hash must fail here, not silently compare equal to another empty read"
+    printf '%s\n' "$_cs_out"
+}
+
+# Assert a real PNG at $target, READ FROM INSIDE A CONTAINER rather than from this host.
+#
+# THE HOST CANNOT READ THE ARTIFACT, and that is by design. BrewShot writes outputs owner-only
+# as its fixed UID 10001; a host whose uid differs gets permission-denied on a SUCCESSFUL
+# capture. That is exactly what turned main red on the first real ubuntu-latest run:
+#   "expected a PNG at .../legacy.png — file(1) reports: regular file, no read permission"
+# The file was there and correct. The reader was wrong.
+#
+# This is a KNOWN class in this repo, already solved once: plan 2f42a765 fixed the capture gate
+# the same way, and ci.yml still carries that shape — a read-only second invocation of the same
+# pinned image. The smoke script simply never adopted it, because every environment it had been
+# run in read as root, where mode bits never bite.
+#
+# Reads via the image under test, mounted READ-ONLY, so the assertion cannot mutate what it
+# checks. `od` on the first 8 bytes is the PNG signature — the same check ci.yml uses — rather
+# than file(1), which the runtime image does not carry.
 assert_png() {
     target=$1
-    if [ ! -s "$target" ]; then
-        fail "expected a PNG at $target — missing or empty"
-    fi
-    if ! file "$target" | grep -q 'PNG image data'; then
-        fail "expected a PNG at $target — file(1) reports: $(file -b "$target")"
+    dir=$(dirname "$target")
+    base=$(basename "$target")
+    if ! docker run --rm --user 0:0 --volume "$dir:/verify:ro" --entrypoint /bin/sh "$image" -eu -c "
+            test -s '/verify/$base'
+            test \"\$(od -An -t x1 -N 8 '/verify/$base' | tr -d ' \n')\" = '89504e470d0a1a0a'
+        " >/dev/null 2>&1; then
+        fail "expected a PNG at $target — container-side read found it missing, empty, or not PNG-signed"
     fi
 }
 
@@ -205,8 +325,13 @@ docker run --rm \
     "$image" cli /brewshot/input/cli.html \
     -o /brewshot/output/explicit.png
 assert_png "$output/legacy.png"
+assert_owner_only "$output/legacy.png"
 assert_png "$output/explicit.png"
-cmp "$output/legacy.png" "$output/explicit.png"
+# POSIX sh has no process substitution, so the comparison happens INSIDE one container that
+# can read both files, rather than by staging copies on a host that cannot read either.
+docker run --rm --user 0:0 --volume "$output:/verify:ro" --entrypoint /bin/sh "$image" \
+    -c 'cmp /verify/legacy.png /verify/explicit.png' \
+    || fail "legacy.png and explicit.png differ"
 docker run --rm "$image" cli --version | grep -q '^brewshot 0\.9\.0$'
 
 step "pre-worker /work contract: relative output and default brewshot.png"
@@ -266,8 +391,8 @@ test -L "$input/symlink.html"
 test ! -e "$output/upload.html.tmp.png"
 test ! -e "$output/ignored.json.png"
 test ! -e "$output/symlink.html.png"
-test "$(wc -c < "$output/empty.htm.error.txt")" -le 600
-grep -q 'empty-input' "$output/empty.htm.error.txt"
+test "$(container_cat "$output/empty.htm.error.txt" | wc -c)" -le 600
+container_cat "$output/empty.htm.error.txt" | grep -q 'empty-input'
 assert_running "$watch_one"
 
 write_html "$input/.after-failure.html.tmp" 'After failure' '#dcfce7'
@@ -280,17 +405,15 @@ assert_running "$watch_one"
 step "output/archive bytes immutable under a same-name resend"
 # Existing output and archive bytes are immutable. A second same-name source
 # with different pixels fails closed and is retained under the failed bucket.
-startup_output_before=$(sha256sum "$output/startup page.html.png" | cut -d ' ' -f 1)
-startup_source_before=$(sha256sum "$input/finished/startup page.html" | cut -d ' ' -f 1)
+startup_output_before=$(container_sha256 "$output/startup page.html.png")
+startup_source_before=$(container_sha256 "$input/finished/startup page.html")
 write_html "$input/.startup page.html.tmp" 'Collision' '#fef3c7'
 mv "$input/.startup page.html.tmp" "$input/startup page.html"
 wait_for_path "$output/startup page.html.error.txt" "$watch_one"
 wait_for_path "$input/failed/startup page.html" "$watch_one"
-test "$startup_output_before" = \
-    "$(sha256sum "$output/startup page.html.png" | cut -d ' ' -f 1)"
-test "$startup_source_before" = \
-    "$(sha256sum "$input/finished/startup page.html" | cut -d ' ' -f 1)"
-grep -q 'output-collision' "$output/startup page.html.error.txt"
+test "$startup_output_before" = "$(container_sha256 "$output/startup page.html.png")"
+test "$startup_source_before" = "$(container_sha256 "$input/finished/startup page.html")"
+container_cat "$output/startup page.html.error.txt" | grep -q 'output-collision'
 assert_running "$watch_one"
 docker stop -t 3 "$watch_one" >/dev/null
 docker rm "$watch_one" >/dev/null
@@ -299,7 +422,7 @@ step "restart recovery of a UUID claim directory"
 # Restart recovery consumes a valid UUID claim directory and leaves unrelated
 # processing entries alone.
 recovery_id=0123456789abcdef0123456789abcdef
-mkdir -p "$input/processing/$recovery_id"
+container_mkdir 0777 "$input/processing/$recovery_id"
 # MEASURED ON LINUX, NOT ASSUMED (plan 4124aab6). `mkdir -p` creates the INTERMEDIATE and
 # INNERMOST directories at the caller's UMASK -- 0755 under the default 0022 -- and only the
 # path we chmod explicitly gets 0777. The image runs as USER 10001:10001, so on Linux, where a
@@ -308,7 +431,7 @@ mkdir -p "$input/processing/$recovery_id"
 # UIDs, so the same script passes and the defect is invisible. Every other directory in this
 # file is already chmod'd for exactly this reason; these two were created inside a phase rather
 # than in the setup block and were missed.
-chmod 0777 "$input/processing" "$input/processing/$recovery_id"
+# (modes set by container_mkdir above — the host never needed privilege here)
 write_html "$input/processing/$recovery_id/recovered.html" 'Recovered' '#ede9fe'
 printf '%s\n' 'not a claim' > "$input/processing/keep-me.txt"
 docker run -d --name "$watch_recovery" \
@@ -464,8 +587,8 @@ wait_for_path "$unreadable_input/failed/collisions/$unreadable_id/unreadable.htm
     "$watch_unreadable_a"
 wait_for_path "$unreadable_output/job-$unreadable_id-$unreadable_id.error.txt" \
     "$watch_unreadable_a"
-test "$(cat "$unreadable_input/failed/unreadable.html")" = 'ARCHIVE-SENTINEL'
-test "$(cat "$unreadable_output/unreadable.html.error.txt")" = 'DIAGNOSTIC-SENTINEL'
+test "$(container_cat "$unreadable_input/failed/unreadable.html")" = 'ARCHIVE-SENTINEL'
+test "$(container_cat "$unreadable_output/unreadable.html.error.txt")" = 'DIAGNOSTIC-SENTINEL'
 test "$(find "$unreadable_output" -maxdepth 1 -type f \
     -name "job-$unreadable_id-*.error.txt" | wc -l | tr -d ' ')" -eq 1
 test -z "$(find "$unreadable_input/processing" "$unreadable_input/failed/pending" \
