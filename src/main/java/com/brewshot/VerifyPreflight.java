@@ -36,6 +36,13 @@ final class VerifyPreflight {
         UPDATE
     }
 
+    private enum Phase {
+        BEFORE_STAGING,
+        STAGED,
+        COMMIT_READY,
+        EVIDENCE
+    }
+
     private VerifyPreflight() {
     }
 
@@ -46,8 +53,14 @@ final class VerifyPreflight {
 
     static Prepared inspect(VerifyManifest manifest, Mode mode, String stageId)
             throws PreflightException {
+        return inspect(manifest, mode, stageId, Phase.BEFORE_STAGING);
+    }
+
+    private static Prepared inspect(VerifyManifest manifest, Mode mode, String stageId,
+                                    Phase phase) throws PreflightException {
         Objects.requireNonNull(manifest, "manifest");
         Objects.requireNonNull(mode, "mode");
+        Objects.requireNonNull(phase, "phase");
         if (stageId == null || !STAGE_ID.matcher(stageId).matches()) {
             throw new IllegalArgumentException("stageId must match [a-z0-9]{8,64}");
         }
@@ -63,8 +76,10 @@ final class VerifyPreflight {
             graph.add(manifestNode);
             List<PreparedJob> jobs = new ArrayList<>(manifest.jobs().size());
             Path stagingRoot = workspace.resolve(".brewshot-verify-stage-" + stageId);
-            Node stagingNode = futureNode(
-                workspace, workspaceReal, stagingRoot, "staging root", true);
+            Node stagingNode = phase == Phase.BEFORE_STAGING
+                ? futureNode(workspace, workspaceReal, stagingRoot, "staging root", true)
+                : existingDirectoryNode(
+                    workspace, workspaceReal, stagingRoot, "staging root", true);
             graph.add(stagingNode);
 
             Path batchReceipt = workspace.resolve(
@@ -90,19 +105,34 @@ final class VerifyPreflight {
                         workspace, workspaceReal, job.heatmap(), prefix + "heatmap", true));
                 }
 
+                Path stagedInput = stagingRoot.resolve(job.id() + ".input.html");
+                Path stagedBaselineInput = mode == Mode.CHECK
+                    ? stagingRoot.resolve(job.id() + ".baseline-input.png") : null;
                 Path stagedCapture = stagingRoot.resolve(job.id() + ".capture.png");
                 Path stagedReceipt = stagingRoot.resolve(job.id() + ".receipt.json");
                 Path stagedHeatmap = job.heatmap() == null ? null
                     : stagingRoot.resolve(job.id() + ".heatmap.png");
                 Path stagedBaseline = mode == Mode.UPDATE
                     ? stagingRoot.resolve(job.id() + ".baseline.png") : null;
+                Path commitTemporary = mode == Mode.UPDATE
+                    ? job.baseline().getParent().resolve(
+                        ".brewshot-verify-" + stageId + "-" + job.id() + ".tmp")
+                    : null;
+                if (commitTemporary != null && phase != Phase.EVIDENCE) {
+                    graph.add(phase == Phase.COMMIT_READY
+                        ? existingNode(workspace, workspaceReal, commitTemporary,
+                            prefix + "commit temporary", true)
+                        : futureNode(workspace, workspaceReal, commitTemporary,
+                            prefix + "commit temporary", true));
+                }
                 jobs.add(new PreparedJob(
-                    job, stagedCapture, stagedReceipt, stagedHeatmap, stagedBaseline));
+                    job, stagedInput, stagedBaselineInput, stagedCapture, stagedReceipt,
+                    stagedHeatmap, stagedBaseline, commitTemporary));
             }
 
             rejectGraphCollisions(graph);
             return new Prepared(
-                manifest, mode, workspaceReal, batchReceipt, stagingRoot,
+                manifest, mode, stageId, workspaceReal, batchReceipt, stagingRoot,
                 stagingRoot.resolve("batch-receipt.json"),
                 stagingRoot.resolve("commit-ledger.json"), jobs);
         } catch (PreflightProblem invalid) {
@@ -150,6 +180,17 @@ final class VerifyPreflight {
         }
         requireCreatableParent(path.getParent(), role);
         return new Node(role, path, resolveInside(workspaceReal, path, role), writable, false);
+    }
+
+    private static Node existingDirectoryNode(Path workspace, Path workspaceReal, Path path,
+                                              String role, boolean writable)
+            throws IOException {
+        rejectSymlinkPath(workspace, path, role);
+        if (!Files.isDirectory(path, LinkOption.NOFOLLOW_LINKS)) {
+            throw problem(role + " must be an existing directory: "
+                + relative(workspace, path));
+        }
+        return new Node(role, path, resolveInside(workspaceReal, path, role), writable, true);
     }
 
     private static void requireCreatableParent(Path parent, String role) {
@@ -276,12 +317,13 @@ final class VerifyPreflight {
             message == null || message.isBlank() ? "unknown preflight failure" : message), cause);
     }
 
-    record Prepared(VerifyManifest manifest, Mode mode, Path workspaceReal,
+    record Prepared(VerifyManifest manifest, Mode mode, String stageId, Path workspaceReal,
                     Path batchReceipt, Path stagingRoot, Path stagedBatchReceipt,
                     Path commitLedger, List<PreparedJob> jobs) {
         Prepared {
             Objects.requireNonNull(manifest, "manifest");
             Objects.requireNonNull(mode, "mode");
+            Objects.requireNonNull(stageId, "stageId");
             Objects.requireNonNull(workspaceReal, "workspaceReal");
             Objects.requireNonNull(batchReceipt, "batchReceipt");
             Objects.requireNonNull(stagingRoot, "stagingRoot");
@@ -301,7 +343,7 @@ final class VerifyPreflight {
         }
 
         Staging createStaging() throws PreflightException {
-            assertManifestUnchanged();
+            VerifyPreflight.inspect(manifest, mode, stageId, Phase.BEFORE_STAGING);
             try {
                 createPrivateDirectory(stagingRoot);
                 return new Staging(
@@ -310,12 +352,29 @@ final class VerifyPreflight {
                 throw failure("cannot create private staging root: " + message(invalid), invalid);
             }
         }
+
+        void revalidateStagedGraph() throws PreflightException {
+            VerifyPreflight.inspect(manifest, mode, stageId, Phase.STAGED);
+        }
+
+        void revalidateCommitGraph() throws PreflightException {
+            if (mode != Mode.UPDATE) {
+                throw new IllegalStateException("commit graph exists only in update mode");
+            }
+            VerifyPreflight.inspect(manifest, mode, stageId, Phase.COMMIT_READY);
+        }
+
+        void revalidateEvidenceGraph() throws PreflightException {
+            VerifyPreflight.inspect(manifest, mode, stageId, Phase.EVIDENCE);
+        }
     }
 
-    record PreparedJob(VerifyManifest.Job job, Path stagedCapture, Path stagedReceipt,
-                       Path stagedHeatmap, Path stagedBaseline) {
+    record PreparedJob(VerifyManifest.Job job, Path stagedInput, Path stagedBaselineInput,
+                       Path stagedCapture, Path stagedReceipt, Path stagedHeatmap,
+                       Path stagedBaseline, Path commitTemporary) {
         PreparedJob {
             Objects.requireNonNull(job, "job");
+            Objects.requireNonNull(stagedInput, "stagedInput");
             Objects.requireNonNull(stagedCapture, "stagedCapture");
             Objects.requireNonNull(stagedReceipt, "stagedReceipt");
         }

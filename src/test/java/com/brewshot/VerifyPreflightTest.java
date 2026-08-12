@@ -46,7 +46,27 @@ class VerifyPreflightTest {
         assertFalse(Files.exists(directory.resolve("baselines/home.png")));
         assertEquals(prepared.stagingRoot().resolve("home.baseline.png"),
             prepared.jobs().getFirst().stagedBaseline());
+        assertEquals(directory.resolve(
+            "baselines/.brewshot-verify-updatestage1-home.tmp"),
+            prepared.jobs().getFirst().commitTemporary());
+        assertFalse(Files.exists(prepared.jobs().getFirst().commitTemporary()));
         assertFalse(Files.exists(prepared.stagingRoot()));
+    }
+
+    @Test
+    void updateCommitTemporaryParticipatesInWholeGraphAliasChecks(
+            @TempDir Path directory) throws Exception {
+        Path manifestPath = fixture(directory, false);
+        Files.writeString(manifestPath, manifest("baselines/home.png",
+            "baselines/.brewshot-verify-committemp1-home.tmp/result.json"));
+
+        VerifyPreflight.PreflightException failure = assertThrows(
+            VerifyPreflight.PreflightException.class,
+            () -> VerifyPreflight.inspect(VerifyManifest.load(manifestPath),
+                VerifyPreflight.Mode.UPDATE, "committemp1"));
+
+        assertTrue(failure.getMessage().contains("ancestor/descendant"));
+        assertNoStage(directory);
     }
 
     @Test
