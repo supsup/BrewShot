@@ -22,7 +22,8 @@ import java.util.regex.Pattern;
  * {@code brewshot verify}.
  *
  * <p>The inspected graph includes every authored input/final output plus the
- * derived batch receipt and staging tree. No directory is created until the
+ * derived batch receipt, same-base-directory input snapshots, sibling commit
+ * temporaries, and staging tree. No directory or file is created until the
  * complete graph has passed and the manifest bytes have been rechecked.
  */
 final class VerifyPreflight {
@@ -105,7 +106,15 @@ final class VerifyPreflight {
                         workspace, workspaceReal, job.heatmap(), prefix + "heatmap", true));
                 }
 
-                Path stagedInput = stagingRoot.resolve(job.id() + ".input.html");
+                // Keep the snapshot beside the authored HTML so relative subresources
+                // resolve against the same directory when Chrome opens this generation.
+                Path stagedInput = job.input().getParent().resolve(
+                    ".brewshot-verify-" + stageId + "-" + job.id() + ".input.html");
+                graph.add(phase == Phase.BEFORE_STAGING
+                    ? futureNode(workspace, workspaceReal, stagedInput,
+                        prefix + "input snapshot", true)
+                    : existingNode(workspace, workspaceReal, stagedInput,
+                        prefix + "input snapshot", true));
                 Path stagedBaselineInput = mode == Mode.CHECK
                     ? stagingRoot.resolve(job.id() + ".baseline-input.png") : null;
                 Path stagedCapture = stagingRoot.resolve(job.id() + ".capture.png");

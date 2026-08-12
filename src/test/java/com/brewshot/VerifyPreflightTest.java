@@ -32,6 +32,10 @@ class VerifyPreflightTest {
         assertFalse(Files.exists(prepared.stagingRoot()));
         assertFalse(Files.exists(prepared.batchReceipt()));
         assertEquals(1, prepared.jobs().size());
+        assertEquals(directory.resolve(
+            "fixtures/.brewshot-verify-checkstage01-home.input.html"),
+            prepared.jobs().getFirst().stagedInput());
+        assertFalse(Files.exists(prepared.jobs().getFirst().stagedInput()));
         assertNull(prepared.jobs().getFirst().stagedBaseline());
         assertNotNull(prepared.jobs().getFirst().stagedHeatmap());
     }

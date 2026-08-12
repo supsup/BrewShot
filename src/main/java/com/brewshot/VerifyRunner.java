@@ -68,6 +68,7 @@ final class VerifyRunner {
         } catch (IOException snapshotFailure) {
             System.err.println("brewshot: cannot snapshot verify inputs: "
                 + stableMessage(prepared, snapshotFailure));
+            cleanupInputSnapshots(states);
             cleanupStaging(prepared.stagingRoot());
             return VerifyManifest.FailureCategory.PREFLIGHT.exitCode();
         }
@@ -83,6 +84,7 @@ final class VerifyRunner {
         }
 
         publishEvidence(prepared, states, batchFailures);
+        cleanupInputSnapshots(states);
         cleanupStaging(prepared.stagingRoot());
         cleanupCommitTemporaries(states);
         return finalExit(states, batchFailures);
@@ -373,7 +375,7 @@ final class VerifyRunner {
         marker.put("attemptId", prepared.stageId());
         marker.put("contentDigest", contentDigest(prepared, states));
         marker.put("state", "in-progress");
-        marker.put("mode", "update");
+        marker.put("mode", prepared.mode().name().toLowerCase(java.util.Locale.ROOT));
         marker.put("powerLossDurable", false);
         marker.put("message", "verify evidence is incomplete"
             + (prepared.mode() == VerifyPreflight.Mode.UPDATE
@@ -839,6 +841,16 @@ final class VerifyRunner {
         }
     }
 
+    private static void cleanupInputSnapshots(List<JobState> states) {
+        for (JobState state : states) {
+            try {
+                Files.deleteIfExists(state.prepared.stagedInput());
+            } catch (IOException ignored) {
+                // Best-effort cleanup after receipt publication has been attempted.
+            }
+        }
+    }
+
     private static void cleanupStaging(Path root) {
         if (!Files.isDirectory(root, LinkOption.NOFOLLOW_LINKS)
                 || Files.isSymbolicLink(root)) {
@@ -849,11 +861,11 @@ final class VerifyRunner {
                 try {
                     Files.deleteIfExists(path);
                 } catch (IOException ignored) {
-                    // Best-effort cleanup after durable receipts have been attempted.
+                    // Best-effort cleanup after receipt publication has been attempted.
                 }
             });
         } catch (IOException ignored) {
-            // Best-effort cleanup after durable receipts have been attempted.
+            // Best-effort cleanup after receipt publication has been attempted.
         }
     }
 

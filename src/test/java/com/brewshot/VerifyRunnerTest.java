@@ -248,6 +248,8 @@ class VerifyRunnerTest {
         Fixture fixture = fixture(directory);
         String originalTwo = Files.readString(directory.resolve("fixtures/two.html"));
         VerifyRunner runner = VerifyRunner.forTest((job, input, output) -> {
+            assertEquals(job.input().getParent(), input.getParent(),
+                "snapshot must preserve the authored HTML base directory");
             if (job.id().equals("one")) {
                 Files.writeString(directory.resolve("fixtures/two.html"), "changed live input");
             } else {
