@@ -56,6 +56,15 @@ class BoundedUtf8Test {
             BoundedUtf8.read(new java.io.ByteArrayInputStream(malformed), 8, "source"));
     }
 
+    @Test
+    void strictConfigurationDecodeRejectsMalformedUtf8WithoutChangingLegacyReads() {
+        byte[] malformed = {(byte) 0xC3, 0x28};
+        IOException failure = assertThrows(IOException.class,
+            () -> BoundedUtf8.readStrict(
+                new java.io.ByteArrayInputStream(malformed), 8, "manifest"));
+        assertEquals("manifest is not valid UTF-8", failure.getMessage());
+    }
+
     private static final class CountingInputStream extends InputStream {
         private int remaining;
         private int bytesRead;
