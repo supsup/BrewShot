@@ -149,11 +149,12 @@ final class ArtifactWriter {
         if (parent == null) {
             throw new IOException("output path has no parent: " + target);
         }
-        Path temporary = Files.createTempFile(
-            parent, "." + commitTarget.getFileName() + ".", ".tmp");
+        Path temporary = createPrivateTemporary(parent, commitTarget.getFileName().toString());
         boolean committed = false;
         try {
             writer.write(temporary);
+            // Belt-and-braces after the writer too: a future writer implementation must not be
+            // able to relax the mode of the file it was handed.
             makeOwnerOnly(temporary);
             moveIntoPlace(temporary, commitTarget, FILESYSTEM_MOVE);
             committed = true;
@@ -165,6 +166,29 @@ final class ArtifactWriter {
                     // Preserve the original write/mode/move failure.
                 }
             }
+        }
+    }
+
+    private static Path createPrivateTemporary(Path parent, String targetName)
+            throws IOException {
+        if (Files.getFileStore(parent).supportsFileAttributeView("posix")) {
+            return Files.createTempFile(parent, "." + targetName + ".", ".tmp",
+                PosixFilePermissions.asFileAttribute(Set.of(
+                    PosixFilePermission.OWNER_READ,
+                    PosixFilePermission.OWNER_WRITE)));
+        }
+        Path temporary = Files.createTempFile(parent, "." + targetName + ".", ".tmp");
+        try {
+            // Establish privacy BEFORE bytes are written, not only before the final rename.
+            makeOwnerOnly(temporary);
+            return temporary;
+        } catch (IOException privacyFailure) {
+            try {
+                Files.deleteIfExists(temporary);
+            } catch (IOException cleanupFailure) {
+                privacyFailure.addSuppressed(cleanupFailure);
+            }
+            throw privacyFailure;
         }
     }
 
