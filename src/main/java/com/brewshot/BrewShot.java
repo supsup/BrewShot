@@ -2241,6 +2241,24 @@ public final class BrewShot implements AutoCloseable {
     }
 
     /**
+     * One CLI-facing snapshot of both bounded page-voice logs after a single inbox drain.
+     * Package-private on purpose: the stable library API remains {@link #console()} and
+     * {@link #errors()}, while the CLI needs all four values to describe one honest processed
+     * prefix rather than draining separately between fields.
+     */
+    DiagnosticsSnapshot diagnosticsSnapshot() {
+        drainInboxNonBlocking();
+        return new DiagnosticsSnapshot(
+            consoleLog.view(), consoleLog.dropped(), errorLog.view(), errorLog.dropped());
+    }
+
+    record DiagnosticsSnapshot(
+            List<String> console,
+            long consoleDropped,
+            List<String> errors,
+            long errorsDropped) { }
+
+    /**
      * Total CDP messages rejected because the undrained inbox hit either its
      * message-count or retained-byte ceiling. This counter is monotonic for the client.
      */

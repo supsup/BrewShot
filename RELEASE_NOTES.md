@@ -2,17 +2,33 @@
 
 ## Unreleased
 
-- **Documented that BrewShot's outputs are owner-only, and how to read them.** The
-  README explained at length which permissions the *input* side needs and said
-  nothing about the output side: captures are written mode `0600` owned by
-  `10001:10001`, so on Linux a host process with a different UID cannot open a file
-  that exists, is the right size, and contains a correct PNG. Every symptom points
-  away from the cause, and in CI it surfaces as a later step "producing no usable
-  output". The warning now states the property, shows the measured
-  `-rw------- 1 10001 10001` plus the `Permission denied` a UID-1001 read gets, and
-  gives both remedies — run as yourself with `--user`, or read the artifact back
-  through a container — noting that it applies to every artifact BrewShot writes,
-  not just PNGs. Documentation only; no behaviour changed.
+- **Bounded page diagnostics now survive the failure they explain** (plan
+  76ca8437). `--page-diagnostics`, `--fail-page-errors`, and
+  `--fail-console-errors` require an explicit `--json` path before Chrome
+  starts. Raw console/exception text is present only under the first opt-in;
+  gate-only receipts expose bounded counts, exact existing drop counters,
+  completeness, and the selected outcome without disclosing text. Uncaught
+  page exceptions and `console.error` are independently selectable signals.
+  A proven error returns exit 4 only after the image and JSON exist; relevant
+  dropped evidence returns typed inconclusive exit 5 rather than a false clean.
+  Each captured array preserves its own order without inventing a total order
+  across independent CDP streams. Capture sidecars are forced to owner-only
+  `0600` even when replacing a permissive file; Docker smoke proves a different
+  UID cannot read one while the supported deliberate container-side reader can.
+
+- **Documented how output permissions actually behave, and how to read an artifact
+  you cannot open.** The README explained at length which permissions the *input*
+  side needs and said nothing about the output side, where the rule has three cases:
+  a **new** target is created owner-only (`0600`, owned by the image's `10001:10001`
+  in a container), an **existing ordinary** target keeps its own mode bits, and a
+  `--json` sidecar is forced to `0600` even when replacing a permissive file. So on
+  Linux a host process with a different UID may be unable to open a file that exists,
+  is the right size, and contains a correct PNG — or may open it fine, depending on
+  whether the path already existed. Every symptom points away from the cause, and in
+  CI it surfaces as a later step "producing no usable output". The warning states all
+  three cases with the measurements behind them and gives both remedies: run as
+  yourself with `--user`, or read the artifact back through a container.
+  Documentation only; no behaviour changed.
 
 - **The folder worker's concurrency now has behavioural coverage in CI** (plan
   4124aab6). `docker/smoke-test.sh` — the only test that exercises

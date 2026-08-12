@@ -37,7 +37,10 @@ same-directory replace otherwise), so a failed encode/write cannot leave a
 plausible partial target; temporary residue is cleaned best-effort. The
 fallback preserves the complete-before-replace rule but cannot guarantee
 atomic replacement on a filesystem that does not support `ATOMIC_MOVE`.
-Replacing an existing POSIX target retains its mode bits. A valid output
+Replacing an existing ordinary POSIX target retains its mode bits. Capture
+`--json` sidecars are the deliberate exception: they are forced to owner-only
+`0600` even when replacing a permissive file, because opted-in page text can
+contain application data. A valid output
 symlink remains a symlink and its referent is replaced; broken or cyclic
 output symlinks fail before temporary-file creation. Output aliases are
 rejected before artifacts are written; when either future target is absent,
@@ -49,6 +52,38 @@ of flattening it through `String.valueOf`.
 Direct stdin HTML is capped at 16 MiB and `--eval-file` at 1 MiB (byte caps,
 UTF-8); inputs at the exact cap are accepted and cap+1 is refused before
 decoding.
+
+### Let the CLI hear the page
+
+The library has always retained bounded `console()` and `errors()` evidence.
+The CLI exposes that same storage only when asked, and never invents a sidecar:
+
+```bash
+brewshot page.html -o shot.png --json shot.json --page-diagnostics
+brewshot page.html -o shot.png --json shot.json --fail-page-errors
+brewshot page.html -o shot.png --json shot.json --fail-console-errors
+```
+
+All three flags require an explicit `--json` path before Chrome starts.
+`--page-diagnostics` adds the bounded `console` and `errors` arrays, counts,
+existing drop counters, and completeness to the manifest. The gate-only flags
+record counts/status but do not disclose raw page text. `--fail-page-errors`
+means uncaught page exceptions; it deliberately ignores `console.error`, whose
+often-noisy signal is gated only by the separate `--fail-console-errors` opt-in.
+
+The screenshot and private JSON sidecar are published before a tripped gate
+returns exit 4. If the shared bounded error stream dropped evidence and no
+retained entry already proves failure, the gate is **inconclusive (exit 5)**,
+never clean. Forced raw-diagnostics overflow is likewise exit 5. Drop counters
+are evidence, not decoration. Console and exception arrays each preserve their
+own arrival order; V1 claims no total order across those independent CDP
+streams. Raw strings receive the library's existing entry/UTF-8 byte bounds,
+not general secret redaction.
+
+In the container image, BrewShot runs as fixed UID 10001. A `0600` sidecar may
+therefore be unreadable to a different host UID by design; inspect it through a
+deliberate container-side reader (or explicitly copy/change ownership outside
+BrewShot) rather than weakening the artifact mode.
 
 The `--gif N` lane records N frames as a looping GIF instead of a still —
 `--gif-delay` sets the per-frame cadence (capture == playback, default 40 ms) and
@@ -499,24 +534,34 @@ restart, and multiple workers may share the same mounts. Set
 > [SLOWSTART](SLOWSTART.md) Scenario 5.
 
 > [!WARNING]
-> **What BrewShot writes, you may not be able to read.** Outputs are created
-> owner-only — mode `0600`, owned by `10001:10001` — so on Linux a host process
-> with a different UID cannot open them *even though the capture succeeded*.
-> Measured, not inferred: after a container capture, `ls -l` shows
-> `-rw------- 1 10001 10001 5116 shot.png` and a `cat` from UID 1001 answers
-> `Permission denied`. The bytes are there and they are correct.
+> **What BrewShot writes, you may not be able to read — and whether you can depends
+> on whether the file already existed.** Three cases, each measured:
 >
-> This is the awkward failure mode, because every symptom points away from the
-> cause: the file exists, `stat` works, the size is right, and `file(1)` says
-> "regular file, no read permission" rather than anything about the capture. In
-> CI it surfaces as a step that "produced no usable output" long after the step
-> that actually produced it.
+> | target | resulting mode | consequence |
+> |---|---|---|
+> | does not exist yet | `0600`, owned by `10001:10001` in a container | a different host UID **cannot** open it |
+> | exists as an ordinary file | its own mode bits are **retained** | a pre-existing `0644` output stays world-readable |
+> | `--json` sidecar | forced `0600` even over a permissive file | deliberate, so opted-in page text is not widened |
+>
+> Measured both ways rather than generalised from one: a fresh capture produced
+> `-rw------- 10001 10001 shot.png` and a `cat` from UID 1001 answered `Permission
+> denied`, while capturing over a pre-created `0644` file left it `-rw-r--r--`,
+> readable by anyone. An earlier draft of this warning said outputs are *always*
+> owner-only. That is true only of the first row, and stating it as a blanket rule
+> would have been wrong in the direction people rely on — "BrewShot outputs are
+> private" is not a confidentiality guarantee when the target pre-exists permissively.
+>
+> The first row is the one that costs time, because every symptom points away from
+> the cause: the file exists, `stat` works, the size is right, and `file(1)` says
+> "regular file, no read permission" rather than anything about the capture. In CI it
+> surfaces as a step that "produced no usable output" long after the step that
+> actually produced it.
 >
 > Two ways through, and pick deliberately:
 >
-> - **Run as yourself** — `--user "$(id -u):$(id -g)"`. The output lands owned by
->   you and every later step reads it normally. Requires the bind folders to be
->   writable by that UID.
+> - **Run as yourself** — `--user "$(id -u):$(id -g)"`. The output lands owned by you
+>   and every later step reads it normally. Requires the bind folders to be writable
+>   by that UID.
 > - **Read it back through a container**, when running as the image's own user is
 >   what you want (it is the safer default, and it is what CI does):
 >
@@ -525,9 +570,8 @@ restart, and multiple workers may share the same mounts. Set
 >     --entrypoint /bin/sh brewshot:local -c 'cat /verify/shot.png' > shot.png
 >   ```
 >
-> The same applies to *every* artifact BrewShot writes, including diff heatmaps,
-> verify receipts and any future sidecar — the permission is a property of the
-> writer, not of the file type.
+> This is a property of the **writer**, so it applies to every artifact BrewShot
+> produces — stills, GIFs, diff heatmaps, verify receipts and JSON sidecars alike.
 
 Rolling your own image: install `chromium` + fonts (`fonts-liberation`,
 `fonts-dejavu-core`), set `BREWSHOT_CHROME=/usr/bin/chromium` and
