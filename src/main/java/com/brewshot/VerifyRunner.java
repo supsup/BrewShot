@@ -63,6 +63,11 @@ final class VerifyRunner {
             states.add(new JobState(job));
         }
 
+        if (!writeInProgressMarker(prepared, states, batchFailures, false)) {
+            cleanupStaging(prepared.stagingRoot());
+            return finalExit(states, batchFailures);
+        }
+
         try {
             snapshotInputs(prepared, states);
         } catch (IOException snapshotFailure) {
@@ -208,7 +213,7 @@ final class VerifyRunner {
                 throw new IOException("diff receipt root is not an object");
             }
             state.diff = new LinkedHashMap<>((Map<String, Object>) raw);
-            boolean exceeded = Boolean.TRUE.equals(state.diff.get("exceeded"));
+            boolean exceeded = Boolean.TRUE.equals(MiniJson.get(state.diff, "gate.exceeded"));
             state.heatmapWritten = state.prepared.stagedHeatmap() != null
                 && Files.isRegularFile(
                     state.prepared.stagedHeatmap(), LinkOption.NOFOLLOW_LINKS);
@@ -302,11 +307,24 @@ final class VerifyRunner {
 
         for (int index = 0; index < states.size(); index++) {
             JobState state = states.get(index);
-            if (index == 0 && !writeInProgressMarker(prepared, states, batchFailures)) {
+            if (index == 0
+                    && !writeInProgressMarker(prepared, states, batchFailures, true)) {
                 state.fail(VerifyManifest.FailureCategory.COMMIT,
                     "cannot invalidate the prior batch receipt before replacement");
                 for (int remaining = 1; remaining < states.size(); remaining++) {
                     states.get(remaining).status = "not-attempted-without-run-marker";
+                }
+                break;
+            }
+            if (!contentAndMetadataUnchanged(state.job().baseline(),
+                    state.originalBaselineSha256, state.originalBaselineMetadata)) {
+                String message = "baseline changed immediately before replacement: "
+                    + relative(prepared, state.job().baseline());
+                state.fail(VerifyManifest.FailureCategory.PREFLIGHT, message);
+                batchFailures.add(new VerifyManifest.Failure(
+                    VerifyManifest.FailureCategory.PREFLIGHT, state.job().id(), message));
+                for (int remaining = index + 1; remaining < states.size(); remaining++) {
+                    states.get(remaining).status = "not-attempted-after-baseline-drift";
                 }
                 break;
             }
@@ -368,12 +386,13 @@ final class VerifyRunner {
 
     private boolean writeInProgressMarker(
             VerifyPreflight.Prepared prepared, List<JobState> states,
-            List<VerifyManifest.Failure> batchFailures) {
+            List<VerifyManifest.Failure> batchFailures, boolean contentDigestReady) {
         Map<String, Object> marker = new LinkedHashMap<>();
         marker.put("schemaVersion", 1);
         marker.put("manifestSha256", prepared.manifest().sourceSha256());
         marker.put("attemptId", prepared.stageId());
-        marker.put("contentDigest", contentDigest(prepared, states));
+        marker.put("contentDigest", contentDigestReady ? contentDigest(prepared, states) : null);
+        marker.put("contentDigestReady", contentDigestReady);
         marker.put("state", "in-progress");
         marker.put("mode", prepared.mode().name().toLowerCase(java.util.Locale.ROOT));
         marker.put("powerLossDurable", false);
@@ -388,8 +407,12 @@ final class VerifyRunner {
                 MiniJson.stringifyPretty(marker) + "\n", StandardCharsets.UTF_8);
             return true;
         } catch (IOException failure) {
+            VerifyManifest.FailureCategory category = prepared.mode()
+                == VerifyPreflight.Mode.UPDATE
+                    ? VerifyManifest.FailureCategory.COMMIT
+                    : VerifyManifest.FailureCategory.DIFF;
             batchFailures.add(new VerifyManifest.Failure(
-                VerifyManifest.FailureCategory.COMMIT, null,
+                category, null,
                 "cannot write in-progress batch marker: "
                     + stableMessage(prepared, failure)));
             return false;
@@ -406,7 +429,7 @@ final class VerifyRunner {
                 + unsafe.failure().message());
             return;
         }
-        if (!writeInProgressMarker(prepared, states, batchFailures)) {
+        if (!writeInProgressMarker(prepared, states, batchFailures, true)) {
             return;
         }
         String attemptId = prepared.stageId();

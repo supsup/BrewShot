@@ -243,6 +243,54 @@ class VerifyRunnerTest {
     }
 
     @Test
+    void processCrashDuringCaptureAlreadyInvalidatesThePriorBatchReceipt(
+            @TempDir Path directory) throws Exception {
+        Fixture fixture = fixture(directory);
+        Files.writeString(fixture.batchReceipt(),
+            "{\"state\":\"complete\",\"attemptId\":\"old\"}");
+        VerifyRunner runner = VerifyRunner.forTest((job, input, output) -> {
+            throw new AssertionError("simulated capture-process crash");
+        }, null);
+
+        assertThrows(AssertionError.class,
+            () -> runner.execute(fixture.manifest(), VerifyPreflight.Mode.CHECK));
+
+        String marker = Files.readString(fixture.batchReceipt());
+        assertTrue(marker.contains("\"state\": \"in-progress\""));
+        assertTrue(marker.contains("\"mode\": \"check\""));
+        assertTrue(marker.contains("\"contentDigestReady\": false"));
+        assertFalse(marker.contains("\"attemptId\": \"old\""));
+    }
+
+    @Test
+    void baselineDriftAfterPreparationRefusesThatReplacement(
+            @TempDir Path directory) throws Exception {
+        Fixture fixture = fixture(directory);
+        byte[] externalTwo = pngBytes(Color.GREEN);
+        AtomicInteger replacements = new AtomicInteger();
+        ArtifactWriter.MoveStrategy driftAfterFirst = (temporary, target, atomic) -> {
+            Files.move(temporary, target, StandardCopyOption.ATOMIC_MOVE,
+                StandardCopyOption.REPLACE_EXISTING);
+            if (replacements.incrementAndGet() == 1) {
+                Files.write(fixture.baselineTwo(), externalTwo);
+            }
+        };
+        VerifyRunner runner = VerifyRunner.forTest((job, input, output) -> {
+            writePng(output, job.id().equals("one") ? Color.BLUE : Color.RED);
+            return 0;
+        }, driftAfterFirst);
+
+        int exit = runner.execute(fixture.manifest(), VerifyPreflight.Mode.UPDATE);
+
+        assertEquals(2, exit);
+        assertEquals(1, replacements.get());
+        assertArrayEquals(externalTwo, Files.readAllBytes(fixture.baselineTwo()));
+        assertTrue(Files.readString(fixture.receiptTwo())
+            .contains("baseline changed immediately before replacement"));
+        assertTrue(Files.readString(fixture.batchReceipt()).contains("\"partial\": true"));
+    }
+
+    @Test
     void capturesUseThePreflightedInputGeneration(@TempDir Path directory)
             throws Exception {
         Fixture fixture = fixture(directory);
