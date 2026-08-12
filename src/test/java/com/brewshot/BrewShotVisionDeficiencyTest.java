@@ -154,7 +154,7 @@ class BrewShotVisionDeficiencyTest {
         Path receipt = dir.resolve("preview.json");
 
         assertEquals(0, Main.run(new String[] {
-            page.toString(), "-o", preview.toString(), "--settle", "0",
+            page.toString(), "-o", preview.toString(), "--settle", "1",
             "--vision-deficiency", "achromatopsia", "--json", receipt.toString(),
         }));
         assertGrayscale(ImageIO.read(preview.toFile()), 60, 60, "CLI preview red");
@@ -168,7 +168,7 @@ class BrewShotVisionDeficiencyTest {
         Path ordinary = dir.resolve("ordinary.png");
         Path ordinaryReceipt = dir.resolve("ordinary.json");
         assertEquals(0, Main.run(new String[] {
-            page.toString(), "-o", ordinary.toString(), "--settle", "0",
+            page.toString(), "-o", ordinary.toString(), "--settle", "1",
             "--json", ordinaryReceipt.toString(),
         }));
         assertFalse(Files.readString(ordinaryReceipt).contains("visionDeficiency"),
