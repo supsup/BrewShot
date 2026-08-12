@@ -280,6 +280,7 @@ final class VerifyPreflight {
 
     private static void assertManifestUnchanged(VerifyManifest manifest)
             throws IOException {
+        // Belt-and-braces for deletion in the TOCTOU window after graph inspection.
         if (!Files.isRegularFile(manifest.source(), LinkOption.NOFOLLOW_LINKS)) {
             throw problem("manifest is missing or no longer a regular file");
         }

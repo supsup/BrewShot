@@ -111,7 +111,7 @@ class VerifyPreflightTest {
 
         VerifyPreflight.PreflightException failure = assertThrows(
             VerifyPreflight.PreflightException.class, prepared::createStaging);
-        assertTrue(failure.getMessage().contains("manifest is missing"));
+        assertTrue(failure.getMessage().contains("manifest must be an existing regular file"));
         assertFalse(Files.exists(prepared.stagingRoot()));
     }
 
