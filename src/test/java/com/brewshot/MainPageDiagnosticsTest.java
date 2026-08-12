@@ -2,6 +2,7 @@ package com.brewshot;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.ByteArrayOutputStream;
@@ -95,6 +96,25 @@ class MainPageDiagnosticsTest {
             true, false, false);
         assertEquals("inconclusive", raw.outcome());
         assertEquals(5, raw.exitCode(), "an explicitly requested raw capture must not hide drops");
+    }
+
+    @Test
+    void deterministicReceiptPreservesArrayOrderAndJsonBytesAcrossRepeatedSnapshots() {
+        Main.PageDiagnosticsReceipt first = new Main.PageDiagnosticsReceipt(
+            List.of("log: first", "warning: second", "log: third"), 2,
+            List.of("console.error: fourth", "uncaught: Error: fifth"), 1,
+            true, true, true);
+        Main.PageDiagnosticsReceipt repeated = new Main.PageDiagnosticsReceipt(
+            List.of("log: first", "warning: second", "log: third"), 2,
+            List.of("console.error: fourth", "uncaught: Error: fifth"), 1,
+            true, true, true);
+
+        assertEquals(first.console(), repeated.console());
+        assertEquals(first.errors(), repeated.errors());
+        assertEquals(
+            MiniJson.stringifyPretty(first.toJson()),
+            MiniJson.stringifyPretty(repeated.toJson()),
+            "the same bounded per-stream fixture must emit byte-stable diagnostic fields");
     }
 
     @Test
@@ -193,6 +213,28 @@ class MainPageDiagnosticsTest {
         assertEquals(Boolean.FALSE, diagnostics.get("complete"));
         assertEquals("inconclusive",
             ((Map<String, Object>) diagnostics.get("gate")).get("outcome"));
+    }
+
+    @Test
+    void manifestWriteFailureWinsOverAnObservedPageGate(
+            @TempDir Path directory) throws Exception {
+        TestChrome.requireChromeOrLoudSkip("MainPageDiagnosticsTest");
+        Path page = directory.resolve("write-failure.html");
+        Files.writeString(page, """
+            <!doctype html><p>write failure</p><script>
+              setTimeout(function () { throw new Error('must-not-become-exit-four'); }, 0);
+            </script>
+            """);
+        Path png = directory.resolve("write-failure.png");
+        Path json = directory.resolve("missing-parent").resolve("write-failure.json");
+
+        assertThrows(java.io.IOException.class, () -> Main.run(new String[] {
+            page.toString(), "-o", png.toString(), "--json", json.toString(),
+            "--page-diagnostics", "--fail-page-errors", "--settle", "100"}));
+
+        assertTrue(Files.size(png) > 200,
+            "the screenshot still precedes the manifest failure");
+        assertFalse(Files.exists(json));
     }
 
     @SuppressWarnings("unchecked")
