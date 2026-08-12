@@ -178,6 +178,13 @@ public final class BrewShot implements AutoCloseable {
     // identifier is sent before every navigation, then proved from the loaded page's Intl view.
     private String emulatedTimezone;
     private String appliedTimezone;
+    // True page-density emulation is a launch contract, not an output raster knob. A null
+    // request preserves the legacy force-1 Chrome launch unchanged. An explicit integer DPR is
+    // applied once to the attached target before the first content navigation, then only
+    // WITNESSED after each load; we deliberately do not reapply it and hide target-state drift.
+    private Integer emulatedDevicePixelRatio;
+    private Integer appliedDevicePixelRatio;
+    private int deviceMetricsApplicationCount;
     private String sessionId; // null during browser-scope bootstrap, then the tab session
     private int nextId = 1;
     // Network in-flight tracking for waitForNetworkIdle. A SET of live CDP
@@ -1032,14 +1039,33 @@ public final class BrewShot implements AutoCloseable {
 
     /** Launch headless Chrome with the given viewport and attach to a fresh tab. */
     public static BrewShot launch(int width, int height) throws IOException {
-        return launch(width, height, Map.of());
+        return launch(width, height, null, Map.of());
+    }
+
+    /**
+     * Launch with an explicit page-visible device pixel ratio. V1 deliberately accepts only
+     * integers 1 through 4: fractional DPR needs an output-dimension rounding contract before it
+     * can compose honestly with screenshot scale.
+     */
+    public static BrewShot launch(int width, int height, int devicePixelRatio)
+            throws IOException {
+        return launch(width, height, devicePixelRatio, Map.of());
     }
 
     /** Package test seam for proving that the unforced browser really follows host TZ. */
     static BrewShot launch(int width, int height, Map<String, String> environmentOverrides)
             throws IOException {
+        return launch(width, height, null, environmentOverrides);
+    }
+
+    private static BrewShot launch(int width, int height, Integer devicePixelRatio,
+                                   Map<String, String> environmentOverrides)
+            throws IOException {
         Validation.positiveInt("viewport width", width);
         Validation.positiveInt("viewport height", height);
+        if (devicePixelRatio != null) {
+            Validation.intRange("device pixel ratio", devicePixelRatio, 1, 4);
+        }
         Objects.requireNonNull(environmentOverrides, "environmentOverrides");
         String bin = findChrome();
         if (bin == null) { throw new IllegalStateException("no Chrome binary found"); }
@@ -1047,24 +1073,8 @@ public final class BrewShot implements AutoCloseable {
             System.getenv(), System.getProperty("os.name", ""), bin);
         if (refusal != null) { throw new IOException(refusal); }
         Path profile = Files.createTempDirectory("brewshot-");
-        List<String> args = new ArrayList<>(List.of(
-            bin,
-            "--headless",
-            "--disable-gpu",
-            "--hide-scrollbars",
-            "--force-device-scale-factor=1",
-            "--window-size=" + width + "," + height,
-            "--remote-debugging-port=0",
-            "--user-data-dir=" + profile,
-            "--no-first-run",
-            "--no-default-browser-check",
-            // macOS 26 + Chrome 150 (plan ba9dafd7, 2026-07-22): without this flag, ~1/3 of
-            // rapid headless launches spawned a doomed secondary Chrome that abort()ed inside
-            // TransformProcessType -> _RegisterApplication. It reduced the original observed
-            // storm from 5/15 aborts to 0/15, but later Seatbelt evidence proved it is not a
-            // universal crash-dialog fix; launchContextRefusal handles that known-denied context.
-            // The flag remains harmless on Linux/CI.
-            "--no-startup-window"));
+        List<String> args = chromeLaunchArguments(
+            bin, profile, width, height, devicePixelRatio);
         // Extra Chrome flags via env — the container hook (e.g. the Docker
         // image sets BREWSHOT_CHROME_ARGS=--no-sandbox: Chrome's sandbox needs
         // privileges containers don't grant by default). Space-separated.
@@ -1093,7 +1103,46 @@ public final class BrewShot implements AutoCloseable {
             lease.cleanup(false);
             throw e;
         }
-        return finishLaunch(lease, wsUrl, HTTP_CONNECTOR, envTimeoutMs());
+        BrewShot shot = finishLaunch(lease, wsUrl, HTTP_CONNECTOR, envTimeoutMs());
+        if (devicePixelRatio != null) {
+            try {
+                shot.applyDeviceMetricsOverride(width, height, devicePixelRatio);
+            } catch (RuntimeException | Error rejected) {
+                shot.close();
+                throw rejected;
+            }
+        }
+        return shot;
+    }
+
+    /** Package-visible launch-argument seam: proves default and explicit DPR never compete. */
+    static List<String> chromeLaunchArguments(String bin, Path profile, int width, int height,
+                                              Integer devicePixelRatio) {
+        List<String> args = new ArrayList<>(List.of(
+            bin,
+            "--headless",
+            "--disable-gpu",
+            "--hide-scrollbars"));
+        // Default launches retain the historical browser-level force-1 contract byte-for-byte.
+        // Explicit DPR owns this property at the target-scoped CDP seam instead, so leaving the
+        // flag here would create an undocumented precedence between two independent mechanisms.
+        if (devicePixelRatio == null) {
+            args.add("--force-device-scale-factor=1");
+        }
+        args.addAll(List.of(
+            "--window-size=" + width + "," + height,
+            "--remote-debugging-port=0",
+            "--user-data-dir=" + profile,
+            "--no-first-run",
+            "--no-default-browser-check",
+            // macOS 26 + Chrome 150 (plan ba9dafd7, 2026-07-22): without this flag, ~1/3 of
+            // rapid headless launches spawned a doomed secondary Chrome that abort()ed inside
+            // TransformProcessType -> _RegisterApplication. It reduced the original observed
+            // storm from 5/15 aborts to 0/15, but later Seatbelt evidence proved it is not a
+            // universal crash-dialog fix; launchContextRefusal handles that known-denied context.
+            // The flag remains harmless on Linux/CI.
+            "--no-startup-window"));
+        return args;
     }
 
     private static ProcessBuilder chromeProcessBuilder(
@@ -2047,6 +2096,7 @@ public final class BrewShot implements AutoCloseable {
         }
         waitEvent("Page.loadEventFired", navTimeoutMs);
         verifyAppliedTimezone();
+        verifyAppliedDevicePixelRatio();
     }
 
     /**
@@ -2063,6 +2113,7 @@ public final class BrewShot implements AutoCloseable {
             "{\"frameId\":\"" + frameId + "\",\"html\":\"" + MiniJson.esc(source) + "\"}");
         waitEvent("Page.loadEventFired", navTimeoutMs);
         verifyAppliedTimezone();
+        verifyAppliedDevicePixelRatio();
     }
 
     /**
@@ -2079,6 +2130,7 @@ public final class BrewShot implements AutoCloseable {
         inFlightRequestIds.clear();
         lastNetChangeNanos = System.nanoTime();
         appliedTimezone = null;
+        appliedDevicePixelRatio = null;
         // Re-send any active colorScheme/media/reducedMotion override BEFORE the navigation
         // command below, so the new document paints under it from the first frame — a no-op
         // when none was ever set (plan 02af3a3d: emulation must survive "any new page/navigation
@@ -2265,6 +2317,50 @@ public final class BrewShot implements AutoCloseable {
                 + emulatedTimezone + ", page reported " + visible);
         }
         appliedTimezone = actual;
+    }
+
+    /** The page-visible DPR proved after the most recent navigation, or null. */
+    public Integer appliedDevicePixelRatio() {
+        return appliedDevicePixelRatio;
+    }
+
+    /**
+     * Apply the launch-time target metrics exactly once, before the first content navigation.
+     * Subsequent navigations only verify persistence; they never reapply and make a lost override
+     * look healthy. The browser-level force-1 flag is absent for this launch by construction.
+     */
+    private void applyDeviceMetricsOverride(int width, int height, int devicePixelRatio) {
+        this.emulatedDevicePixelRatio = devicePixelRatio;
+        this.appliedDevicePixelRatio = null;
+        try {
+            command("Emulation.setDeviceMetricsOverride",
+                "{\"width\":" + width + ",\"height\":" + height
+                    + ",\"deviceScaleFactor\":" + devicePixelRatio
+                    + ",\"mobile\":false}");
+            deviceMetricsApplicationCount++;
+        } catch (IllegalStateException rejected) {
+            throw new IllegalStateException(
+                "device pixel ratio override rejected for " + devicePixelRatio + ": "
+                    + rejected.getMessage(), rejected);
+        }
+    }
+
+    /** Post-load witness: null-before-throw so a stale prior success is never observable. */
+    private void verifyAppliedDevicePixelRatio() {
+        if (emulatedDevicePixelRatio == null) { return; }
+        appliedDevicePixelRatio = null;
+        Object visible = eval("window.devicePixelRatio");
+        if (!(visible instanceof Number actual)
+                || Double.compare(actual.doubleValue(), emulatedDevicePixelRatio.doubleValue()) != 0) {
+            throw new IllegalStateException("device pixel ratio override mismatch: requested "
+                + emulatedDevicePixelRatio + ", page reported " + visible);
+        }
+        appliedDevicePixelRatio = emulatedDevicePixelRatio;
+    }
+
+    /** Package test witness that navigation did not hide persistence behind reapplication. */
+    int deviceMetricsApplicationCountForTests() {
+        return deviceMetricsApplicationCount;
     }
 
     /** Toggle console/error capture (default ON; bounded either way). */

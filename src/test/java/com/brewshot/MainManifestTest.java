@@ -39,6 +39,8 @@ class MainManifestTest {
             assertEquals(values.get(i), root.get("eval"), "top-level eval value " + i);
             assertFalse(root.containsKey("pageDiagnostics"),
                 "legacy manifests must keep their exact schema when no new flag is present");
+            assertFalse(root.containsKey("dpr"),
+                "omitted DPR must preserve the legacy one-shot receipt shape");
         }
     }
 
@@ -138,6 +140,24 @@ class MainManifestTest {
             (Map<String, Object>) MiniJson.parse(Files.readString(manifest));
         assertEquals(Map.of("requested", "Asia/Tokyo", "applied", "Asia/Tokyo"),
             root.get("timezone"));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void explicitDprManifestRecordsRequestedAndPageVerifiedApplied(@TempDir Path directory)
+            throws Exception {
+        Path out = directory.resolve("shot.png");
+        Files.write(out, new byte[] {1, 2, 3});
+        Path manifest = directory.resolve("shot.json");
+
+        Main.writeManifest(manifest, "page.html", "file", 640, 480, 25,
+            null, out, null, null, true, 12, null, null, null,
+            null, null, 2, 2);
+
+        Map<String, Object> root =
+            (Map<String, Object>) MiniJson.parse(Files.readString(manifest));
+        assertEquals(Map.of("requested", 2.0, "applied", 2.0), root.get("dpr"));
+        assertFalse(root.containsKey("timezone"));
     }
 
     @Test

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **True page-visible DPR and Retina capture** (plan 12c7f774). Library
+  `launch(width, height, dpr)` and CLI `--dpr N` accept integers 1 through 4, apply
+  `Emulation.setDeviceMetricsOverride` once before first content navigation, and witness the exact
+  `window.devicePixelRatio` after every load. Explicit DPR omits the competing browser force-1
+  flag; default launches retain it unchanged. DPR controls the page environment while `--scale`
+  re-rasters the result, so the dimensions multiply. Opt-in one-shot receipts record requested and
+  verified-applied DPR; omission preserves legacy JSON bytes. Fractional DPR and VerifyManifest
+  support remain explicit follow-ups.
 - **Pinned, page-verified timezones for reproducible captures** (plan c6e57eda).
   Library `timezone(IANA_ID)`, CLI `--timezone`, and verify-manifest
   `capture.timezone` use Chrome's `Emulation.setTimezoneOverride` before every navigation and
