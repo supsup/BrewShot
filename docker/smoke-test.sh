@@ -217,8 +217,12 @@ assert_owner_only() {
 # Same reason as assert_png: outputs are owner-only to UID 10001, so ANY host-side content read
 # fails on a runner whose uid differs — and it fails with "permission denied" on a file that is
 # present and correct. Fixing assert_png alone was not enough; the next host-side reader (`cmp`)
-# failed identically one line later, which is why this is a shared helper and why I enumerated
-# every content read rather than chasing them one at a time.
+# failed identically one line later, which is why this is a shared helper.
+#
+# An earlier version of this comment claimed the content reads had all been enumerated. They had
+# not: four host-side `sha256sum` calls survived, and the first non-root run found them. The
+# enumeration that missed them searched for readers that LOOK like readers (`cat`, `cmp`); a
+# hashing command reads every byte of a file without resembling one. See container_sha256.
 #
 # DIRECTORY listings are deliberately NOT routed through this: the smoke's mount points are
 # 0777, so `find`/`wc -l` over a directory works from the host and needs no container hop.
@@ -227,6 +231,29 @@ container_cat() {
     _cc_base=$(basename "$1")
     docker run --rm --user 0:0 --volume "$_cc_dir:/verify:ro" --entrypoint /bin/sh "$image" \
         -c "cat '/verify/$_cc_base'"
+}
+
+# Hash $1 FROM INSIDE A CONTAINER, and refuse to return anything that is not a hash.
+#
+# A host-side `sha256sum` on an owner-only output is worse than a plain read failure. It writes
+# its complaint to stderr and NOTHING to stdout, so the caller's variable is set to the EMPTY
+# STRING rather than left unset. Two such reads then compare equal to each other, and an
+# immutability assertion written as `test "$before" = "$(...)"` passes while proving nothing —
+# a green line whose subject was never read. That is the exact shape this script exists to close,
+# and it survived a review and a self-audit before a non-root run exposed it.
+#
+# The hash is computed container-side rather than by piping container_cat into a host sha256sum,
+# and the difference matters: a failed pipe would produce the hash OF ZERO BYTES — a well-formed
+# 64-character hash that still compares equal to its twin. That is the same vacuity wearing a
+# convincing disguise, and the length check below would not catch it.
+container_sha256() {
+    _cs_dir=$(dirname "$1")
+    _cs_base=$(basename "$1")
+    _cs_out=$(docker run --rm --user 0:0 --volume "$_cs_dir:/verify:ro" --entrypoint /bin/sh \
+        "$image" -c "sha256sum '/verify/$_cs_base'" 2>/dev/null | cut -d ' ' -f 1)
+    test ${#_cs_out} -eq 64 \
+        || fail "container-side sha256 of $1 returned '$_cs_out' (expected 64 hex chars) — a read that yields no hash must fail here, not silently compare equal to another empty read"
+    printf '%s\n' "$_cs_out"
 }
 
 # Assert a real PNG at $target, READ FROM INSIDE A CONTAINER rather than from this host.
@@ -378,16 +405,14 @@ assert_running "$watch_one"
 step "output/archive bytes immutable under a same-name resend"
 # Existing output and archive bytes are immutable. A second same-name source
 # with different pixels fails closed and is retained under the failed bucket.
-startup_output_before=$(sha256sum "$output/startup page.html.png" | cut -d ' ' -f 1)
-startup_source_before=$(sha256sum "$input/finished/startup page.html" | cut -d ' ' -f 1)
+startup_output_before=$(container_sha256 "$output/startup page.html.png")
+startup_source_before=$(container_sha256 "$input/finished/startup page.html")
 write_html "$input/.startup page.html.tmp" 'Collision' '#fef3c7'
 mv "$input/.startup page.html.tmp" "$input/startup page.html"
 wait_for_path "$output/startup page.html.error.txt" "$watch_one"
 wait_for_path "$input/failed/startup page.html" "$watch_one"
-test "$startup_output_before" = \
-    "$(sha256sum "$output/startup page.html.png" | cut -d ' ' -f 1)"
-test "$startup_source_before" = \
-    "$(sha256sum "$input/finished/startup page.html" | cut -d ' ' -f 1)"
+test "$startup_output_before" = "$(container_sha256 "$output/startup page.html.png")"
+test "$startup_source_before" = "$(container_sha256 "$input/finished/startup page.html")"
 container_cat "$output/startup page.html.error.txt" | grep -q 'output-collision'
 assert_running "$watch_one"
 docker stop -t 3 "$watch_one" >/dev/null

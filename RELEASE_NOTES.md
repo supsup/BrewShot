@@ -24,6 +24,22 @@
   — CI included — cannot collect the logs afterwards, and a diagnostic that runs
   after its subject is gone prints nothing while appearing to have reported.
   A red run now shows the failing phase *and* the workers' account of it.
+- **The container smoke's immutability check no longer passes by comparing two
+  failed reads.** Four host-side `sha256sum` calls survived the pass that routed
+  the script's other artifact reads through containers. On a runner whose uid is
+  not BrewShot's 10001 they could not read the owner-only output at all — and a
+  failing `sha256sum` writes to stderr and nothing to stdout, so each hash
+  variable became the *empty string* rather than being left unset. The
+  before/after comparison then read `test "" = ""` and passed, so the assertion
+  that output bytes are immutable under a same-name resend was green while
+  proving nothing. Hashing now happens inside the image via `container_sha256`,
+  which refuses any result that is not 64 hex characters, so a read that yields
+  no hash fails the phase instead of silently agreeing with another empty read.
+  The guard is computed container-side rather than by piping a container read
+  into a host `sha256sum`: a broken pipe there would produce the hash of zero
+  bytes — a well-formed hash that still compares equal to its twin. Proven
+  load-bearing: breaking the helper's mount makes the smoke exit 1 naming the
+  phase, while the unmutated script exits 0.
 - **AA forgiveness no longer hides hard one-pixel layout movement** (plan
   ac1851a6). The old reciprocal 3×3 color-presence test could classify an
   opaque rectangle translated by one pixel as pure rasterizer noise, report
