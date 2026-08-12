@@ -9,6 +9,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.attribute.PosixFileAttributeView;
 import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.util.HashSet;
 import java.util.Objects;
 import java.util.Set;
@@ -38,6 +39,21 @@ final class ArtifactWriter {
     @FunctionalInterface
     interface MoveStrategy {
         void move(Path temporary, Path target, boolean atomic) throws IOException;
+    }
+
+    enum MoveOutcome {
+        ATOMIC_REPLACE("atomic-replace"),
+        NON_ATOMIC_REPLACE("non-atomic-replace");
+
+        private final String receiptValue;
+
+        MoveOutcome(String receiptValue) {
+            this.receiptValue = receiptValue;
+        }
+
+        String receiptValue() {
+            return receiptValue;
+        }
     }
 
     private static final MoveStrategy FILESYSTEM_MOVE = (temporary, target, atomic) -> {
@@ -109,14 +125,88 @@ final class ArtifactWriter {
         write(target, temporary -> Files.writeString(temporary, value, charset));
     }
 
-    private static void moveIntoPlace(Path temporary, Path target, MoveStrategy mover)
+    /**
+     * Copy a complete staged artifact into a caller-declared sibling temporary without
+     * replacing the target. Verify uses this to prepare an entire baseline set before
+     * the first replacement and to keep every commit temporary in its preflight graph.
+     */
+    static void prepareCopy(Path source, Path temporary, Path target) throws IOException {
+        Objects.requireNonNull(source, "source");
+        Objects.requireNonNull(temporary, "temporary");
+        Objects.requireNonNull(target, "target");
+        Path commitTarget = resolveWriteTarget(target);
+        Path normalizedTemporary = temporary.toAbsolutePath().normalize();
+        if (!Objects.equals(normalizedTemporary.getParent(), commitTarget.getParent())) {
+            throw new IOException("commit temporary must be a sibling of its target: "
+                + temporary + " vs " + target);
+        }
+        if (!Files.isRegularFile(source, LinkOption.NOFOLLOW_LINKS)) {
+            throw new IOException("staged artifact is not a regular file: " + source);
+        }
+        Set<PosixFilePermission> permissions = existingPosixPermissions(commitTarget);
+        boolean created = false;
+        boolean complete = false;
+        try {
+            if (permissions != null) {
+                Files.createFile(normalizedTemporary,
+                    PosixFilePermissions.asFileAttribute(permissions));
+            } else if (Files.getFileStore(commitTarget.getParent())
+                    .supportsFileAttributeView("posix")) {
+                Files.createFile(normalizedTemporary,
+                    PosixFilePermissions.asFileAttribute(
+                        PosixFilePermissions.fromString("rw-------")));
+            } else {
+                Files.createFile(normalizedTemporary);
+            }
+            created = true;
+            try (var input = Files.newInputStream(source);
+                 var output = Files.newOutputStream(normalizedTemporary)) {
+                input.transferTo(output);
+            }
+            complete = true;
+        } finally {
+            if (created && !complete) {
+                try {
+                    Files.deleteIfExists(normalizedTemporary);
+                } catch (IOException ignored) {
+                    // Preserve the copy failure.
+                }
+            }
+        }
+    }
+
+    static MoveOutcome commitPrepared(Path temporary, Path target) throws IOException {
+        return commitPrepared(temporary, target, FILESYSTEM_MOVE);
+    }
+
+    /** Package-private move seam for verify's fallback and partial-commit discriminators. */
+    static MoveOutcome commitPrepared(Path temporary, Path target, MoveStrategy mover)
+            throws IOException {
+        Objects.requireNonNull(temporary, "temporary");
+        Objects.requireNonNull(target, "target");
+        Objects.requireNonNull(mover, "mover");
+        Path commitTarget = resolveWriteTarget(target);
+        Path normalizedTemporary = temporary.toAbsolutePath().normalize();
+        if (!Files.isRegularFile(normalizedTemporary, LinkOption.NOFOLLOW_LINKS)) {
+            throw new IOException("commit temporary is not a regular file: " + temporary);
+        }
+        if (!Objects.equals(normalizedTemporary.getParent(), commitTarget.getParent())) {
+            throw new IOException("commit temporary must be a sibling of its target: "
+                + temporary + " vs " + target);
+        }
+        return moveIntoPlace(normalizedTemporary, commitTarget, mover);
+    }
+
+    private static MoveOutcome moveIntoPlace(Path temporary, Path target, MoveStrategy mover)
             throws IOException {
         try {
             mover.move(temporary, target, true);
+            return MoveOutcome.ATOMIC_REPLACE;
         } catch (AtomicMoveNotSupportedException unsupported) {
             // The artifact is still complete before this fallback begins, but
             // replacement itself is not guaranteed atomic on this filesystem.
             mover.move(temporary, target, false);
+            return MoveOutcome.NON_ATOMIC_REPLACE;
         }
     }
 
