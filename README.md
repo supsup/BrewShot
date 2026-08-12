@@ -116,6 +116,7 @@ WebSocket client since 11. BrewShot is those messages, wrapped well:
 | `Emulation.setEmulatedMedia` | `colorScheme("dark"\|"light")` · `media("print"\|"screen")` · `reducedMotion("reduce")` |
 | `Emulation.setTimezoneOverride` | `timezone("Asia/Tokyo")` — applied before navigation and proved from page `Intl` after load |
 | `Emulation.setDeviceMetricsOverride` | `launch(width, height, dpr)` — true page-visible DPR, proved after every load |
+| `Emulation.setEmulatedVisionDeficiency` | capture-scoped PNG `screenshot(path, VisionDeficiency)` / `screenshotClip(…, VisionDeficiency)` — cleared after the one shot |
 | `Input.dispatchMouseEvent` | `mouse(x,y)` · `click(x,y)` / `click("css")` · `hover("css")` — real trusted input |
 | + JDK ImageIO | `recordGif(rect…)` · `recordGifElement("css", …)` · `recordGifScroll(…)` · `recordGifFullPage(…, scale, …)` · `recordGifRegion(0.5, 1.0, …)` |
 
@@ -360,6 +361,41 @@ The CLI form is `--dpr N`. With `--json`, the sidecar adds requested and page-ve
 omitting the flag preserves the legacy JSON shape. Fractional DPR is deferred until its composition
 with `--scale` has a documented pixel-rounding policy. Verify-manifest DPR is likewise intentionally
 outside this first slice.
+
+## Preview a recognized vision deficiency in one PNG
+
+`--vision-deficiency` asks Chrome to render one PNG preview under a recognized
+color-vision-deficiency emulation. It is a visual preview—not an accessibility assessment, WCAG
+or contrast verdict, medical claim, diagnosis, or remediation recommendation. The bounded values
+are `none`, `achromatopsia`, `deuteranopia`, `protanopia`, and `tritanopia`; spelling and case are
+strict. Chrome's best-effort `blurredVision` and `reducedContrast` modes are intentionally outside
+this contract.
+
+```bash
+brewshot page.html -o deuteranopia.png --vision-deficiency deuteranopia
+brewshot page.html -o achromatopsia.png --vision-deficiency achromatopsia \
+  --json achromatopsia.json
+```
+
+The library surface is capture-scoped rather than a sticky setter:
+
+```java
+try (BrewShot shot = BrewShot.launch()) {
+    shot.open("https://example.com");
+    shot.screenshot(Path.of("preview.png"),
+        BrewShot.VisionDeficiency.PROTANOPIA);
+    // The preview was cleared in finally; this is an ordinary PNG again.
+    shot.screenshot(Path.of("ordinary.png"));
+}
+```
+
+V1 refuses JPEG, PDF, GIF, and recorder outputs before Chrome or artifact creation. It works with
+full-page, scaled, selector, and direct-clip PNG stills, applies immediately before the one capture,
+and clears to `none` in `finally`, including when capture fails. When `--json` is supplied, the
+receipt records `kind: emulated-preview`, the requested mode, and that Chrome accepted the command.
+It deliberately never says `applied`: CDP returns no page-visible or per-artifact witness, and a
+naturally grayscale subject cannot prove the transform from its own pixels. Omission preserves the
+legacy JSON shape.
 
 ## Compare two shots — a citable verdict, not an eyeball job
 

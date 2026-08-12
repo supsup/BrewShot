@@ -13,7 +13,7 @@ import java.util.Map;
 import javax.imageio.ImageIO;
 import org.junit.jupiter.api.Test;
 
-/** Raw-CDP gate for the vision-deficiency preview plan; production API deliberately absent. */
+/** Raw-CDP gate kept independent of the production preview API so it cannot prove itself. */
 class BrewShotVisionDeficiencySpikeTest {
 
     private static final String SWATCH_PAGE = """

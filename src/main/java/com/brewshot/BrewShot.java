@@ -2581,6 +2581,77 @@ public final class BrewShot implements AutoCloseable {
     public enum ImageFormat { PNG, JPEG }
 
     /**
+     * Chrome's medically recognized color-vision-deficiency emulations plus the explicit
+     * no-emulation control. The two best-effort CDP values ({@code blurredVision} and
+     * {@code reducedContrast}) are deliberately absent: this API is a visual preview of the
+     * bounded V1 set, not an accessibility or medical assessment.
+     */
+    public enum VisionDeficiency {
+        NONE("none"),
+        ACHROMATOPSIA("achromatopsia"),
+        DEUTERANOPIA("deuteranopia"),
+        PROTANOPIA("protanopia"),
+        TRITANOPIA("tritanopia");
+
+        private final String cdpValue;
+
+        VisionDeficiency(String cdpValue) {
+            this.cdpValue = cdpValue;
+        }
+
+        /** Exact case-sensitive value accepted by CDP and the BrewShot CLI. */
+        public String cdpValue() {
+            return cdpValue;
+        }
+
+        /** Strict parser: misspellings and case changes refuse instead of silently degrading. */
+        public static VisionDeficiency fromCdpValue(String value) {
+            for (VisionDeficiency deficiency : values()) {
+                if (deficiency.cdpValue.equals(value)) {
+                    return deficiency;
+                }
+            }
+            throw new IllegalArgumentException("vision deficiency wants "
+                + "none|achromatopsia|deuteranopia|protanopia|tritanopia, got: " + value);
+        }
+    }
+
+    @FunctionalInterface
+    interface CaptureOperation<T> {
+        T capture() throws IOException;
+    }
+
+    /**
+     * Apply one vision preview immediately before one PNG capture and clear it in {@code finally}.
+     * Package visibility is intentional: browser tests inject a failing capture operation to
+     * prove cleanup without adding sticky state or a public setter.
+     */
+    <T> T captureWithVisionDeficiency(VisionDeficiency deficiency,
+                                      CaptureOperation<T> capture) throws IOException {
+        Objects.requireNonNull(deficiency, "deficiency");
+        Objects.requireNonNull(capture, "capture");
+        command("Emulation.setEmulatedVisionDeficiency",
+            "{\"type\":\"" + deficiency.cdpValue() + "\"}");
+        Throwable primaryFailure = null;
+        try {
+            return capture.capture();
+        } catch (IOException | RuntimeException | Error failure) {
+            primaryFailure = failure;
+            throw failure;
+        } finally {
+            try {
+                command("Emulation.setEmulatedVisionDeficiency", "{\"type\":\"none\"}");
+            } catch (RuntimeException | Error cleanupFailure) {
+                if (primaryFailure != null) {
+                    primaryFailure.addSuppressed(cleanupFailure);
+                } else {
+                    throw cleanupFailure;
+                }
+            }
+        }
+    }
+
+    /**
      * The CDP {@code Page.captureScreenshot} format+quality JSON fragment for a
      * format selector — {@code "format":"png"} or {@code "format":"jpeg","quality":N}.
      * Fails loud with {@link IllegalArgumentException} when a JPEG quality is
@@ -2599,6 +2670,17 @@ public final class BrewShot implements AutoCloseable {
     /** Full-page PNG (beyond the viewport), written to the given path. */
     public void screenshot(Path out) throws IOException {
         screenshot(out, ImageFormat.PNG, 0);
+    }
+
+    /**
+     * One full-page PNG under a capture-scoped vision-deficiency preview. The emulation is
+     * cleared to {@link VisionDeficiency#NONE} even when capture or artifact writing fails.
+     */
+    public void screenshot(Path out, VisionDeficiency deficiency) throws IOException {
+        captureWithVisionDeficiency(deficiency, () -> {
+            screenshot(out);
+            return null;
+        });
     }
 
     /**
@@ -2732,6 +2814,16 @@ public final class BrewShot implements AutoCloseable {
      */
     public byte[] screenshotClip(double x, double y, double width, double height, double scale) {
         return screenshotClip(x, y, width, height, scale, ImageFormat.PNG, 0);
+    }
+
+    /**
+     * One clipped PNG under a capture-scoped vision-deficiency preview. This overload cannot
+     * select JPEG, GIF, PDF, or a recorder family by construction.
+     */
+    public byte[] screenshotClip(double x, double y, double width, double height, double scale,
+                                 VisionDeficiency deficiency) throws IOException {
+        return captureWithVisionDeficiency(deficiency,
+            () -> screenshotClip(x, y, width, height, scale, ImageFormat.PNG, 0));
     }
 
     /**
