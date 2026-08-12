@@ -498,6 +498,37 @@ restart, and multiple workers may share the same mounts. Set
 > One-shot CLI input can remain read-only. Details:
 > [SLOWSTART](SLOWSTART.md) Scenario 5.
 
+> [!WARNING]
+> **What BrewShot writes, you may not be able to read.** Outputs are created
+> owner-only — mode `0600`, owned by `10001:10001` — so on Linux a host process
+> with a different UID cannot open them *even though the capture succeeded*.
+> Measured, not inferred: after a container capture, `ls -l` shows
+> `-rw------- 1 10001 10001 5116 shot.png` and a `cat` from UID 1001 answers
+> `Permission denied`. The bytes are there and they are correct.
+>
+> This is the awkward failure mode, because every symptom points away from the
+> cause: the file exists, `stat` works, the size is right, and `file(1)` says
+> "regular file, no read permission" rather than anything about the capture. In
+> CI it surfaces as a step that "produced no usable output" long after the step
+> that actually produced it.
+>
+> Two ways through, and pick deliberately:
+>
+> - **Run as yourself** — `--user "$(id -u):$(id -g)"`. The output lands owned by
+>   you and every later step reads it normally. Requires the bind folders to be
+>   writable by that UID.
+> - **Read it back through a container**, when running as the image's own user is
+>   what you want (it is the safer default, and it is what CI does):
+>
+>   ```bash
+>   docker run --rm --user 0:0 --volume "$PWD/out:/verify:ro" \
+>     --entrypoint /bin/sh brewshot:local -c 'cat /verify/shot.png' > shot.png
+>   ```
+>
+> The same applies to *every* artifact BrewShot writes, including diff heatmaps,
+> verify receipts and any future sidecar — the permission is a property of the
+> writer, not of the file type.
+
 Rolling your own image: install `chromium` + fonts (`fonts-liberation`,
 `fonts-dejavu-core`), set `BREWSHOT_CHROME=/usr/bin/chromium` and
 `BREWSHOT_CHROME_ARGS="--no-sandbox --disable-dev-shm-usage"` — scope

@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **Documented that BrewShot's outputs are owner-only, and how to read them.** The
+  README explained at length which permissions the *input* side needs and said
+  nothing about the output side: captures are written mode `0600` owned by
+  `10001:10001`, so on Linux a host process with a different UID cannot open a file
+  that exists, is the right size, and contains a correct PNG. Every symptom points
+  away from the cause, and in CI it surfaces as a later step "producing no usable
+  output". The warning now states the property, shows the measured
+  `-rw------- 1 10001 10001` plus the `Permission denied` a UID-1001 read gets, and
+  gives both remedies — run as yourself with `--user`, or read the artifact back
+  through a container — noting that it applies to every artifact BrewShot writes,
+  not just PNGs. Documentation only; no behaviour changed.
+
 - **The folder worker's concurrency now has behavioural coverage in CI** (plan
   4124aab6). `docker/smoke-test.sh` — the only test that exercises
   `BrewShotFolderWorker`'s file locks, atomic-rename claims, collision handling
