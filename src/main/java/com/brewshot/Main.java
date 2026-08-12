@@ -92,6 +92,7 @@ public final class Main {
         String mediaType = null;
         String timezone = null;
         Integer devicePixelRatio = null;
+        BrewShot.VisionDeficiency visionDeficiency = null;
         boolean reducedMotion = false;
         int gifFrames = 0;
         boolean gifSet = false;     // explicit flag, NOT a 0-sentinel: `--gif 0` must refuse
@@ -160,6 +161,8 @@ public final class Main {
                 }
                 case "--dpr" -> devicePixelRatio = boundedInt(
                     "--dpr", requireValue(args, ++i), 1, 4);
+                case "--vision-deficiency" -> visionDeficiency =
+                    BrewShot.VisionDeficiency.fromCdpValue(requireValue(args, ++i));
                 case "--reduced-motion" -> reducedMotion = true;
                 case "--gif" -> { gifFrames = posInt("--gif", requireValue(args, ++i)); gifSet = true; }
                 case "--gif-delay" -> {
@@ -234,6 +237,10 @@ public final class Main {
         }
         if (jpegQualitySet && !jpegOut) {
             return err("--jpeg-quality applies only to .jpg/.jpeg still outputs");
+        }
+        if (visionDeficiency != null && (gifSet || pdfOut || jpegOut)) {
+            return err("--vision-deficiency is a PNG still-preview only; it cannot apply to "
+                + (gifSet ? "GIF recording" : pdfOut ? "PDF output" : "JPEG output"));
         }
         if ((pageDiagnostics || failPageErrors || failConsoleErrors)
                 && jsonManifest == null) {
@@ -342,11 +349,17 @@ public final class Main {
                     System.err.println("brewshot: " + e.getMessage());
                     return 1;
                 }
-                ArtifactWriter.writeBytes(out, shot.screenshotClip(
-                    Math.max(0, b[0] - clipPadding), Math.max(0, b[1] - clipPadding),
-                    b[2] + 2 * clipPadding, b[3] + 2 * clipPadding, scale,
-                    jpegOut ? BrewShot.ImageFormat.JPEG : BrewShot.ImageFormat.PNG,
-                    jpegOut ? jpegQuality : 0));
+                double x = Math.max(0, b[0] - clipPadding);
+                double y = Math.max(0, b[1] - clipPadding);
+                double captureWidth = b[2] + 2 * clipPadding;
+                double captureHeight = b[3] + 2 * clipPadding;
+                byte[] capture = visionDeficiency == null
+                    ? shot.screenshotClip(x, y, captureWidth, captureHeight, scale,
+                        jpegOut ? BrewShot.ImageFormat.JPEG : BrewShot.ImageFormat.PNG,
+                        jpegOut ? jpegQuality : 0)
+                    : shot.screenshotClip(
+                        x, y, captureWidth, captureHeight, scale, visionDeficiency);
+                ArtifactWriter.writeBytes(out, capture);
             } else if (clipJs != null) {
                 Object r = shot.eval(clipJs);
                 Object x = MiniJson.get(r, "x"), y = MiniJson.get(r, "y");
@@ -355,11 +368,17 @@ public final class Main {
                         || !(w instanceof Double) || !(h instanceof Double)) {
                     return err("--clip-js must return {x,y,w,h} (page coordinates), got: " + r);
                 }
-                ArtifactWriter.writeBytes(out, shot.screenshotClip(
-                    Math.max(0, (Double) x - clipPadding), Math.max(0, (Double) y - clipPadding),
-                    (Double) w + 2 * clipPadding, (Double) h + 2 * clipPadding, scale,
-                    jpegOut ? BrewShot.ImageFormat.JPEG : BrewShot.ImageFormat.PNG,
-                    jpegOut ? jpegQuality : 0));
+                double captureX = Math.max(0, (Double) x - clipPadding);
+                double captureY = Math.max(0, (Double) y - clipPadding);
+                double captureWidth = (Double) w + 2 * clipPadding;
+                double captureHeight = (Double) h + 2 * clipPadding;
+                byte[] capture = visionDeficiency == null
+                    ? shot.screenshotClip(captureX, captureY, captureWidth, captureHeight, scale,
+                        jpegOut ? BrewShot.ImageFormat.JPEG : BrewShot.ImageFormat.PNG,
+                        jpegOut ? jpegQuality : 0)
+                    : shot.screenshotClip(captureX, captureY, captureWidth, captureHeight, scale,
+                        visionDeficiency);
+                ArtifactWriter.writeBytes(out, capture);
             } else if (scale != 1.0) {
                 // Standalone --scale: clip the full PAGE box (scroll dimensions, not just the
                 // viewport) at scale — crisp full-page stills with zero extra flags. Chrome's
@@ -367,14 +386,23 @@ public final class Main {
                 Object dims = shot.eval("[document.documentElement.scrollWidth,"
                     + "document.documentElement.scrollHeight].join(',')");
                 String[] wh = String.valueOf(dims).split(",");
-                ArtifactWriter.writeBytes(out, shot.screenshotClip(0, 0,
-                    Double.parseDouble(wh[0]), Double.parseDouble(wh[1]), scale,
-                    jpegOut ? BrewShot.ImageFormat.JPEG : BrewShot.ImageFormat.PNG,
-                    jpegOut ? jpegQuality : 0));
+                double captureWidth = Double.parseDouble(wh[0]);
+                double captureHeight = Double.parseDouble(wh[1]);
+                byte[] capture = visionDeficiency == null
+                    ? shot.screenshotClip(0, 0, captureWidth, captureHeight, scale,
+                        jpegOut ? BrewShot.ImageFormat.JPEG : BrewShot.ImageFormat.PNG,
+                        jpegOut ? jpegQuality : 0)
+                    : shot.screenshotClip(
+                        0, 0, captureWidth, captureHeight, scale, visionDeficiency);
+                ArtifactWriter.writeBytes(out, capture);
             } else {
-                shot.screenshot(out,
-                    jpegOut ? BrewShot.ImageFormat.JPEG : BrewShot.ImageFormat.PNG,
-                    jpegOut ? jpegQuality : 0);
+                if (visionDeficiency == null) {
+                    shot.screenshot(out,
+                        jpegOut ? BrewShot.ImageFormat.JPEG : BrewShot.ImageFormat.PNG,
+                        jpegOut ? jpegQuality : 0);
+                } else {
+                    shot.screenshot(out, visionDeficiency);
+                }
             }
             // --fail-js: assert AFTER the screenshot so failures still carry eyes.
             if (failJs != null) {
@@ -391,7 +419,9 @@ public final class Main {
                     System.currentTimeMillis() - t0, gifSet ? gifDelayMs : null,
                     jpegOut ? jpegQuality : null, diagnosticsReceipt,
                     timezone, shot.appliedTimezone(),
-                    devicePixelRatio, shot.appliedDevicePixelRatio());
+                    devicePixelRatio, shot.appliedDevicePixelRatio(),
+                    visionDeficiency == null ? null : visionDeficiency.cdpValue(),
+                    visionDeficiency == null ? null : Boolean.TRUE);
             }
             System.err.println("brewshot: wrote " + out);
         }
@@ -847,6 +877,21 @@ public final class Main {
             PageDiagnosticsReceipt diagnostics, String timezoneRequested,
             String timezoneApplied, Integer dprRequested, Integer dprApplied)
             throws java.io.IOException {
+        writeManifest(manifest, input, mode, width, height, settleMs, waitJs, out,
+            evalResult, failJs, failJsPassed, elapsedMs, requestedGifDelayMs, jpegQuality,
+            diagnostics, timezoneRequested, timezoneApplied, dprRequested, dprApplied,
+            null, null);
+    }
+
+    /** Vision-preview-aware opt-in overload; null values preserve the legacy byte shape. */
+    static void writeManifest(Path manifest, String input, String mode,
+            int width, int height, long settleMs, String waitJs, Path out,
+            Object evalResult, String failJs, boolean failJsPassed, long elapsedMs,
+            Integer requestedGifDelayMs, Integer jpegQuality,
+            PageDiagnosticsReceipt diagnostics, String timezoneRequested,
+            String timezoneApplied, Integer dprRequested, Integer dprApplied,
+            String visionDeficiencyRequested, Boolean visionCommandAccepted)
+            throws java.io.IOException {
         java.util.Map<String, Object> fields = new java.util.LinkedHashMap<>();
         fields.put("input", input);
         fields.put("mode", mode);
@@ -881,6 +926,13 @@ public final class Main {
             dpr.put("requested", dprRequested);
             dpr.put("applied", dprApplied);
             fields.put("dpr", dpr);
+        }
+        if (visionDeficiencyRequested != null) {
+            java.util.Map<String, Object> preview = new java.util.LinkedHashMap<>();
+            preview.put("kind", "emulated-preview");
+            preview.put("requested", visionDeficiencyRequested);
+            preview.put("commandAccepted", visionCommandAccepted);
+            fields.put("visionDeficiency", preview);
         }
         fields.put("brewshot", BrewShot.VERSION);
         ArtifactWriter.writePrivateString(
@@ -1243,6 +1295,10 @@ public final class Main {
               --timezone   IANA timezone ID applied by Chrome and verified from page Intl
               --dpr        page-visible device pixel ratio, integer 1-4; distinct from
                            --scale, which re-rasters the resulting capture
+              --vision-deficiency
+                           none|achromatopsia|deuteranopia|protanopia|tritanopia;
+                           PNG still-preview only, capture-scoped and cleared afterward;
+                           visual emulation, never an accessibility or medical verdict
               --reduced-motion  force prefers-reduced-motion: reduce before capture
               --fail-js    JS assertion; false -> exit 4 (output artifact still written)
               --json       write a machine-readable manifest beside the output

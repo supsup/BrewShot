@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **Capture-scoped PNG vision-deficiency previews** (plan d19eba9f). Library
+  `screenshot(..., VisionDeficiency)` / `screenshotClip(..., VisionDeficiency)` and CLI
+  `--vision-deficiency` support `none`, `achromatopsia`, `deuteranopia`, `protanopia`, and
+  `tritanopia`. A raw-CDP gate first proved Chrome's transformed pixels survive viewport,
+  full-page, and below-fold clip capture. Each preview applies immediately before one PNG and
+  clears to `none` in `finally`; JPEG, PDF, GIF, recorder families, best-effort vision modes,
+  misspellings, and case variants refuse. Opt-in JSON records `emulated-preview`, the request, and
+  CDP command acceptance—never an artifact-level `applied` or accessibility/medical verdict.
 - **True page-visible DPR and Retina capture** (plan 12c7f774). Library
   `launch(width, height, dpr)` and CLI `--dpr N` accept integers 1 through 4, apply
   `Emulation.setDeviceMetricsOverride` once before first content navigation, and witness the exact
