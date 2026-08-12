@@ -329,7 +329,11 @@ final class VerifyRunner {
                 break;
             }
             state.status = "commit-attempting";
+            state.commitAttempted = true;
+            state.commitOutcome = "attempt-intent-recorded";
             if (!writeLedger(prepared, states, batchFailures)) {
+                state.commitAttempted = false;
+                state.commitOutcome = "not-attempted";
                 state.fail(VerifyManifest.FailureCategory.COMMIT,
                     "commit ledger unavailable before replacement");
                 for (int remaining = index + 1; remaining < states.size(); remaining++) {
@@ -337,7 +341,6 @@ final class VerifyRunner {
                 }
                 break;
             }
-            state.commitAttempted = true;
             try {
                 ArtifactWriter.MoveOutcome outcome = mover == null
                     ? ArtifactWriter.commitPrepared(
@@ -428,6 +431,9 @@ final class VerifyRunner {
             System.err.println("brewshot: refusing verify receipt publication after graph drift: "
                 + unsafe.failure().message());
             return;
+        }
+        if (verifyReplacementDigests(prepared, states, batchFailures)) {
+            writeLedger(prepared, states, batchFailures);
         }
         if (!writeInProgressMarker(prepared, states, batchFailures, true)) {
             return;
@@ -571,7 +577,10 @@ final class VerifyRunner {
             ? commitSummary(states) : notApplicableCommitSummary());
         List<Map<String, Object>> failures = new ArrayList<>();
         for (VerifyManifest.Failure failure : batchFailures) {
-            failures.add(failureMap(failure));
+            Map<String, Object> fields = failureMap(failure);
+            if (!failures.contains(fields)) {
+                failures.add(fields);
+            }
         }
         core.put("failures", failures);
         core.put("exit", exit);
@@ -600,7 +609,10 @@ final class VerifyRunner {
             } else if ("replacement-observed-after-error".equals(state.commitOutcome)) {
                 unknownAtomicity++;
                 replaced++;
-            } else if ("indeterminate-after-error".equals(state.commitOutcome)) {
+            } else if ("indeterminate-after-error".equals(state.commitOutcome)
+                    || "attempt-intent-recorded".equals(state.commitOutcome)) {
+                indeterminate++;
+            } else if ("drifted-after-replacement".equals(state.commitOutcome)) {
                 indeterminate++;
             }
             if (state.failure != null
@@ -620,6 +632,49 @@ final class VerifyRunner {
         commit.put("indeterminate", indeterminate);
         commit.put("partial", (replaced > 0 && replaced < states.size()) || indeterminate > 0);
         return commit;
+    }
+
+    private static boolean verifyReplacementDigests(
+            VerifyPreflight.Prepared prepared, List<JobState> states,
+            List<VerifyManifest.Failure> batchFailures) {
+        if (prepared.mode() != VerifyPreflight.Mode.UPDATE) {
+            return false;
+        }
+        boolean drifted = false;
+        for (JobState state : states) {
+            if (!replacementWasObserved(state.commitOutcome)) {
+                continue;
+            }
+            boolean candidateStillPublished;
+            try {
+                candidateStillPublished = state.candidateSha256 != null
+                    && state.candidateSha256.equals(inspectStable(
+                        state.job().baseline()).sha256());
+            } catch (IOException | SecurityException unreadable) {
+                candidateStillPublished = false;
+            }
+            if (candidateStillPublished) {
+                continue;
+            }
+            String message = "baseline drifted after confirmed replacement: "
+                + relative(prepared, state.job().baseline());
+            VerifyManifest.Failure failure = new VerifyManifest.Failure(
+                VerifyManifest.FailureCategory.COMMIT, state.job().id(), message);
+            state.failure = failure;
+            state.status = "commit-drifted";
+            state.commitOutcome = "drifted-after-replacement";
+            drifted = true;
+            if (!batchFailures.contains(failure)) {
+                batchFailures.add(failure);
+            }
+        }
+        return drifted;
+    }
+
+    private static boolean replacementWasObserved(String outcome) {
+        return "atomic-replace".equals(outcome)
+            || "non-atomic-replace".equals(outcome)
+            || "replacement-observed-after-error".equals(outcome);
     }
 
     private static Map<String, Object> notApplicableCommitSummary() {

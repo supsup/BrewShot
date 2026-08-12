@@ -247,6 +247,21 @@ class VerifyRunnerTest {
         assertEquals("in-progress", parsedMarker.get("state"));
         assertNotNull(parsedMarker.get("contentDigest"));
         assertEquals(Boolean.TRUE, parsedMarker.get("contentDigestReady"));
+        Path ledgerPath = directory.resolve(".brewshot-verify-stage-"
+            + parsedMarker.get("attemptId") + "/commit-ledger.json");
+        java.util.Map<String, Object> ledger = jsonMap(ledgerPath);
+        @SuppressWarnings("unchecked")
+        java.util.Map<String, Object> ledgerSummary =
+            (java.util.Map<String, Object>) ledger.get("summary");
+        @SuppressWarnings("unchecked")
+        java.util.List<java.util.Map<String, Object>> ledgerJobs =
+            (java.util.List<java.util.Map<String, Object>>) ledger.get("jobs");
+        java.util.Map<String, Object> second = ledgerJobs.get(1);
+        assertEquals("commit-attempting", second.get("status"));
+        assertEquals(Boolean.TRUE, second.get("attempted"));
+        assertEquals("attempt-intent-recorded", second.get("outcome"));
+        assertEquals(1.0, ledgerSummary.get("replaced"));
+        assertEquals(1.0, ledgerSummary.get("indeterminate"));
     }
 
     @Test
@@ -299,6 +314,64 @@ class VerifyRunnerTest {
         assertTrue(Files.readString(fixture.receiptTwo())
             .contains("baseline changed immediately before replacement"));
         assertTrue(Files.readString(fixture.batchReceipt()).contains("\"partial\": true"));
+    }
+
+    @Test
+    void replacementDriftWhileLaterJobsCommitRefusesAFalseFinalClaim(
+            @TempDir Path directory) throws Exception {
+        Fixture fixture = fixture(directory);
+        byte[] externalOne = pngBytes(Color.GREEN);
+        AtomicInteger replacements = new AtomicInteger();
+        ArtifactWriter.MoveStrategy mutateFirstDuringSecond = (temporary, target, atomic) -> {
+            if (replacements.incrementAndGet() == 2) {
+                Files.write(fixture.baselineOne(), externalOne);
+            }
+            Files.move(temporary, target, StandardCopyOption.ATOMIC_MOVE,
+                StandardCopyOption.REPLACE_EXISTING);
+        };
+        VerifyRunner runner = VerifyRunner.forTest((job, input, output) -> {
+            writePng(output, job.id().equals("one") ? Color.BLUE : Color.RED);
+            return 0;
+        }, mutateFirstDuringSecond);
+
+        int exit = runner.execute(fixture.manifest(), VerifyPreflight.Mode.UPDATE);
+
+        assertEquals(1, exit);
+        assertArrayEquals(externalOne, Files.readAllBytes(fixture.baselineOne()));
+        java.util.Map<String, Object> batch = jsonMap(fixture.batchReceipt());
+        assertEquals("complete", batch.get("state"));
+        String receipt = Files.readString(fixture.receiptOne());
+        assertTrue(receipt.contains("\"status\": \"commit-drifted\""));
+        assertTrue(receipt.contains("baseline drifted after confirmed replacement"));
+        assertTrue(receipt.contains("\"outcome\": \"drifted-after-replacement\""));
+        String batchText = Files.readString(fixture.batchReceipt());
+        assertTrue(batchText.contains("\"replaced\": 1"));
+        assertTrue(batchText.contains("\"indeterminate\": 1"));
+        assertTrue(batchText.contains("\"partial\": true"));
+    }
+
+    @Test
+    void updateValidationFailureAppearsOnceInTheBatchFailureList(
+            @TempDir Path directory) throws Exception {
+        Fixture fixture = fixture(directory);
+        VerifyRunner runner = VerifyRunner.forTest((job, input, output) -> {
+            Files.writeString(output, "not an image");
+            return 0;
+        }, null);
+
+        int exit = runner.execute(fixture.manifest(), VerifyPreflight.Mode.UPDATE);
+
+        assertEquals(1, exit);
+        java.util.Map<String, Object> batch = jsonMap(fixture.batchReceipt());
+        @SuppressWarnings("unchecked")
+        java.util.Map<String, Object> core =
+            (java.util.Map<String, Object>) batch.get("deterministicCore");
+        @SuppressWarnings("unchecked")
+        java.util.List<java.util.Map<String, Object>> failures =
+            (java.util.List<java.util.Map<String, Object>>) core.get("failures");
+        assertEquals(1, failures.size());
+        assertEquals("captured baseline candidates failed image validation",
+            failures.get(0).get("message"));
     }
 
     @Test
