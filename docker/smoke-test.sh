@@ -175,6 +175,23 @@ wait_for_log() {
     done
 }
 
+# mkdir -p a path whose PARENT may already be worker-owned, and set its mode, in one hop.
+#
+# The host cannot create a subdirectory inside a directory the worker made: by the time the
+# restart-recovery phase runs, `processing/` exists and is owned by UID 10001, so a plain
+# `mkdir -p` fails with permission denied BEFORE any chmod could help. Ordering a chmod first
+# does not fix it either — the chmod has the same problem for the same reason. Doing both from
+# inside a container removes the host's need for any privilege over the tree at all.
+container_mkdir() {
+    _mk_mode=$1
+    _mk_path=$2
+    _mk_parent=$(dirname "$_mk_path")
+    docker run --rm --user 0:0 --volume "$_mk_parent:/target" --entrypoint /bin/sh "$image" \
+        -c "mkdir -p '/target/$(basename "$_mk_path")' \
+            && chmod $_mk_mode '/target' '/target/$(basename "$_mk_path")'" >/dev/null 2>&1 \
+        || fail "could not create $_mk_path with mode $_mk_mode (container-side)"
+}
+
 # chmod a path that may ALREADY be worker-owned, from inside a container that can.
 #
 # The host creates most of these directories, but a worker may have created them first — it
@@ -394,7 +411,7 @@ step "restart recovery of a UUID claim directory"
 # Restart recovery consumes a valid UUID claim directory and leaves unrelated
 # processing entries alone.
 recovery_id=0123456789abcdef0123456789abcdef
-mkdir -p "$input/processing/$recovery_id"
+container_mkdir 0777 "$input/processing/$recovery_id"
 # MEASURED ON LINUX, NOT ASSUMED (plan 4124aab6). `mkdir -p` creates the INTERMEDIATE and
 # INNERMOST directories at the caller's UMASK -- 0755 under the default 0022 -- and only the
 # path we chmod explicitly gets 0777. The image runs as USER 10001:10001, so on Linux, where a
@@ -403,7 +420,7 @@ mkdir -p "$input/processing/$recovery_id"
 # UIDs, so the same script passes and the defect is invisible. Every other directory in this
 # file is already chmod'd for exactly this reason; these two were created inside a phase rather
 # than in the setup block and were missed.
-container_chmod 0777 "$input/processing" "$input/processing/$recovery_id"
+# (modes set by container_mkdir above — the host never needed privilege here)
 write_html "$input/processing/$recovery_id/recovered.html" 'Recovered' '#ede9fe'
 printf '%s\n' 'not a claim' > "$input/processing/keep-me.txt"
 docker run -d --name "$watch_recovery" \
