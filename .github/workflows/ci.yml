@@ -106,9 +106,12 @@ jobs:
       #
       # LOAD-BEARING, PROVEN RATHER THAN ASSUMED: with the atomic claim mutated to a
       # non-atomic copy (`Files.copy` for `Files.move(..., ATOMIC_MOVE)` at
-      # BrewShotFolderWorker.java:199) the script exits 1 and names the phase "two workers
-      # sharing one mount converge on one success". Clean image exits 0. A green step here
-      # therefore means something.
+      # BrewShotFolderWorker.java:199) the script RELIABLY exits 1; the clean image exits 0.
+      # Which invariant trips first is TIMING-DEPENDENT — observed at both the single-worker
+      # backlog phase and the two-worker convergence phase across runs (Fixpoint reproduced
+      # 2/2 and got a different phase each time). So a red run here names a real defect but
+      # not a fixed site; do not treat one phase name as the signature. A green step means
+      # something regardless, which is the property that matters.
       # Worker logs on failure are dumped by the SCRIPT's own trap, not by a follow-on step
       # here: cleanup() removes the worker containers on exit, so a separate `if: failure()`
       # step would run after they are gone and print nothing — a diagnostic that reports
