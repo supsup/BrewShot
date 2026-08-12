@@ -19,9 +19,9 @@ import java.util.Locale;
  *   brewshot ./fx.html --gif 40 --gif-element ".lx-math" -o fx.gif   # film an element
  * </pre>
  *
- * Exit codes: 0 ok · 2 bad arguments · 3 no Chrome found · 4 --fail-js
- * assertion failed (output artifact still written) or a `diff` gate exceeded
- * (verdict still written) · 1 runtime failure.
+ * Exit codes: 0 ok · 2 bad arguments · 3 no Chrome found · 4 an observed
+ * assertion/page/diff gate failed after its artifacts were written · 5 requested
+ * page diagnostics were incomplete after their artifacts were written · 1 runtime failure.
  * Note: the {@code --gif} lane and `diff` are library/jar-path (ImageIO/AWT is
  * not yet supported by native-image on macOS — the CLI refuses/reports this
  * loudly rather than half-working); the PNG shoot path is native-clean.
@@ -83,6 +83,9 @@ public final class Main {
         double clipPadding = 0;
         String failJs = null;
         Path jsonManifest = null;
+        boolean pageDiagnostics = false;
+        boolean failPageErrors = false;
+        boolean failConsoleErrors = false;
         java.util.List<String[]> cookies = new java.util.ArrayList<>();
         java.util.List<String[]> headers = new java.util.ArrayList<>();
         String colorScheme = null;
@@ -122,6 +125,9 @@ public final class Main {
                 case "--clip-padding" -> clipPadding = nonNegDouble("--clip-padding", requireValue(args, ++i));
                 case "--fail-js" -> failJs = requireValue(args, ++i);
                 case "--json" -> jsonManifest = Path.of(requireValue(args, ++i));
+                case "--page-diagnostics" -> pageDiagnostics = true;
+                case "--fail-page-errors" -> failPageErrors = true;
+                case "--fail-console-errors" -> failConsoleErrors = true;
                 case "--jpeg-quality" -> {
                     jpegQuality = boundedInt(
                         "--jpeg-quality", requireValue(args, ++i), 1, 100);
@@ -219,6 +225,11 @@ public final class Main {
         if (jpegQualitySet && !jpegOut) {
             return err("--jpeg-quality applies only to .jpg/.jpeg still outputs");
         }
+        if ((pageDiagnostics || failPageErrors || failConsoleErrors)
+                && jsonManifest == null) {
+            return err("--page-diagnostics/--fail-page-errors/--fail-console-errors require "
+                + "an explicit --json PATH (no implicit diagnostics sidecar is created)");
+        }
         // Raster-only flags cannot be honored on the paged PDF path, and the .pdf branch runs
         // FIRST, so they would be silently ignored — a full-page PDF where the caller asked for a
         // crop. BrewShot output is review evidence, so refuse LOUDLY (exit 2) rather than emit a
@@ -262,6 +273,7 @@ public final class Main {
         long t0 = System.currentTimeMillis();
         Object evalResult = null;
         boolean failJsPassed = true;
+        PageDiagnosticsReceipt diagnosticsReceipt = null;
         try (BrewShot shot = BrewShot.launch(width, height)) {
             for (String[] h : headers) { shot.header(h[0], h[1]); }
             for (String[] c : cookies) { shot.cookie(c[0], c[1], c[2]); }
@@ -356,11 +368,15 @@ public final class Main {
                 Object ok = shot.eval("!!(" + failJs + ")");
                 failJsPassed = Boolean.TRUE.equals(ok);
             }
+            if (pageDiagnostics || failPageErrors || failConsoleErrors) {
+                diagnosticsReceipt = PageDiagnosticsReceipt.capture(
+                    shot, pageDiagnostics, failPageErrors, failConsoleErrors);
+            }
             if (jsonManifest != null) {
                 writeManifest(jsonManifest, input, mode, width, height, settleMs, waitJs,
                     out, evalResult, failJs, failJsPassed,
                     System.currentTimeMillis() - t0, gifSet ? gifDelayMs : null,
-                    jpegOut ? jpegQuality : null);
+                    jpegOut ? jpegQuality : null, diagnosticsReceipt);
             }
             System.err.println("brewshot: wrote " + out);
         }
@@ -368,6 +384,12 @@ public final class Main {
             System.err.println("brewshot: --fail-js assertion FAILED (output artifact still written): "
                 + failJs);
             return 4;
+        }
+        if (diagnosticsReceipt != null && diagnosticsReceipt.exitCode() != 0) {
+            System.err.println("brewshot: page diagnostics " + diagnosticsReceipt.outcome()
+                + " (image and JSON evidence still written)"
+                + diagnosticsReceipt.outcomeDetail());
+            return diagnosticsReceipt.exitCode();
         }
         return 0;
     }
@@ -772,6 +794,18 @@ public final class Main {
             Object evalResult, String failJs, boolean failJsPassed, long elapsedMs,
             Integer requestedGifDelayMs, Integer jpegQuality)
             throws java.io.IOException {
+        writeManifest(manifest, input, mode, width, height, settleMs, waitJs, out,
+            evalResult, failJs, failJsPassed, elapsedMs, requestedGifDelayMs, jpegQuality,
+            null);
+    }
+
+    /** The opt-in overload: a null receipt preserves the legacy manifest byte shape. */
+    static void writeManifest(Path manifest, String input, String mode,
+            int width, int height, long settleMs, String waitJs, Path out,
+            Object evalResult, String failJs, boolean failJsPassed, long elapsedMs,
+            Integer requestedGifDelayMs, Integer jpegQuality,
+            PageDiagnosticsReceipt diagnostics)
+            throws java.io.IOException {
         java.util.Map<String, Object> fields = new java.util.LinkedHashMap<>();
         fields.put("input", input);
         fields.put("mode", mode);
@@ -792,9 +826,135 @@ public final class Main {
         if (jpegQuality != null) {
             fields.put("jpegQuality", jpegQuality);
         }
+        if (diagnostics != null) {
+            fields.put("pageDiagnostics", diagnostics.toJson());
+        }
         fields.put("brewshot", BrewShot.VERSION);
-        ArtifactWriter.writeString(
+        ArtifactWriter.writePrivateString(
             manifest, MiniJson.stringifyPretty(fields) + "\n", StandardCharsets.UTF_8);
+    }
+
+    /**
+     * One bounded snapshot of the two library logs after capture and before manifest
+     * publication. The library's historical {@code errors()} list intentionally contains both
+     * {@code console.error} and uncaught page exceptions; the stable prefixes written at the CDP
+     * seam let the two opt-in gates classify that one bounded source without introducing a
+     * second accumulator or claiming a cross-stream total order.
+     */
+    record PageDiagnosticsReceipt(
+            java.util.List<String> console,
+            long consoleDropped,
+            java.util.List<String> errors,
+            long errorsDropped,
+            boolean includeText,
+            boolean failPageErrors,
+            boolean failConsoleErrors) {
+
+        PageDiagnosticsReceipt {
+            console = java.util.List.copyOf(console);
+            errors = java.util.List.copyOf(errors);
+            if (consoleDropped < 0 || errorsDropped < 0) {
+                throw new IllegalArgumentException("diagnostics drop counters must be non-negative");
+            }
+        }
+
+        static PageDiagnosticsReceipt capture(BrewShot shot, boolean includeText,
+                boolean failPageErrors, boolean failConsoleErrors) {
+            BrewShot.DiagnosticsSnapshot snapshot = shot.diagnosticsSnapshot();
+            return new PageDiagnosticsReceipt(
+                snapshot.console(), snapshot.consoleDropped(),
+                snapshot.errors(), snapshot.errorsDropped(),
+                includeText, failPageErrors, failConsoleErrors);
+        }
+
+        private long pageErrorCount() {
+            return errors.stream().filter(e -> e.startsWith("uncaught: ")).count();
+        }
+
+        private long consoleErrorCount() {
+            return errors.stream().filter(e -> e.startsWith("console.error: ")).count();
+        }
+
+        private String pageGateStatus() {
+            return gateStatus(failPageErrors, pageErrorCount());
+        }
+
+        private String consoleGateStatus() {
+            return gateStatus(failConsoleErrors, consoleErrorCount());
+        }
+
+        private String gateStatus(boolean requested, long observed) {
+            if (!requested) return "not-requested";
+            if (observed > 0) return "failed";
+            // Both error classes share the library's one bounded errorLog. A dropped entry is
+            // therefore relevant to either negative claim: absent retained evidence cannot prove
+            // which class was dropped, so the only honest result is inconclusive.
+            return errorsDropped > 0 ? "inconclusive" : "passed";
+        }
+
+        String outcome() {
+            if ("failed".equals(pageGateStatus()) || "failed".equals(consoleGateStatus())) {
+                return "failed";
+            }
+            if ("inconclusive".equals(pageGateStatus())
+                    || "inconclusive".equals(consoleGateStatus())
+                    || (includeText && (consoleDropped > 0 || errorsDropped > 0))) {
+                return "inconclusive";
+            }
+            return (failPageErrors || failConsoleErrors) ? "passed" : "complete";
+        }
+
+        int exitCode() {
+            return switch (outcome()) {
+                case "failed" -> 4;
+                case "inconclusive" -> 5;
+                default -> 0;
+            };
+        }
+
+        String outcomeDetail() {
+            java.util.List<String> names = new java.util.ArrayList<>();
+            if ("failed".equals(pageGateStatus())) names.add("--fail-page-errors");
+            if ("failed".equals(consoleGateStatus())) names.add("--fail-console-errors");
+            if ("inconclusive".equals(pageGateStatus())) names.add("--fail-page-errors incomplete");
+            if ("inconclusive".equals(consoleGateStatus())) names.add("--fail-console-errors incomplete");
+            if (names.isEmpty() && "inconclusive".equals(outcome())) {
+                names.add("raw capture incomplete");
+            }
+            return names.isEmpty() ? "" : ": " + String.join(", ", names);
+        }
+
+        java.util.Map<String, Object> toJson() {
+            java.util.Map<String, Object> root = new java.util.LinkedHashMap<>();
+            root.put("consoleCount", console.size());
+            root.put("consoleDropped", consoleDropped);
+            root.put("consoleComplete", consoleDropped == 0);
+            root.put("errorsCount", errors.size());
+            root.put("errorsDropped", errorsDropped);
+            root.put("errorsComplete", errorsDropped == 0);
+            root.put("complete", consoleDropped == 0 && errorsDropped == 0);
+            root.put("pageErrorCount", pageErrorCount());
+            root.put("consoleErrorCount", consoleErrorCount());
+            if (includeText) {
+                root.put("console", console);
+                root.put("errors", errors);
+            }
+
+            java.util.Map<String, Object> gate = new java.util.LinkedHashMap<>();
+            gate.put("pageErrors", pageGateStatus());
+            gate.put("consoleErrors", consoleGateStatus());
+            gate.put("outcome", outcome());
+            java.util.List<String> tripped = new java.util.ArrayList<>();
+            if ("failed".equals(pageGateStatus())) tripped.add("page-errors");
+            if ("failed".equals(consoleGateStatus())) tripped.add("console-errors");
+            java.util.List<String> inconclusive = new java.util.ArrayList<>();
+            if ("inconclusive".equals(pageGateStatus())) inconclusive.add("page-errors");
+            if ("inconclusive".equals(consoleGateStatus())) inconclusive.add("console-errors");
+            gate.put("tripped", tripped);
+            gate.put("inconclusive", inconclusive);
+            root.put("gate", gate);
+            return root;
+        }
     }
 
     private static int posInt(String flag, String v) {
@@ -1030,6 +1190,12 @@ public final class Main {
               --reduced-motion  force prefers-reduced-motion: reduce before capture
               --fail-js    JS assertion; false -> exit 4 (output artifact still written)
               --json       write a machine-readable manifest beside the output
+              --page-diagnostics  include bounded console/error text, drop counters,
+                           completeness, and gate outcome in --json (requires --json)
+              --fail-page-errors  exit 4 after image+JSON on an uncaught page exception
+                           (requires --json; console.error is deliberately separate)
+              --fail-console-errors  exit 4 after image+JSON on console.error
+                           (requires --json; benign third-party noise is caller policy)
               --jpeg-quality  JPEG quality 1-100, only with .jpg/.jpeg output
                            (default 90)
               --gif N      record N frames as a looping GIF instead of a still
@@ -1063,6 +1229,11 @@ public final class Main {
 
             stdin HTML is UTF-8 and capped at 16 MiB. Unknown output extensions
             are refused rather than receiving misnamed PNG bytes.
+
+            Page-diagnostic text is opt-in and bounded by the library's existing
+            console/error ceilings. A relevant dropped entry makes a requested gate
+            inconclusive (exit 5), never clean. The image and private 0600 JSON sidecar
+            are published before exit 4/5, so a lost process status still leaves evidence.
 
             requires a local Chrome/Chromium (or set BREWSHOT_CHROME).""");
     }

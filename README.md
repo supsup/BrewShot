@@ -37,7 +37,10 @@ same-directory replace otherwise), so a failed encode/write cannot leave a
 plausible partial target; temporary residue is cleaned best-effort. The
 fallback preserves the complete-before-replace rule but cannot guarantee
 atomic replacement on a filesystem that does not support `ATOMIC_MOVE`.
-Replacing an existing POSIX target retains its mode bits. A valid output
+Replacing an existing ordinary POSIX target retains its mode bits. Capture
+`--json` sidecars are the deliberate exception: they are forced to owner-only
+`0600` even when replacing a permissive file, because opted-in page text can
+contain application data. A valid output
 symlink remains a symlink and its referent is replaced; broken or cyclic
 output symlinks fail before temporary-file creation. Output aliases are
 rejected before artifacts are written; when either future target is absent,
@@ -49,6 +52,38 @@ of flattening it through `String.valueOf`.
 Direct stdin HTML is capped at 16 MiB and `--eval-file` at 1 MiB (byte caps,
 UTF-8); inputs at the exact cap are accepted and cap+1 is refused before
 decoding.
+
+### Let the CLI hear the page
+
+The library has always retained bounded `console()` and `errors()` evidence.
+The CLI exposes that same storage only when asked, and never invents a sidecar:
+
+```bash
+brewshot page.html -o shot.png --json shot.json --page-diagnostics
+brewshot page.html -o shot.png --json shot.json --fail-page-errors
+brewshot page.html -o shot.png --json shot.json --fail-console-errors
+```
+
+All three flags require an explicit `--json` path before Chrome starts.
+`--page-diagnostics` adds the bounded `console` and `errors` arrays, counts,
+existing drop counters, and completeness to the manifest. The gate-only flags
+record counts/status but do not disclose raw page text. `--fail-page-errors`
+means uncaught page exceptions; it deliberately ignores `console.error`, whose
+often-noisy signal is gated only by the separate `--fail-console-errors` opt-in.
+
+The screenshot and private JSON sidecar are published before a tripped gate
+returns exit 4. If the shared bounded error stream dropped evidence and no
+retained entry already proves failure, the gate is **inconclusive (exit 5)**,
+never clean. Forced raw-diagnostics overflow is likewise exit 5. Drop counters
+are evidence, not decoration. Console and exception arrays each preserve their
+own arrival order; V1 claims no total order across those independent CDP
+streams. Raw strings receive the library's existing entry/UTF-8 byte bounds,
+not general secret redaction.
+
+In the container image, BrewShot runs as fixed UID 10001. A `0600` sidecar may
+therefore be unreadable to a different host UID by design; inspect it through a
+deliberate container-side reader (or explicitly copy/change ownership outside
+BrewShot) rather than weakening the artifact mode.
 
 The `--gif N` lane records N frames as a looping GIF instead of a still —
 `--gif-delay` sets the per-frame cadence (capture == playback, default 40 ms) and

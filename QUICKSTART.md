@@ -139,6 +139,15 @@ brewshot http://localhost:8080/route -o shot.png \
 # unknown -o extensions are rejected (only png, jpg/jpeg, pdf, guarded gif)
 # (--clip-js still exists for computed rects; --clip-selector covers the common case)
 
+# opt-in page voice: raw bounded text + drop/completeness evidence
+brewshot page.html -o shot.png --json shot.json --page-diagnostics
+# independent post-artifact gates (both require --json; no implicit sidecar)
+brewshot page.html -o shot.png --json shot.json --fail-page-errors
+brewshot page.html -o shot.png --json shot.json --fail-console-errors
+# uncaught page errors and console.error are separate signals. Exit 4 means an
+# observed gate failed; exit 5 means the requested bounded evidence was incomplete.
+# Pixels and the private 0600 JSON explanation are written before either exit.
+
 # film it instead of freezing it: N frames as a looping GIF (jar path)
 brewshot ./fx.html --gif 40 -o fx.gif                        # full page
 brewshot ./fx.html --gif 40 --gif-delay 60 --gif-element ".lx-math" -o fx.gif

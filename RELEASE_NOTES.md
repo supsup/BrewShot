@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **Bounded page diagnostics now survive the failure they explain** (plan
+  76ca8437). `--page-diagnostics`, `--fail-page-errors`, and
+  `--fail-console-errors` require an explicit `--json` path before Chrome
+  starts. Raw console/exception text is present only under the first opt-in;
+  gate-only receipts expose bounded counts, exact existing drop counters,
+  completeness, and the selected outcome without disclosing text. Uncaught
+  page exceptions and `console.error` are independently selectable signals.
+  A proven error returns exit 4 only after the image and JSON exist; relevant
+  dropped evidence returns typed inconclusive exit 5 rather than a false clean.
+  Each captured array preserves its own order without inventing a total order
+  across independent CDP streams. Capture sidecars are forced to owner-only
+  `0600` even when replacing a permissive file; Docker smoke proves a different
+  UID cannot read one while the supported deliberate container-side reader can.
 - **The folder worker's concurrency now has behavioural coverage in CI** (plan
   4124aab6). `docker/smoke-test.sh` — the only test that exercises
   `BrewShotFolderWorker`'s file locks, atomic-rename claims, collision handling

@@ -8,11 +8,14 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFileAttributeView;
+import java.nio.file.attribute.PosixFilePermission;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.io.TempDir;
 
 /** The CLI manifest preserves eval's JSON types instead of stringifying them. */
@@ -34,7 +37,35 @@ class MainManifestTest {
             Map<String, Object> root =
                 (Map<String, Object>) MiniJson.parse(Files.readString(manifest));
             assertEquals(values.get(i), root.get("eval"), "top-level eval value " + i);
+            assertFalse(root.containsKey("pageDiagnostics"),
+                "legacy manifests must keep their exact schema when no new flag is present");
         }
+    }
+
+    @Test
+    void captureManifestIsOwnerOnlyEvenWhenReplacingAPermissiveFile(
+            @TempDir Path directory) throws Exception {
+        Path out = directory.resolve("shot.png");
+        Files.write(out, new byte[] {1, 2, 3});
+        Path manifest = directory.resolve("private.json");
+        Files.writeString(manifest, "old-public-content");
+        Assumptions.assumeTrue(
+            Files.getFileAttributeView(manifest, PosixFileAttributeView.class) != null,
+            "filesystem does not expose POSIX permissions");
+        Files.setPosixFilePermissions(manifest, java.util.Set.of(
+            PosixFilePermission.OWNER_READ,
+            PosixFilePermission.OWNER_WRITE,
+            PosixFilePermission.GROUP_READ,
+            PosixFilePermission.OTHERS_READ));
+
+        Main.writeManifest(manifest, "page.html", "file", 640, 480, 25,
+            null, out, null, null, true, 12, null, null);
+
+        assertEquals(java.util.Set.of(
+                PosixFilePermission.OWNER_READ,
+                PosixFilePermission.OWNER_WRITE),
+            Files.getPosixFilePermissions(manifest),
+            "raw page diagnostics may be added later, so every capture sidecar starts private");
     }
 
     @Test
