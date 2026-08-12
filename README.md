@@ -115,6 +115,7 @@ WebSocket client since 11. BrewShot is those messages, wrapped well:
 | `Page.printToPDF` | `pdf(path)` / `pdf(path, PdfOptions)` — the page as a paged, print-fidelity PDF |
 | `Emulation.setEmulatedMedia` | `colorScheme("dark"\|"light")` · `media("print"\|"screen")` · `reducedMotion("reduce")` |
 | `Emulation.setTimezoneOverride` | `timezone("Asia/Tokyo")` — applied before navigation and proved from page `Intl` after load |
+| `Emulation.setDeviceMetricsOverride` | `launch(width, height, dpr)` — true page-visible DPR, proved after every load |
 | `Input.dispatchMouseEvent` | `mouse(x,y)` · `click(x,y)` / `click("css")` · `hover("css")` — real trusted input |
 | + JDK ImageIO | `recordGif(rect…)` · `recordGifElement("css", …)` · `recordGifScroll(…)` · `recordGifFullPage(…, scale, …)` · `recordGifRegion(0.5, 1.0, …)` |
 
@@ -154,6 +155,10 @@ test: the clip rect is CSS px, the output bitmap is exactly `rect × scale`. Tha
 (CSS px, pre-scale), so tight crops don't need a padding div. The same knobs ride the CLI:
 `--clip-selector`, `--scale`, `--clip-padding` — and `--scale` alone re-rasters the full
 page box:
+
+`scale` does **not** change `window.devicePixelRatio`, resolution media queries, responsive-image
+selection, or DPR-aware canvas code. Use launch-time DPR for the page environment; use scale for
+the resulting raster. They compose: DPR 2 with scale 1.5 yields exactly 3× output dimensions.
 
 ```bash
 brewshot page.html -o card.png --clip-selector "#card" --scale 3 --clip-padding 8
@@ -329,6 +334,32 @@ the requested and verified-applied identifier. When the flag is absent, the JSON
 unchanged. Verify manifests accept the same optional `capture.timezone`; successful job receipts
 carry the same requested/applied proof. Blank or Chrome-unsupported identifiers fail before any
 capture artifact is written.
+
+## Render at a true device pixel ratio
+
+Retina-aware pages decide what to render from `window.devicePixelRatio`, resolution media queries,
+responsive images, and canvas backing stores. `launch(width, height, dpr)` makes those page-visible
+signals observe an integer DPR from 1 through 4 while keeping the requested width and height in CSS
+pixels:
+
+```java
+try (BrewShot shot = BrewShot.launch(1280, 900, 2)) {
+    shot.open("https://example.com");
+    System.out.println(shot.appliedDevicePixelRatio()); // 2, witnessed from the loaded page
+    shot.screenshot(Path.of("retina.png"));             // 2560px wide at scale 1
+}
+```
+
+The target-scoped CDP override is applied once before the first content navigation and witnessed
+after every later `open`/`html`. It is deliberately not re-applied: if Chrome ever loses the target
+state, the post-load witness fails before capture instead of hiding the drift. An explicit DPR launch
+omits the otherwise-retained `--force-device-scale-factor=1` browser flag, so two mechanisms never
+compete for one property.
+
+The CLI form is `--dpr N`. With `--json`, the sidecar adds requested and page-verified `dpr` values;
+omitting the flag preserves the legacy JSON shape. Fractional DPR is deferred until its composition
+with `--scale` has a documented pixel-rounding policy. Verify-manifest DPR is likewise intentionally
+outside this first slice.
 
 ## Compare two shots — a citable verdict, not an eyeball job
 
