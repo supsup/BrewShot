@@ -60,6 +60,20 @@ cleanup() {
         echo "brewshot Docker smoke: FAILED during phase: ${current_step}" >&2
         echo "  (exit ${smoke_status}; re-run with \`sh -x docker/smoke-test.sh <image>\` to get" \
              "the exact command)" >&2
+        # The phase name says WHICH property broke; these logs are the workers' own account of
+        # why. Dumped HERE, before the rm below, because that is the only moment they still
+        # exist -- a caller (CI) cannot dump them afterwards, and a diagnostic that runs after
+        # its subject is gone reports nothing while looking like it reported. Whole logs, not a
+        # tail: these workers are short-lived and the interesting line is often the first.
+        for smoke_container in "$watch_one" "$watch_recovery" \
+                "$watch_race_a" "$watch_race_b" "$watch_foreign" \
+                "$watch_unreadable_a" "$watch_unreadable_b" \
+                "$watch_unreadable_c" "$watch_unreadable_d"; do
+            if docker inspect "$smoke_container" >/dev/null 2>&1; then
+                echo "--- worker log: $smoke_container ---" >&2
+                docker logs "$smoke_container" >&2 2>&1 || true
+            fi
+        done
     fi
     docker rm -f "$watch_one" "$watch_recovery" "$watch_race_a" "$watch_race_b" \
         "$watch_foreign" \

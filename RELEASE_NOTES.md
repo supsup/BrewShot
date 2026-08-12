@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- **The folder worker's concurrency now has behavioural coverage in CI** (plan
+  4124aab6). `docker/smoke-test.sh` — the only test that exercises
+  `BrewShotFolderWorker`'s file locks, atomic-rename claims, collision handling
+  and restart recovery — ran nowhere. The Dockerfile compiles that worker, so a
+  compile break was always caught; its concurrency logic had no test on any
+  path. It now runs in the docker job on every push and is **blocking**, never
+  `continue-on-error`: a smoke test wired in but non-blocking reproduces the
+  original gap with extra steps. Measured 52s on a Linux runner, which does not
+  earn a schedule gate. Proven load-bearing rather than assumed — mutating the
+  atomic claim to a non-atomic copy makes the job **reliably exit 1**, while the
+  unmutated image passes. Which invariant trips first is timing-dependent: it has
+  been observed at both the single-worker backlog phase and the two-worker
+  convergence phase across runs, so the gate blocks the defect without promising
+  a fixed failure site. A first attempt at this wiring was reverted after going red on
+  Linux with macOS-only evidence behind it; this one is backed by runs on a
+  genuine Linux daemon.
+- **A failing container smoke now says why, not just where.** The script's
+  failure path dumps each worker's own log before removing the containers.
+  That ordering is the point: cleanup deletes the workers on exit, so a caller
+  — CI included — cannot collect the logs afterwards, and a diagnostic that runs
+  after its subject is gone prints nothing while appearing to have reported.
+  A red run now shows the failing phase *and* the workers' account of it.
 - **AA forgiveness no longer hides hard one-pixel layout movement** (plan
   ac1851a6). The old reciprocal 3×3 color-presence test could classify an
   opaque rectangle translated by one pixel as pure rasterizer noise, report
