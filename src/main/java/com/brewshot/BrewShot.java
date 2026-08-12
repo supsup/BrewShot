@@ -174,6 +174,10 @@ public final class BrewShot implements AutoCloseable {
     private String emulatedColorScheme;   // "dark" | "light" | "no-preference" | null
     private String emulatedMediaType;     // "print" | "screen" | null
     private String emulatedReducedMotion; // "reduce" | "no-preference" | null
+    // Chrome is the timezone authority: no Java/IANA allowlist is consulted. The requested
+    // identifier is sent before every navigation, then proved from the loaded page's Intl view.
+    private String emulatedTimezone;
+    private String appliedTimezone;
     private String sessionId; // null during browser-scope bootstrap, then the tab session
     private int nextId = 1;
     // Network in-flight tracking for waitForNetworkIdle. A SET of live CDP
@@ -1028,8 +1032,15 @@ public final class BrewShot implements AutoCloseable {
 
     /** Launch headless Chrome with the given viewport and attach to a fresh tab. */
     public static BrewShot launch(int width, int height) throws IOException {
+        return launch(width, height, Map.of());
+    }
+
+    /** Package test seam for proving that the unforced browser really follows host TZ. */
+    static BrewShot launch(int width, int height, Map<String, String> environmentOverrides)
+            throws IOException {
         Validation.positiveInt("viewport width", width);
         Validation.positiveInt("viewport height", height);
+        Objects.requireNonNull(environmentOverrides, "environmentOverrides");
         String bin = findChrome();
         if (bin == null) { throw new IllegalStateException("no Chrome binary found"); }
         String refusal = launchContextRefusal(
@@ -1064,7 +1075,7 @@ public final class BrewShot implements AutoCloseable {
         args.add("about:blank");
         ResourceLease lease = startLaunchProcess(
             profile,
-            () -> new ProcessBuilder(args)
+            () -> chromeProcessBuilder(args, environmentOverrides)
                 // Both startup streams are bounded and continuously drained by
                 // the endpoint witness observer below. Chrome versions and
                 // wrappers have published the DevTools line on either stream.
@@ -1083,6 +1094,13 @@ public final class BrewShot implements AutoCloseable {
             throw e;
         }
         return finishLaunch(lease, wsUrl, HTTP_CONNECTOR, envTimeoutMs());
+    }
+
+    private static ProcessBuilder chromeProcessBuilder(
+            List<String> args, Map<String, String> environmentOverrides) {
+        ProcessBuilder builder = new ProcessBuilder(args);
+        builder.environment().putAll(environmentOverrides);
+        return builder;
     }
 
     /**
@@ -2028,6 +2046,7 @@ public final class BrewShot implements AutoCloseable {
             throw new IllegalStateException("navigation to " + url + " failed: " + err);
         }
         waitEvent("Page.loadEventFired", navTimeoutMs);
+        verifyAppliedTimezone();
     }
 
     /**
@@ -2043,6 +2062,7 @@ public final class BrewShot implements AutoCloseable {
         command("Page.setDocumentContent",
             "{\"frameId\":\"" + frameId + "\",\"html\":\"" + MiniJson.esc(source) + "\"}");
         waitEvent("Page.loadEventFired", navTimeoutMs);
+        verifyAppliedTimezone();
     }
 
     /**
@@ -2058,11 +2078,13 @@ public final class BrewShot implements AutoCloseable {
         errorLog.clear();
         inFlightRequestIds.clear();
         lastNetChangeNanos = System.nanoTime();
+        appliedTimezone = null;
         // Re-send any active colorScheme/media/reducedMotion override BEFORE the navigation
         // command below, so the new document paints under it from the first frame — a no-op
         // when none was ever set (plan 02af3a3d: emulation must survive "any new page/navigation
         // the harness opens", not just the page open() was first called on).
         applyEmulatedMedia();
+        applyTimezoneOverride();
     }
 
     /**
@@ -2198,6 +2220,51 @@ public final class BrewShot implements AutoCloseable {
         command("Emulation.setEmulatedMedia",
             "{\"media\":\"" + (emulatedMediaType != null ? emulatedMediaType : "")
                 + "\",\"features\":[" + String.join(",", features) + "]}");
+    }
+
+    /**
+     * Pin the page timezone to a Chrome-supported IANA identifier. Chrome/CDP is deliberately
+     * the authority rather than a Java-side timezone database, so the browser that renders the
+     * page is also the component that accepts or rejects the identifier. The override is sent
+     * immediately and before every later {@link #open}/{@link #html}; each loaded page must then
+     * report the exact identifier through {@code Intl.DateTimeFormat} before capture may proceed.
+     */
+    public BrewShot timezone(String ianaId) {
+        if (ianaId == null || ianaId.isBlank()) {
+            throw new IllegalArgumentException("timezone wants a non-blank IANA identifier");
+        }
+        this.emulatedTimezone = ianaId;
+        this.appliedTimezone = null;
+        applyTimezoneOverride();
+        return this;
+    }
+
+    /** The exact page-visible timezone proved after the most recent navigation, or null. */
+    public String appliedTimezone() {
+        return appliedTimezone;
+    }
+
+    private void applyTimezoneOverride() {
+        if (emulatedTimezone == null) { return; }
+        try {
+            command("Emulation.setTimezoneOverride",
+                "{\"timezoneId\":\"" + MiniJson.esc(emulatedTimezone) + "\"}");
+        } catch (IllegalStateException rejected) {
+            throw new IllegalStateException(
+                "timezone override rejected for " + emulatedTimezone + ": "
+                    + rejected.getMessage(), rejected);
+        }
+    }
+
+    private void verifyAppliedTimezone() {
+        if (emulatedTimezone == null) { return; }
+        Object visible = eval("Intl.DateTimeFormat().resolvedOptions().timeZone");
+        if (!(visible instanceof String actual) || !emulatedTimezone.equals(actual)) {
+            appliedTimezone = null;
+            throw new IllegalStateException("timezone override mismatch: requested "
+                + emulatedTimezone + ", page reported " + visible);
+        }
+        appliedTimezone = actual;
     }
 
     /** Toggle console/error capture (default ON; bounded either way). */

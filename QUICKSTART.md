@@ -71,6 +71,7 @@ List<String> logs = shot.console();   // "log: hello 42" — since last open()/h
 List<String> errs = shot.errors();    // uncaught exceptions + console.error
 assertEquals(List.of(), shot.errors());  // the one-line page-health assertion
 shot.captureConsole(false);           // opt out if you want zero retention
+shot.timezone("Asia/Tokyo");          // page-visible timezone, verified after each navigation
 ```
 
 ## Get past auth

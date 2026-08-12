@@ -91,6 +91,8 @@ class MainCliTest {
         assertEquals(2, Main.run(new String[] {"--color-scheme=dark", "no-such-file.html"}));
         assertEquals(2, Main.run(new String[] {"--media=print", "no-such-file.html"}));
         assertEquals(2, Main.run(new String[] {"--reduced-motion", "no-such-file.html"}));
+        assertEquals(2, Main.run(new String[] {"--timezone", " ", "https://example.com"}));
+        assertEquals(2, Main.run(new String[] {"--timezone=Asia/Tokyo", "no-such-file.html"}));
     }
 
     @Test

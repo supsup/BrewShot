@@ -35,6 +35,7 @@ final class VerifyManifest {
     static final int MAX_PATH_BYTES = 4096;
     static final int MAX_INLINE_JS_BYTES = 64 * 1024;
     static final int MAX_SELECTOR_BYTES = 16 * 1024;
+    static final int MAX_TIMEZONE_BYTES = 256;
     static final int MAX_VIEWPORT_DIMENSION = 16_384;
     static final long MAX_VIEWPORT_PIXELS = 67_108_864L;
     static final long MAX_WAIT_MILLIS = 600_000L;
@@ -51,7 +52,7 @@ final class VerifyManifest {
         "id", "input", "baseline", "receipt", "heatmap", "capture", "diff");
     private static final Set<String> CAPTURE_FIELDS = Set.of(
         "width", "height", "settleMs", "waitJs", "waitTimeoutMs", "clipSelector",
-        "scale", "clipPadding", "colorScheme", "media", "reducedMotion");
+        "scale", "clipPadding", "colorScheme", "media", "timezone", "reducedMotion");
     private static final Set<String> DIFF_FIELDS = Set.of(
         "tolerance", "ignoreAntialiasing", "masks", "failOverPct", "failPixels");
     private static final Set<String> MASK_FIELDS = Set.of("x", "y", "width", "height");
@@ -187,9 +188,10 @@ final class VerifyManifest {
         }
         String colorScheme = optionalEnum(fields, "colorScheme", context, "dark", "light");
         String media = optionalEnum(fields, "media", context, "print", "screen");
+        String timezone = optionalString(fields, "timezone", context, MAX_TIMEZONE_BYTES);
         boolean reducedMotion = optionalBoolean(fields, "reducedMotion", context, false);
         return new CaptureOptions(width, height, settleMs, waitJs, waitTimeoutMs,
-            clipSelector, scale, clipPadding, colorScheme, media, reducedMotion);
+            clipSelector, scale, clipPadding, colorScheme, media, timezone, reducedMotion);
     }
 
     private static DiffOptions parseDiff(Object raw, String context) {
@@ -462,7 +464,7 @@ final class VerifyManifest {
     record CaptureOptions(int width, int height, long settleMs, String waitJs,
                           long waitTimeoutMs, String clipSelector, double scale,
                           double clipPadding, String colorScheme, String media,
-                          boolean reducedMotion) {
+                          String timezone, boolean reducedMotion) {
         CaptureOptions {
             Validation.intRange("verify width", width, 1, MAX_VIEWPORT_DIMENSION);
             Validation.intRange("verify height", height, 1, MAX_VIEWPORT_DIMENSION);
@@ -496,6 +498,7 @@ final class VerifyManifest {
                 throw new IllegalArgumentException(
                     "verify media must be print or screen, got: " + media);
             }
+            requireOptionalBoundedText("verify timezone", timezone, MAX_TIMEZONE_BYTES);
         }
     }
 
