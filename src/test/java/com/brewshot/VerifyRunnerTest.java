@@ -443,6 +443,37 @@ class VerifyRunnerTest {
         }
     }
 
+    @Test
+    @SuppressWarnings("unchecked")
+    void successfulTimezoneCaptureReceiptsCarryRequestedAndVerifiedApplied(
+            @TempDir Path directory) throws Exception {
+        Fixture fixture = fixture(directory);
+        Files.writeString(fixture.manifest(), """
+            {"version":1,"jobs":[
+              {"id":"one","input":"fixtures/one.html","baseline":"baselines/one.png",
+               "receipt":"receipts/one.json","heatmap":"receipts/one.diff.png",
+               "capture":{"timezone":"Asia/Tokyo"}},
+              {"id":"two","input":"fixtures/two.html","baseline":"baselines/two.png",
+               "receipt":"receipts/two.json","heatmap":"receipts/two.diff.png",
+               "capture":{"timezone":"Asia/Tokyo"}}
+            ]}
+            """);
+        VerifyRunner runner = VerifyRunner.forTest((job, input, output) -> {
+            writePng(output, Color.BLUE);
+            return 0;
+        }, null);
+
+        assertEquals(0, runner.execute(fixture.manifest(), VerifyPreflight.Mode.UPDATE));
+
+        java.util.Map<String, Object> core = (java.util.Map<String, Object>)
+            jsonMap(fixture.receiptOne()).get("deterministicCore");
+        java.util.Map<String, Object> capture =
+            (java.util.Map<String, Object>) core.get("capture");
+        assertEquals(java.util.Map.of(
+            "requested", "Asia/Tokyo", "applied", "Asia/Tokyo"),
+            capture.get("timezone"));
+    }
+
     private static Fixture fixture(Path directory) throws Exception {
         Files.createDirectories(directory.resolve("fixtures"));
         Files.writeString(directory.resolve("fixtures/one.html"), "<main>one</main>");

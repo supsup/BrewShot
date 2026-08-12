@@ -123,6 +123,24 @@ class MainManifestTest {
     }
 
     @Test
+    @SuppressWarnings("unchecked")
+    void timezoneManifestRecordsRequestedAndPageVerifiedApplied(@TempDir Path directory)
+            throws Exception {
+        Path out = directory.resolve("shot.png");
+        Files.write(out, new byte[] {1, 2, 3});
+        Path manifest = directory.resolve("shot.json");
+
+        Main.writeManifest(manifest, "page.html", "file", 640, 480, 25,
+            null, out, null, null, true, 12, null, null, null,
+            "Asia/Tokyo", "Asia/Tokyo");
+
+        Map<String, Object> root =
+            (Map<String, Object>) MiniJson.parse(Files.readString(manifest));
+        assertEquals(Map.of("requested", "Asia/Tokyo", "applied", "Asia/Tokyo"),
+            root.get("timezone"));
+    }
+
+    @Test
     void unsupportedEvalValueFailsBeforeReplacingAnExistingManifest(
             @TempDir Path directory) throws Exception {
         Path out = directory.resolve("shot.png");
