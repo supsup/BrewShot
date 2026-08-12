@@ -91,6 +91,7 @@ public final class Main {
         String colorScheme = null;
         String mediaType = null;
         String timezone = null;
+        Integer devicePixelRatio = null;
         boolean reducedMotion = false;
         int gifFrames = 0;
         boolean gifSet = false;     // explicit flag, NOT a 0-sentinel: `--gif 0` must refuse
@@ -157,6 +158,8 @@ public final class Main {
                         return err("--timezone wants a non-blank IANA identifier");
                     }
                 }
+                case "--dpr" -> devicePixelRatio = boundedInt(
+                    "--dpr", requireValue(args, ++i), 1, 4);
                 case "--reduced-motion" -> reducedMotion = true;
                 case "--gif" -> { gifFrames = posInt("--gif", requireValue(args, ++i)); gifSet = true; }
                 case "--gif-delay" -> {
@@ -281,7 +284,9 @@ public final class Main {
         Object evalResult = null;
         boolean failJsPassed = true;
         PageDiagnosticsReceipt diagnosticsReceipt = null;
-        try (BrewShot shot = BrewShot.launch(width, height)) {
+        try (BrewShot shot = devicePixelRatio == null
+                ? BrewShot.launch(width, height)
+                : BrewShot.launch(width, height, devicePixelRatio)) {
             for (String[] h : headers) { shot.header(h[0], h[1]); }
             for (String[] c : cookies) { shot.cookie(c[0], c[1], c[2]); }
             if (colorScheme != null) { shot.colorScheme(colorScheme); }
@@ -385,7 +390,8 @@ public final class Main {
                     out, evalResult, failJs, failJsPassed,
                     System.currentTimeMillis() - t0, gifSet ? gifDelayMs : null,
                     jpegOut ? jpegQuality : null, diagnosticsReceipt,
-                    timezone, shot.appliedTimezone());
+                    timezone, shot.appliedTimezone(),
+                    devicePixelRatio, shot.appliedDevicePixelRatio());
             }
             System.err.println("brewshot: wrote " + out);
         }
@@ -828,6 +834,19 @@ public final class Main {
             PageDiagnosticsReceipt diagnostics, String timezoneRequested,
             String timezoneApplied)
             throws java.io.IOException {
+        writeManifest(manifest, input, mode, width, height, settleMs, waitJs, out,
+            evalResult, failJs, failJsPassed, elapsedMs, requestedGifDelayMs, jpegQuality,
+            diagnostics, timezoneRequested, timezoneApplied, null, null);
+    }
+
+    /** DPR-aware opt-in overload; null DPR values preserve the legacy byte shape. */
+    static void writeManifest(Path manifest, String input, String mode,
+            int width, int height, long settleMs, String waitJs, Path out,
+            Object evalResult, String failJs, boolean failJsPassed, long elapsedMs,
+            Integer requestedGifDelayMs, Integer jpegQuality,
+            PageDiagnosticsReceipt diagnostics, String timezoneRequested,
+            String timezoneApplied, Integer dprRequested, Integer dprApplied)
+            throws java.io.IOException {
         java.util.Map<String, Object> fields = new java.util.LinkedHashMap<>();
         fields.put("input", input);
         fields.put("mode", mode);
@@ -856,6 +875,12 @@ public final class Main {
             timezone.put("requested", timezoneRequested);
             timezone.put("applied", timezoneApplied);
             fields.put("timezone", timezone);
+        }
+        if (dprRequested != null) {
+            java.util.Map<String, Object> dpr = new java.util.LinkedHashMap<>();
+            dpr.put("requested", dprRequested);
+            dpr.put("applied", dprApplied);
+            fields.put("dpr", dpr);
         }
         fields.put("brewshot", BrewShot.VERSION);
         ArtifactWriter.writePrivateString(
@@ -1216,6 +1241,8 @@ public final class Main {
               --color-scheme dark|light  force prefers-color-scheme before capture
               --media      print|screen  force the emulated media type (e.g. @media print)
               --timezone   IANA timezone ID applied by Chrome and verified from page Intl
+              --dpr        page-visible device pixel ratio, integer 1-4; distinct from
+                           --scale, which re-rasters the resulting capture
               --reduced-motion  force prefers-reduced-motion: reduce before capture
               --fail-js    JS assertion; false -> exit 4 (output artifact still written)
               --json       write a machine-readable manifest beside the output

@@ -33,6 +33,8 @@ class MainCliTest {
                 && help.contains("exact UTF-8 bytes per complete CDP message"), help);
         assertTrue(help.contains("image-header dimension checks after Base64 decode"), help);
         assertTrue(help.contains("not total GIF encoder heap"), help);
+        assertTrue(help.contains("--dpr") && help.contains("integer 1-4")
+                && help.contains("distinct from") && help.contains("--scale"), help);
     }
 
     @Test
@@ -93,6 +95,22 @@ class MainCliTest {
         assertEquals(2, Main.run(new String[] {"--reduced-motion", "no-such-file.html"}));
         assertEquals(2, Main.run(new String[] {"--timezone", " ", "https://example.com"}));
         assertEquals(2, Main.run(new String[] {"--timezone=Asia/Tokyo", "no-such-file.html"}));
+    }
+
+    @Test
+    void dprIsAnIntegerOneThroughFourAndRefusesBeforeArtifacts(@TempDir Path directory)
+            throws Exception {
+        Path output = directory.resolve("never-written.png");
+        Path receipt = directory.resolve("never-written.json");
+        for (String rejected : new String[] {"0", "-1", "1.5", "NaN", "Infinity", "5"}) {
+            assertEquals(2, Main.run(new String[] {
+                "--dpr", rejected, "-o", output.toString(), "--json", receipt.toString(),
+                "https://example.com"}), rejected);
+            org.junit.jupiter.api.Assertions.assertFalse(Files.exists(output), rejected);
+            org.junit.jupiter.api.Assertions.assertFalse(Files.exists(receipt), rejected);
+        }
+        assertEquals(2, Main.run(new String[] {"--dpr=2", "no-such-file.html"}),
+            "equals form must parse and reach input resolution");
     }
 
     @Test
