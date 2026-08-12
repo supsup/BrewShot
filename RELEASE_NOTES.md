@@ -29,6 +29,21 @@
   across independent CDP streams. Capture sidecars are forced to owner-only
   `0600` even when replacing a permissive file; Docker smoke proves a different
   UID cannot read one while the supported deliberate container-side reader can.
+
+- **Documented how output permissions actually behave, and how to read an artifact
+  you cannot open.** The README explained at length which permissions the *input*
+  side needs and said nothing about the output side, where the rule has three cases:
+  a **new** target is created owner-only (`0600`, owned by the image's `10001:10001`
+  in a container), an **existing ordinary** target keeps its own mode bits, and a
+  `--json` sidecar is forced to `0600` even when replacing a permissive file. So on
+  Linux a host process with a different UID may be unable to open a file that exists,
+  is the right size, and contains a correct PNG — or may open it fine, depending on
+  whether the path already existed. Every symptom points away from the cause, and in
+  CI it surfaces as a later step "producing no usable output". The warning states all
+  three cases with the measurements behind them and gives both remedies: run as
+  yourself with `--user`, or read the artifact back through a container.
+  Documentation only; no behaviour changed.
+
 - **The folder worker's concurrency now has behavioural coverage in CI** (plan
   4124aab6). `docker/smoke-test.sh` — the only test that exercises
   `BrewShotFolderWorker`'s file locks, atomic-rename claims, collision handling

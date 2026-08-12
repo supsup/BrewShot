@@ -588,6 +588,46 @@ restart, and multiple workers may share the same mounts. Set
 > One-shot CLI input can remain read-only. Details:
 > [SLOWSTART](SLOWSTART.md) Scenario 5.
 
+> [!WARNING]
+> **What BrewShot writes, you may not be able to read — and whether you can depends
+> on whether the file already existed.** Three cases, each measured:
+>
+> | target | resulting mode | consequence |
+> |---|---|---|
+> | does not exist yet | `0600`, owned by `10001:10001` in a container | a different host UID **cannot** open it |
+> | exists as an ordinary file | its own mode bits are **retained** | a pre-existing `0644` output stays world-readable |
+> | `--json` sidecar | forced `0600` even over a permissive file | deliberate, so opted-in page text is not widened |
+>
+> Measured both ways rather than generalised from one: a fresh capture produced
+> `-rw------- 10001 10001 shot.png` and a `cat` from UID 1001 answered `Permission
+> denied`, while capturing over a pre-created `0644` file left it `-rw-r--r--`,
+> readable by anyone. An earlier draft of this warning said outputs are *always*
+> owner-only. That is true only of the first row, and stating it as a blanket rule
+> would have been wrong in the direction people rely on — "BrewShot outputs are
+> private" is not a confidentiality guarantee when the target pre-exists permissively.
+>
+> The first row is the one that costs time, because every symptom points away from
+> the cause: the file exists, `stat` works, the size is right, and `file(1)` says
+> "regular file, no read permission" rather than anything about the capture. In CI it
+> surfaces as a step that "produced no usable output" long after the step that
+> actually produced it.
+>
+> Two ways through, and pick deliberately:
+>
+> - **Run as yourself** — `--user "$(id -u):$(id -g)"`. The output lands owned by you
+>   and every later step reads it normally. Requires the bind folders to be writable
+>   by that UID.
+> - **Read it back through a container**, when running as the image's own user is
+>   what you want (it is the safer default, and it is what CI does):
+>
+>   ```bash
+>   docker run --rm --user 0:0 --volume "$PWD/out:/verify:ro" \
+>     --entrypoint /bin/sh brewshot:local -c 'cat /verify/shot.png' > shot.png
+>   ```
+>
+> This is a property of the **writer**, so it applies to every artifact BrewShot
+> produces — stills, GIFs, diff heatmaps, verify receipts and JSON sidecars alike.
+
 Rolling your own image: install `chromium` + fonts (`fonts-liberation`,
 `fonts-dejavu-core`), set `BREWSHOT_CHROME=/usr/bin/chromium` and
 `BREWSHOT_CHROME_ARGS="--no-sandbox --disable-dev-shm-usage"` — scope
