@@ -134,4 +134,21 @@ class MiniJsonTest {
     void parserRejectsNumbersThatOverflowToInfinity() {
         assertThrows(IllegalArgumentException.class, () -> MiniJson.parse("1e309"));
     }
+
+    @Test
+    void strictConfigurationModeRejectsAmbiguityWithoutChangingCdpCompatibility() {
+        Object legacy = MiniJson.parse("{\"same\":1,\"same\":2}");
+        assertEquals(2.0, MiniJson.get(legacy, "same"),
+            "the existing CDP reader retains its last-member-wins behavior");
+
+        assertThrows(IllegalArgumentException.class,
+            () -> MiniJson.parseStrict("{\"same\":1,\"same\":2}"));
+        assertThrows(IllegalArgumentException.class,
+            () -> MiniJson.parseStrict("+1"));
+        assertThrows(IllegalArgumentException.class,
+            () -> MiniJson.parseStrict("\"raw\ncontrol\""));
+        assertThrows(IllegalArgumentException.class,
+            () -> MiniJson.parseStrict("\"\\ud800\""));
+        assertEquals("😃", MiniJson.parseStrict("\"\\ud83d\\ude03\""));
+    }
 }

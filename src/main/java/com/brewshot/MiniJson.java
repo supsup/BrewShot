@@ -31,13 +31,30 @@ public final class MiniJson {
         "-?(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?");
 
     private final String s;
+    private final boolean strict;
     private int i;
     private int depth;
 
-    private MiniJson(String s) { this.s = s; }
+    private MiniJson(String s, boolean strict) {
+        this.s = s;
+        this.strict = strict;
+    }
 
     public static Object parse(String json) {
-        MiniJson p = new MiniJson(json);
+        return parse(json, false);
+    }
+
+    /**
+     * Strict document parsing for authored configuration. Unlike the CDP compatibility
+     * reader, this rejects duplicate object members, non-JSON number spellings, raw
+     * control characters, and unpaired UTF-16 surrogates.
+     */
+    static Object parseStrict(String json) {
+        return parse(json, true);
+    }
+
+    private static Object parse(String json, boolean strict) {
+        MiniJson p = new MiniJson(json, strict);
         Object v = p.value();
         p.ws();
         if (p.i != p.s.length()) {
@@ -270,7 +287,11 @@ public final class MiniJson {
             String key = string();
             ws();
             expect(':');
-            m.put(key, value());
+            Object value = value();
+            if (strict && m.containsKey(key)) {
+                throw err("duplicate object key \"" + key + "\"");
+            }
+            m.put(key, value);
             ws();
             char c = next();
             if (c == '}') { return m; }
@@ -297,7 +318,16 @@ public final class MiniJson {
         StringBuilder b = new StringBuilder();
         while (true) {
             char c = next();
-            if (c == '"') { return b.toString(); }
+            if (c == '"') {
+                String value = b.toString();
+                if (strict && hasUnpairedSurrogate(value)) {
+                    throw err("unpaired surrogate in string");
+                }
+                return value;
+            }
+            if (strict && c < 0x20) {
+                throw err("unescaped control character in string");
+            }
             if (c != '\\') { b.append(c); continue; }
             char e = next();
             switch (e) {
@@ -327,11 +357,31 @@ public final class MiniJson {
         int start = i;
         while (i < s.length() && "+-0123456789.eE".indexOf(s.charAt(i)) >= 0) { i++; }
         if (start == i) { throw err("expected value"); }
-        Double value = Double.parseDouble(s.substring(start, i));
+        String encoded = s.substring(start, i);
+        if (strict && !JSON_NUMBER.matcher(encoded).matches()) {
+            throw err("bad JSON number");
+        }
+        Double value = Double.parseDouble(encoded);
         if (!Double.isFinite(value)) {
             throw err("JSON number is not finite");
         }
         return value;
+    }
+
+    private static boolean hasUnpairedSurrogate(String value) {
+        for (int offset = 0; offset < value.length(); offset++) {
+            char current = value.charAt(offset);
+            if (Character.isHighSurrogate(current)) {
+                if (offset + 1 >= value.length()
+                        || !Character.isLowSurrogate(value.charAt(offset + 1))) {
+                    return true;
+                }
+                offset++;
+            } else if (Character.isLowSurrogate(current)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private Object lit(String word, Object v) {
@@ -341,7 +391,16 @@ public final class MiniJson {
     }
 
     private void ws() {
-        while (i < s.length() && Character.isWhitespace(s.charAt(i))) { i++; }
+        while (i < s.length()) {
+            char c = s.charAt(i);
+            boolean whitespace = strict
+                ? c == ' ' || c == '\t' || c == '\r' || c == '\n'
+                : Character.isWhitespace(c);
+            if (!whitespace) {
+                return;
+            }
+            i++;
+        }
     }
 
     private char peek() {
