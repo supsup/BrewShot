@@ -160,6 +160,21 @@ Font-hinting noise is forgiven (and counted) by default, a timestamp footer is
 build-failing fact instead of a review-time surprise. The diff itself needs no
 Chrome — it's pure JDK image work, so it runs in the leanest CI job.
 
+**Sam can keep the page's explanation beside the pixels.** The CLI now projects
+the library's already-bounded page voice into an explicit private sidecar:
+
+```bash
+brewshot current/page.html -o current/page.png --json current/page.json \
+  --page-diagnostics --fail-page-errors
+```
+
+There is no implicit JSON file. The PNG and `0600` receipt publish before an
+observed exception returns exit 4, so a later stage that lost the process status
+can still answer why the bake failed. A dropped relevant entry is not a clean
+page: it produces an inconclusive receipt and exit 5. `console.error` remains a
+separate stronger opt-in (`--fail-console-errors`) because third-party console
+noise and uncaught page exceptions are not the same policy signal.
+
 ---
 
 ## 4. An agent — "I need eyes"

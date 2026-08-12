@@ -334,6 +334,41 @@ docker run --rm --user 0:0 --volume "$output:/verify:ro" --entrypoint /bin/sh "$
     || fail "legacy.png and explicit.png differ"
 docker run --rm "$image" cli --version | grep -q '^brewshot 0\.9\.0$'
 
+step "page diagnostics publish private evidence before the exit gate"
+cat > "$input/diagnostics.html" <<'HTML'
+<!doctype html><meta charset="utf-8"><p>diagnostics</p><script>
+console.log('before-error');
+setTimeout(function () { throw new Error('docker-page-kaput'); }, 0);
+</script>
+HTML
+set +e
+docker run --rm \
+    -v "$input:/brewshot/input:ro" \
+    -v "$output:/brewshot/output" \
+    "$image" cli /brewshot/input/diagnostics.html \
+    -o /brewshot/output/diagnostics.png \
+    --json /brewshot/output/diagnostics.json \
+    --page-diagnostics --fail-page-errors --settle 100
+diagnostics_status=$?
+set -e
+test "$diagnostics_status" -eq 4 \
+    || fail "expected observed page exception exit 4, got $diagnostics_status"
+assert_png "$output/diagnostics.png"
+assert_owner_only "$output/diagnostics.json"
+# The consumer contract is identity-sensitive: a different non-root UID cannot read the
+# 0600 sidecar, while a deliberate container-side privileged reader can consume it.
+docker run --rm --user 10002:10002 --volume "$output:/verify:ro" \
+    --entrypoint /bin/sh "$image" \
+    -c "test ! -r /verify/diagnostics.json" \
+    || fail "a non-owner container identity could read the private diagnostics sidecar"
+docker run --rm --user 0:0 --volume "$output:/verify:ro" \
+    --entrypoint /bin/sh "$image" -eu -c '
+        grep -q "\"outcome\": \"failed\"" /verify/diagnostics.json
+        grep -q "\"page-errors\"" /verify/diagnostics.json
+        grep -q docker-page-kaput /verify/diagnostics.json
+    ' \
+    || fail "container-side diagnostics receipt did not explain the observed gate"
+
 step "pre-worker /work contract: relative output and default brewshot.png"
 # The pre-worker image contract uses /work as its working directory. Preserve
 # both explicit relative output and the default brewshot.png destination.
