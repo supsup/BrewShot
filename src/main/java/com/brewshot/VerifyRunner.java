@@ -523,6 +523,15 @@ final class VerifyRunner {
         captureFields.put("written", Files.isRegularFile(
             state.prepared.stagedCapture(), LinkOption.NOFOLLOW_LINKS));
         captureFields.put("sha256", state.captureSha256);
+        String timezone = state.job().capture().timezone();
+        if (timezone != null) {
+            Map<String, Object> timezoneFields = new LinkedHashMap<>();
+            timezoneFields.put("requested", timezone);
+            // A successful production Capture has crossed BrewShot.open(), whose post-load
+            // exact Intl equality check is part of that success contract.
+            timezoneFields.put("applied", state.captureExit == 0 ? timezone : null);
+            captureFields.put("timezone", timezoneFields);
+        }
         core.put("capture", captureFields);
         core.put("diff", state.diff);
         Map<String, Object> heatmap = new LinkedHashMap<>();
@@ -966,6 +975,9 @@ final class VerifyRunner {
             }
             if (options.media() != null) {
                 shot.media(options.media());
+            }
+            if (options.timezone() != null) {
+                shot.timezone(options.timezone());
             }
             if (options.reducedMotion()) {
                 shot.reducedMotion("reduce");

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **Pinned, page-verified timezones for reproducible captures** (plan c6e57eda).
+  Library `timezone(IANA_ID)`, CLI `--timezone`, and verify-manifest
+  `capture.timezone` use Chrome's `Emulation.setTimezoneOverride` before every navigation and
+  verify the exact page-visible `Intl` timezone after load. Unsupported identifiers preserve
+  Chrome's rejection cause and produce no capture artifact. Opt-in one-shot and verify receipts
+  record requested and verified-applied identifiers; omission preserves legacy JSON bytes.
 - **Bounded page diagnostics now survive the failure they explain** (plan
   76ca8437). `--page-diagnostics`, `--fail-page-errors`, and
   `--fail-console-errors` require an explicit `--json` path before Chrome

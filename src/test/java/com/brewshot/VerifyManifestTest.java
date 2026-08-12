@@ -27,7 +27,8 @@ class VerifyManifestTest {
                   "width":1440,"height":900,"settleMs":0,
                   "waitJs":"document.fonts.status === 'loaded'","waitTimeoutMs":5000,
                   "clipSelector":"main","scale":2,"clipPadding":8,
-                  "colorScheme":"dark","media":"screen","reducedMotion":true
+                  "colorScheme":"dark","media":"screen","timezone":"Asia/Tokyo",
+                  "reducedMotion":true
                 }
                 ,"diff":{
                   "tolerance":8,"ignoreAntialiasing":false,
@@ -57,6 +58,7 @@ class VerifyManifestTest {
         assertEquals(8.0, job.capture().clipPadding());
         assertEquals("dark", job.capture().colorScheme());
         assertEquals("screen", job.capture().media());
+        assertEquals("Asia/Tokyo", job.capture().timezone());
         assertTrue(job.capture().reducedMotion());
         assertEquals(8, job.diff().options().tolerance());
         assertFalse(job.diff().options().ignoreAntialiasing());
@@ -108,6 +110,8 @@ class VerifyManifestTest {
         assertInvalid(directory, manifest(job("one", "a.html", "a.png", "a.json",
             ",\"capture\":{\"clipJs\":\"({x:0,y:0,w:1,h:1})\"}")),
             "unknown field");
+        assertInvalid(directory, manifest(job("one", "a.html", "a.png", "a.json",
+            ",\"capture\":{\"timezone\":\" \"}")), "must be a non-blank string");
         assertInvalid(directory, manifest(job("one", "a.html", "a.png", "a.json",
             ",\"diff\":{\"algorithm\":\"ssim\"}")), "unknown field");
         assertInvalid(directory, manifest(job("one", "a.html", "a.png", "a.json",

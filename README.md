@@ -114,6 +114,7 @@ WebSocket client since 11. BrewShot is those messages, wrapped well:
 | `Page.captureScreenshot` | PNG/JPEG `screenshot(path, format, quality)` / `screenshotClip(x,y,w,h)` · `screenshotElement("css")` |
 | `Page.printToPDF` | `pdf(path)` / `pdf(path, PdfOptions)` — the page as a paged, print-fidelity PDF |
 | `Emulation.setEmulatedMedia` | `colorScheme("dark"\|"light")` · `media("print"\|"screen")` · `reducedMotion("reduce")` |
+| `Emulation.setTimezoneOverride` | `timezone("Asia/Tokyo")` — applied before navigation and proved from page `Intl` after load |
 | `Input.dispatchMouseEvent` | `mouse(x,y)` · `click(x,y)` / `click("css")` · `hover("css")` — real trusted input |
 | + JDK ImageIO | `recordGif(rect…)` · `recordGifElement("css", …)` · `recordGifScroll(…)` · `recordGifFullPage(…, scale, …)` · `recordGifRegion(0.5, 1.0, …)` |
 
@@ -305,6 +306,29 @@ brewshot page.html -o dark.png --color-scheme dark
 brewshot page.html -o preview.png --media print
 brewshot page.html -o still.png --reduced-motion
 ```
+
+## Pin the page timezone
+
+Dates should not change because a capture moved from a Chicago laptop to a UTC runner.
+`timezone(IANA_ID)` asks Chrome itself to apply the identifier before navigation, re-applies it
+for every later `open`/`html`, and refuses capture unless the loaded page reports the exact same
+identifier through `Intl.DateTimeFormat().resolvedOptions().timeZone`. Chrome/CDP is the support
+authority; BrewShot does not keep a second Java-side IANA allowlist.
+
+```java
+try (BrewShot shot = BrewShot.launch()) {
+    shot.timezone("Asia/Tokyo");
+    shot.open("https://example.com");
+    System.out.println(shot.appliedTimezone()); // Asia/Tokyo, page-visible and verified
+    shot.screenshot(Path.of("tokyo.png"));
+}
+```
+
+The CLI form is `--timezone Asia/Tokyo`. With `--json`, the sidecar adds a timezone receipt with
+the requested and verified-applied identifier. When the flag is absent, the JSON byte shape stays
+unchanged. Verify manifests accept the same optional `capture.timezone`; successful job receipts
+carry the same requested/applied proof. Blank or Chrome-unsupported identifiers fail before any
+capture artifact is written.
 
 ## Compare two shots — a citable verdict, not an eyeball job
 
