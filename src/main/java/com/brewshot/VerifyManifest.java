@@ -4,6 +4,8 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -56,11 +58,13 @@ final class VerifyManifest {
 
     private final Path source;
     private final Path workspaceRoot;
+    private final String sourceSha256;
     private final List<Job> jobs;
 
-    private VerifyManifest(Path source, Path workspaceRoot, List<Job> jobs) {
+    private VerifyManifest(Path source, Path workspaceRoot, String sourceSha256, List<Job> jobs) {
         this.source = Objects.requireNonNull(source, "source");
         this.workspaceRoot = Objects.requireNonNull(workspaceRoot, "workspaceRoot");
+        this.sourceSha256 = Objects.requireNonNull(sourceSha256, "sourceSha256");
         this.jobs = List.copyOf(jobs);
     }
 
@@ -70,6 +74,10 @@ final class VerifyManifest {
 
     Path workspaceRoot() {
         return workspaceRoot;
+    }
+
+    String sourceSha256() {
+        return sourceSha256;
     }
 
     List<Job> jobs() {
@@ -87,6 +95,7 @@ final class VerifyManifest {
         try {
             String json = BoundedUtf8.readStrict(
                 source, MAX_MANIFEST_BYTES, "verify manifest " + source);
+            String sourceSha256 = sha256(json.getBytes(StandardCharsets.UTF_8));
             Map<String, Object> root = object(MiniJson.parseStrict(json), "manifest root");
             rejectUnknown(root, ROOT_FIELDS, "manifest root");
             int version = intValue(required(root, "version", "manifest root"),
@@ -117,7 +126,7 @@ final class VerifyManifest {
                 }
                 jobs.add(job);
             }
-            return new VerifyManifest(source, workspace, jobs);
+            return new VerifyManifest(source, workspace, sourceSha256, jobs);
         } catch (ManifestProblem invalid) {
             throw failure(invalid.getMessage(), invalid);
         } catch (IOException | IllegalArgumentException invalid) {
@@ -392,6 +401,20 @@ final class VerifyManifest {
 
     private static ManifestProblem problem(String message) {
         return new ManifestProblem(message);
+    }
+
+    static String sha256(byte[] bytes) {
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-256").digest(bytes);
+            StringBuilder hex = new StringBuilder(digest.length * 2);
+            for (byte value : digest) {
+                hex.append(Character.forDigit((value >>> 4) & 0xf, 16));
+                hex.append(Character.forDigit(value & 0xf, 16));
+            }
+            return hex.toString();
+        } catch (NoSuchAlgorithmException impossible) {
+            throw new IllegalStateException("JDK has no SHA-256 provider", impossible);
+        }
     }
 
     private static ManifestException failure(String message, Throwable cause) {
