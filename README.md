@@ -323,6 +323,35 @@ the macOS native binary). Library callers get the same engine as
 `Options.masks()` and `Verdict.changedBounds()` return defensive copies, so
 mutating caller arrays cannot rewrite a later comparison or sidecar.
 
+## Verify a screenshot manifest
+
+`verify` captures every job in a locally-authored manifest, then either checks
+the staged captures without changing baselines or replaces the complete staged
+baseline set:
+
+```bash
+brewshot verify --manifest shots.json --check
+brewshot verify --manifest shots.json --update
+```
+
+Receipt consumers must treat the manifest-adjacent batch receipt as the
+authority envelope. A job receipt is authoritative only when the batch
+receipt's top-level `state` is `complete`, and its top-level `attemptId` and
+`contentDigest` match the job receipt. `complete` means evidence publication
+finished, not that the verification passed; read `deterministicCore.exit`, job
+statuses, and failures for the verdict. `attemptId` is unique to an execution
+and deliberately excluded from `deterministicCore`; `contentDigest` binds the
+manifest, mode, inputs, baselines, and captures and is present in both the
+top-level envelope and deterministic core.
+
+The batch receipt is replaced with `state: "in-progress"` before capture. Its
+`contentDigestReady` is initially false with a null digest, then true before an
+update can replace a baseline. An interrupted attempt therefore cannot leave
+older job receipts looking current. Update mode is a logical staged commit,
+not a power-loss-atomic transaction: `powerLossDurable` and
+`baselineCommit.crashAtomic` are false, and partial or indeterminate replacement
+is reported explicitly. Check mode never writes baseline bytes or metadata.
+
 ## What it's good for
 
 - **Visual pins in JUnit** — "this page renders, and no element exploded" as a

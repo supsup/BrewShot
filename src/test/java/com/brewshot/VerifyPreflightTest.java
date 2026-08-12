@@ -11,6 +11,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermissions;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -31,6 +32,10 @@ class VerifyPreflightTest {
         assertFalse(Files.exists(prepared.stagingRoot()));
         assertFalse(Files.exists(prepared.batchReceipt()));
         assertEquals(1, prepared.jobs().size());
+        assertEquals(directory.resolve(
+            "fixtures/.brewshot-verify-checkstage01-home.input.html"),
+            prepared.jobs().getFirst().stagedInput());
+        assertFalse(Files.exists(prepared.jobs().getFirst().stagedInput()));
         assertNull(prepared.jobs().getFirst().stagedBaseline());
         assertNotNull(prepared.jobs().getFirst().stagedHeatmap());
     }
@@ -45,7 +50,27 @@ class VerifyPreflightTest {
         assertFalse(Files.exists(directory.resolve("baselines/home.png")));
         assertEquals(prepared.stagingRoot().resolve("home.baseline.png"),
             prepared.jobs().getFirst().stagedBaseline());
+        assertEquals(directory.resolve(
+            "baselines/.brewshot-verify-updatestage1-home.tmp"),
+            prepared.jobs().getFirst().commitTemporary());
+        assertFalse(Files.exists(prepared.jobs().getFirst().commitTemporary()));
         assertFalse(Files.exists(prepared.stagingRoot()));
+    }
+
+    @Test
+    void updateCommitTemporaryParticipatesInWholeGraphAliasChecks(
+            @TempDir Path directory) throws Exception {
+        Path manifestPath = fixture(directory, false);
+        Files.writeString(manifestPath, manifest("baselines/home.png",
+            "baselines/.brewshot-verify-committemp1-home.tmp/result.json"));
+
+        VerifyPreflight.PreflightException failure = assertThrows(
+            VerifyPreflight.PreflightException.class,
+            () -> VerifyPreflight.inspect(VerifyManifest.load(manifestPath),
+                VerifyPreflight.Mode.UPDATE, "committemp1"));
+
+        assertTrue(failure.getMessage().contains("ancestor/descendant"));
+        assertNoStage(directory);
     }
 
     @Test
@@ -86,7 +111,7 @@ class VerifyPreflightTest {
 
         VerifyPreflight.PreflightException failure = assertThrows(
             VerifyPreflight.PreflightException.class, prepared::createStaging);
-        assertTrue(failure.getMessage().contains("manifest is missing"));
+        assertTrue(failure.getMessage().contains("manifest must be an existing regular file"));
         assertFalse(Files.exists(prepared.stagingRoot()));
     }
 
@@ -116,7 +141,8 @@ class VerifyPreflightTest {
         try {
             Files.createSymbolicLink(link, real.getFileName());
         } catch (UnsupportedOperationException unavailable) {
-            return;
+            Assumptions.assumeTrue(false,
+                "symbolic links are unavailable: " + unavailable.getMessage());
         }
         Files.writeString(manifestPath,
             manifest("baselines/home.png", "receipts/home.json")
@@ -131,6 +157,43 @@ class VerifyPreflightTest {
     }
 
     @Test
+    void symlinkAndRealOutputSpellingsCannotReachTheSameTarget(
+            @TempDir Path directory) throws Exception {
+        Files.createDirectories(directory.resolve("fixtures"));
+        Files.writeString(directory.resolve("fixtures/one.html"), "<main>one</main>");
+        Files.writeString(directory.resolve("fixtures/two.html"), "<main>two</main>");
+        Files.createDirectories(directory.resolve("baselines"));
+        Files.write(directory.resolve("baselines/one.png"), new byte[] {1});
+        Files.write(directory.resolve("baselines/two.png"), new byte[] {2});
+        Path realOutputs = Files.createDirectories(directory.resolve("real-outputs"));
+        Path linkedOutputs = directory.resolve("linked-outputs");
+        try {
+            Files.createSymbolicLink(linkedOutputs, realOutputs.getFileName());
+        } catch (UnsupportedOperationException unavailable) {
+            Assumptions.assumeTrue(false,
+                "symbolic links are unavailable: " + unavailable.getMessage());
+        }
+        Path manifestPath = directory.resolve("shots.json");
+        Files.writeString(manifestPath, """
+            {"version":1,"jobs":[
+              {"id":"one","input":"fixtures/one.html","baseline":"baselines/one.png",
+               "receipt":"real-outputs/shared.json"},
+              {"id":"two","input":"fixtures/two.html","baseline":"baselines/two.png",
+               "receipt":"linked-outputs/shared.json"}
+            ]}
+            """);
+
+        VerifyPreflight.PreflightException failure = assertThrows(
+            VerifyPreflight.PreflightException.class,
+            () -> VerifyPreflight.inspect(VerifyManifest.load(manifestPath),
+                VerifyPreflight.Mode.CHECK, "linkalias001"));
+        assertTrue(failure.getMessage().contains("symbolic link")
+            || failure.getMessage().contains("path alias"));
+        assertFalse(Files.exists(realOutputs.resolve("shared.json")));
+        assertNoStage(directory);
+    }
+
+    @Test
     void hardLinkedWritableDestinationRefuses(@TempDir Path directory) throws Exception {
         Path manifestPath = fixture(directory, true);
         Path baseline = directory.resolve("baselines/home.png");
@@ -139,7 +202,8 @@ class VerifyPreflightTest {
         try {
             Files.createLink(receipt, baseline);
         } catch (UnsupportedOperationException unavailable) {
-            return;
+            Assumptions.assumeTrue(false,
+                "hard links are unavailable: " + unavailable.getMessage());
         }
 
         VerifyPreflight.PreflightException failure = assertThrows(

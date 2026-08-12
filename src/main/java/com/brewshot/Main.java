@@ -64,6 +64,9 @@ public final class Main {
         if (args.length > 0 && args[0].equals("diff")) {
             return runDiff(java.util.Arrays.copyOfRange(args, 1, args.length));
         }
+        if (args.length > 0 && args[0].equals("verify")) {
+            return runVerify(java.util.Arrays.copyOfRange(args, 1, args.length));
+        }
         String input = null;
         Path out = Path.of("brewshot.png");
         int width = 1280;
@@ -370,6 +373,50 @@ public final class Main {
     }
 
     // ---- brewshot diff (plan 84f468d0) --------------------------------------------
+
+    /** Parse {@code brewshot verify --manifest shots.json (--check|--update)}. */
+    private static int runVerify(String[] args) {
+        Path manifest = null;
+        VerifyPreflight.Mode mode = null;
+        try {
+            for (int index = 0; index < args.length; index++) {
+                switch (args[index]) {
+                    case "--manifest" -> {
+                        if (manifest != null) {
+                            return err("verify accepts exactly one --manifest");
+                        }
+                        manifest = Path.of(requireValue(args, ++index));
+                    }
+                    case "--check" -> {
+                        if (mode != null) {
+                            return err("verify wants exactly one of --check or --update");
+                        }
+                        mode = VerifyPreflight.Mode.CHECK;
+                    }
+                    case "--update" -> {
+                        if (mode != null) {
+                            return err("verify wants exactly one of --check or --update");
+                        }
+                        mode = VerifyPreflight.Mode.UPDATE;
+                    }
+                    case "-h", "--help" -> {
+                        verifyUsage();
+                        return 0;
+                    }
+                    default -> {
+                        return err("unknown verify flag: " + args[index]);
+                    }
+                }
+            }
+        } catch (IllegalArgumentException invalid) {
+            return err(invalid.getMessage());
+        }
+        if (manifest == null || mode == null) {
+            verifyUsage();
+            return 2;
+        }
+        return VerifyRunner.run(manifest, mode);
+    }
 
     /**
      * One diff comparison: the unit of the LIST-OF-JOBS seam. The CLI builds exactly
@@ -1010,10 +1057,27 @@ public final class Main {
             subcommands:
               diff a.png b.png   pixel diff -> citable verdict + threshold gate
                                  (see 'brewshot diff --help'; no Chrome needed)
+              verify --manifest shots.json --check|--update
+                                 run every authored capture and emit deterministic
+                                 per-job + batch receipts
 
             stdin HTML is UTF-8 and capped at 16 MiB. Unknown output extensions
             are refused rather than receiving misnamed PNG bytes.
 
             requires a local Chrome/Chromium (or set BREWSHOT_CHROME).""");
+    }
+
+    private static void verifyUsage() {
+        System.err.println("""
+            usage: brewshot verify --manifest shots.json (--check | --update)
+
+              --check   capture every job, compare to existing baselines, and never
+                        mutate baseline bytes or metadata
+              --update  stage and validate every capture before beginning the logical
+                        multi-file baseline replacement
+
+            The manifest is strict, local UTF-8 JSON. Receipts are deterministic;
+            baseline commit receipts distinguish atomic replacement, non-atomic
+            fallback, and partial multi-file outcomes.""");
     }
 }
