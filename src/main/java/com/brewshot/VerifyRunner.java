@@ -497,6 +497,7 @@ final class VerifyRunner {
         Map<String, Object> receipt = new LinkedHashMap<>();
         receipt.put("schemaVersion", 1);
         receipt.put("attemptId", attemptId);
+        receipt.put("contentDigest", contentDigest);
         receipt.put("attemptIdExcludedFromDeterministicCore", true);
         receipt.put("authoritativeWhenBatchState", "complete");
         Map<String, Object> core = new LinkedHashMap<>();
@@ -542,6 +543,11 @@ final class VerifyRunner {
         receipt.put("schemaVersion", 1);
         receipt.put("attemptId", prepared.stageId());
         receipt.put("attemptIdExcludedFromDeterministicCore", true);
+        receipt.put("contentDigest", contentDigest(prepared, states));
+        receipt.put("contentDigestReady", true);
+        receipt.put("state", "complete");
+        receipt.put("mode", prepared.mode().name().toLowerCase(java.util.Locale.ROOT));
+        receipt.put("powerLossDurable", false);
         Map<String, Object> core = new LinkedHashMap<>();
         core.put("contentDigest", contentDigest(prepared, states));
         core.put("manifestSha256", prepared.manifest().sourceSha256());

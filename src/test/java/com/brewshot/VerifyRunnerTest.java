@@ -3,6 +3,8 @@ package com.brewshot;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -57,6 +59,7 @@ class VerifyRunnerTest {
         assertTrue(Files.readString(fixture.receiptTwo())
             .contains("\"status\": \"threshold-exceeded\""));
         assertTrue(Files.readString(fixture.batchReceipt()).contains("\"exit\": 4"));
+        assertAuthorityEnvelope(fixture);
         String receiptOneCore = deterministicCore(fixture.receiptOne());
         String receiptTwoCore = deterministicCore(fixture.receiptTwo());
         String batchCore = deterministicCore(fixture.batchReceipt());
@@ -240,6 +243,10 @@ class VerifyRunnerTest {
         assertTrue(marker.contains("\"state\": \"in-progress\""));
         assertTrue(marker.contains("\"powerLossDurable\": false"));
         assertFalse(marker.contains("\"attemptId\": \"old\""));
+        java.util.Map<String, Object> parsedMarker = jsonMap(fixture.batchReceipt());
+        assertEquals("in-progress", parsedMarker.get("state"));
+        assertNotNull(parsedMarker.get("contentDigest"));
+        assertEquals(Boolean.TRUE, parsedMarker.get("contentDigestReady"));
     }
 
     @Test
@@ -260,6 +267,10 @@ class VerifyRunnerTest {
         assertTrue(marker.contains("\"mode\": \"check\""));
         assertTrue(marker.contains("\"contentDigestReady\": false"));
         assertFalse(marker.contains("\"attemptId\": \"old\""));
+        java.util.Map<String, Object> parsedMarker = jsonMap(fixture.batchReceipt());
+        assertEquals("in-progress", parsedMarker.get("state"));
+        assertNull(parsedMarker.get("contentDigest"));
+        assertEquals(Boolean.FALSE, parsedMarker.get("contentDigestReady"));
     }
 
     @Test
@@ -402,9 +413,38 @@ class VerifyRunnerTest {
 
     @SuppressWarnings("unchecked")
     private static String deterministicCore(Path receipt) throws Exception {
-        Object parsed = MiniJson.parseStrict(Files.readString(receipt));
-        Object core = ((java.util.Map<String, Object>) parsed).get("deterministicCore");
+        Object core = jsonMap(receipt).get("deterministicCore");
         return MiniJson.stringifyPretty(core);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static java.util.Map<String, Object> jsonMap(Path path) throws Exception {
+        return (java.util.Map<String, Object>) MiniJson.parseStrict(Files.readString(path));
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void assertAuthorityEnvelope(Fixture fixture) throws Exception {
+        java.util.Map<String, Object> batch = jsonMap(fixture.batchReceipt());
+        java.util.Map<String, Object> batchCore =
+            (java.util.Map<String, Object>) batch.get("deterministicCore");
+        assertEquals("complete", batch.get("state"));
+        assertEquals(Boolean.TRUE, batch.get("contentDigestReady"));
+        assertEquals(batch.get("contentDigest"), batchCore.get("contentDigest"));
+        assertEquals(batch.get("state"), batchCore.get("state"));
+        assertEquals(batch.get("mode"), batchCore.get("mode"));
+        assertEquals(batch.get("powerLossDurable"), batchCore.get("powerLossDurable"));
+        for (Path receiptPath : java.util.List.of(
+                fixture.receiptOne(), fixture.receiptTwo())) {
+            java.util.Map<String, Object> receipt = jsonMap(receiptPath);
+            java.util.Map<String, Object> core =
+                (java.util.Map<String, Object>) receipt.get("deterministicCore");
+            assertEquals(batch.get("attemptId"), receipt.get("attemptId"));
+            assertEquals(batch.get("contentDigest"), receipt.get("contentDigest"));
+            assertEquals(receipt.get("contentDigest"), core.get("contentDigest"));
+            assertEquals("complete", receipt.get("authoritativeWhenBatchState"));
+            assertFalse(receipt.containsKey("state"),
+                "state is batch-only; job status lives in deterministicCore.status");
+        }
     }
 
     private record Fixture(Path manifest, Path baselineOne, Path baselineTwo,
