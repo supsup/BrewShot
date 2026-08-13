@@ -35,6 +35,7 @@ class MainCliTest {
         assertTrue(help.contains("not total GIF encoder heap"), help);
         assertTrue(help.contains("--dpr") && help.contains("integer 1-4")
                 && help.contains("distinct from") && help.contains("--scale"), help);
+        assertTrue(help.contains("--wait-timeout") && help.contains("requires --wait-js"), help);
     }
 
     @Test
@@ -58,6 +59,61 @@ class MainCliTest {
         assertEquals(2, Main.run(new String[] {"--wait-js=true", "no-such-file.html"}));
         // a genuinely unknown =flag still errors
         assertEquals(2, Main.run(new String[] {"--bogus=1", "no-such-file.html"}));
+    }
+
+    @Test
+    void orphanWaitTimeoutRefusesBeforeInputChromeOrArtifacts(@TempDir Path directory)
+            throws Exception {
+        Path output = directory.resolve("never-written.png");
+        Path receipt = directory.resolve("never-written.json");
+        String missing = directory.resolve("definitely-missing.html").toString();
+        java.util.List<String[]> spellingsAndOrders = java.util.List.of(
+            new String[] {"--wait-timeout", "10000", "-o", output.toString(),
+                "--json", receipt.toString(), missing},
+            new String[] {missing, "--wait-timeout", "10000", "-o", output.toString(),
+                "--json", receipt.toString()},
+            new String[] {"--wait-timeout=10000", "-o", output.toString(),
+                "--json", receipt.toString(), missing},
+            new String[] {missing, "--wait-timeout=10000", "-o", output.toString(),
+                "--json", receipt.toString()}
+        );
+
+        for (String[] args : spellingsAndOrders) {
+            ByteArrayOutputStream errors = new ByteArrayOutputStream();
+            PrintStream original = System.err;
+            int code;
+            try {
+                System.setErr(new PrintStream(errors));
+                code = Main.run(args);
+            } finally {
+                System.setErr(original);
+            }
+            assertEquals(2, code, java.util.Arrays.toString(args));
+            assertTrue(errors.toString().contains("--wait-timeout requires --wait-js"),
+                errors.toString());
+            org.junit.jupiter.api.Assertions.assertFalse(Files.exists(output));
+            org.junit.jupiter.api.Assertions.assertFalse(Files.exists(receipt));
+            try (var files = Files.list(directory)) {
+                assertEquals(0L, files.count(),
+                    "the dependency refusal must precede every filesystem side effect");
+            }
+        }
+
+        ByteArrayOutputStream pairedErrors = new ByteArrayOutputStream();
+        PrintStream original = System.err;
+        int pairedCode;
+        try {
+            System.setErr(new PrintStream(pairedErrors));
+            pairedCode = Main.run(new String[] {
+                "--wait-js", "true", "--wait-timeout=10000", missing});
+        } finally {
+            System.setErr(original);
+        }
+        assertEquals(2, pairedCode);
+        assertTrue(pairedErrors.toString().contains("not a URL, an existing file, or '-'"),
+            pairedErrors.toString());
+        org.junit.jupiter.api.Assertions.assertFalse(
+            pairedErrors.toString().contains("requires --wait-js"), pairedErrors.toString());
     }
 
     @Test

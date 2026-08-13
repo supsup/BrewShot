@@ -77,6 +77,7 @@ public final class Main {
         boolean jpegQualitySet = false;
         String waitJs = null;
         long waitTimeoutMs = 10_000;
+        boolean waitTimeoutSet = false;
         String clipJs = null;
         String clipSelector = null;
         double scale = 1.0;
@@ -121,7 +122,10 @@ public final class Main {
                 case "--eval-file" -> evalExpr = BoundedUtf8.read(
                     Path.of(requireValue(args, ++i)), MAX_EVAL_FILE_BYTES, "--eval-file");
                 case "--wait-js" -> waitJs = requireValue(args, ++i);
-                case "--wait-timeout" -> waitTimeoutMs = posLong("--wait-timeout", requireValue(args, ++i));
+                case "--wait-timeout" -> {
+                    waitTimeoutMs = posLong("--wait-timeout", requireValue(args, ++i));
+                    waitTimeoutSet = true;
+                }
                 case "--clip-js" -> clipJs = requireValue(args, ++i);
                 case "--clip-selector" -> clipSelector = requireValue(args, ++i);
                 case "--scale" -> scale = posDouble("--scale", requireValue(args, ++i));
@@ -184,6 +188,9 @@ public final class Main {
             return err(e.getMessage());
         }
         if (input == null) { usage(); return 2; }
+        if (waitTimeoutSet && waitJs == null) {
+            return err("--wait-timeout requires --wait-js");
+        }
         if (clipSelector != null && clipJs != null) {
             return err("--clip-selector and --clip-js are mutually exclusive (pick one clip source)");
         }
@@ -1280,7 +1287,8 @@ public final class Main {
               --eval-file  like --eval, JS read from a UTF-8 file (max 1 MiB;
                            no shell quoting)
               --wait-js    JS predicate to poll before shooting (deterministic ready)
-              --wait-timeout  ms budget for --wait-js       (default 10000)
+              --wait-timeout  ms budget for --wait-js; requires --wait-js
+                              (default 10000)
               --clip-js    JS returning {x,y,w,h} page-coords: shoot just that rect
               --clip-selector  CSS selector: shoot just the first matching element's
                            box (exit 1 if nothing matches; exclusive with --clip-js)

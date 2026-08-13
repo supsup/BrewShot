@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **Orphan one-shot wait timeouts now fail loud before side effects.** An explicit
+  `--wait-timeout` without `--wait-js` is a usage error instead of a silently
+  discarded contract. Both spaced and `--wait-timeout=...` spellings receive the
+  same dependency refusal before input resolution, Chrome discovery, or artifact
+  creation. Paired waits retain the implicit 10-second default and explicit timeout
+  behavior unchanged.
 - **Capture-scoped PNG vision-deficiency previews** (plan d19eba9f). Library
   `screenshot(..., VisionDeficiency)` / `screenshotClip(..., VisionDeficiency)` and CLI
   `--vision-deficiency` support `none`, `achromatopsia`, `deuteranopia`, `protanopia`, and
