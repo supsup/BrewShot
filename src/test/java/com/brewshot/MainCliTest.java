@@ -113,7 +113,8 @@ class MainCliTest {
         assertTrue(pairedErrors.toString().contains("not a URL, an existing file, or '-'"),
             pairedErrors.toString());
         org.junit.jupiter.api.Assertions.assertFalse(
-            pairedErrors.toString().contains("requires --wait-js"), pairedErrors.toString());
+            pairedErrors.toString().contains("--wait-timeout requires --wait-js"),
+            pairedErrors.toString());
 
         ByteArrayOutputStream missingInputErrors = new ByteArrayOutputStream();
         original = System.err;
@@ -128,7 +129,7 @@ class MainCliTest {
         assertTrue(missingInputErrors.toString().contains("usage: brewshot"),
             missingInputErrors.toString());
         org.junit.jupiter.api.Assertions.assertFalse(
-            missingInputErrors.toString().contains("requires --wait-js"),
+            missingInputErrors.toString().contains("--wait-timeout requires --wait-js"),
             "input presence validation must run before the dependency guard");
     }
 
