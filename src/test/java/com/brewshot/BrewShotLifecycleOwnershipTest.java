@@ -360,7 +360,15 @@ class BrewShotLifecycleOwnershipTest {
     @Test
     void actualShutdownBudgetExhaustionRetainsOwnership(@TempDir Path temp)
             throws Exception {
-        FakeProcess process = new FakeProcess(Integer.MAX_VALUE);
+        // HUNG MEANS DEAF TO BOTH SIGNALS (plan 07a0b891). The 1-arg constructor sets
+        // gracefulKillsParent=true, i.e. a child that dies on SIGTERM. That never mattered while
+        // shutdown sent SIGKILL only; now that the signal pass sends destroy() to every lease
+        // first, such a child exits before the reap loop runs and this test measures an empty
+        // budget instead of an exhausted one. The property under test -- a fixed reconciliation
+        // pass bound inside one global wait budget -- is about a child that IGNORES signals, so
+        // the fixture now says so. The assertions below are unchanged.
+        FakeProcess process = new FakeProcess(
+            Integer.MAX_VALUE, true, new FakeHandle(9001, true, List.of()));
         Path profile = profile(temp, "shutdown-exhausted");
         BrewShot.ResourceLease lease =
             BrewShot.registerContainedLaunchLeaseForTests(process, profile);
@@ -391,7 +399,11 @@ class BrewShotLifecycleOwnershipTest {
         List<Path> profiles = new java.util.ArrayList<>();
         List<BrewShot.ResourceLease> leases = new java.util.ArrayList<>();
         for (int i = 0; i < 4; i++) {
-            FakeProcess process = new FakeProcess(Integer.MAX_VALUE);
+            // Deaf to SIGTERM as well as SIGKILL -- see the note in
+            // actualShutdownBudgetExhaustionRetainsOwnership. A child that exits on the new
+            // signal pass would leave nothing for the shared deadline to be shared ACROSS.
+            FakeProcess process = new FakeProcess(
+                Integer.MAX_VALUE, true, new FakeHandle(9100 + i, true, List.of()));
             Path profile = profile(temp, "global-bound-" + i);
             processes.add(process);
             profiles.add(profile);

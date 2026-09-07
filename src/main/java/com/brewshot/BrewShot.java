@@ -715,6 +715,49 @@ public final class BrewShot implements AutoCloseable {
             }
         }
 
+        /**
+         * Ask this lease's process tree to stop, and DO NOT WAIT (plan 07a0b891).
+         *
+         * The shutdown budget exists to bound how long teardown WAITS. It must not also bound how
+         * many children are ASKED to stop -- those are different things and only the first is a
+         * reasonable thing to time-box. Signalling is a non-blocking kernel call; waiting is the
+         * expensive part, and it was the waiting that consumed the budget while later leases went
+         * untouched.
+         *
+         * Refreshes the handle snapshot first, for the same reason {@code cleanup} does: a
+         * descendant that reparented after launch is invisible to a stale snapshot, and an
+         * unsignalled reparented child is precisely what this pass exists to prevent.
+         *
+         * GRACEFUL, not forcible, and that distinction is load-bearing. The reap path still owns
+         * the first destroyForcibly; this pass only ASKS. Sending SIGKILL here would not merely be
+         * ruder, it would move the forcible kill earlier for every lease and change what the
+         * existing suite observes -- which is exactly what happened when I tried it: eight
+         * lifecycle tests that pin kill counts and pass accounting went red against a baseline
+         * that is green. A repair whose first act is to break the tests around it has usually
+         * changed more than it meant to.
+         *
+         * Deliberately changes NO lease state. Ownership, the orphan sweep, the release gate and
+         * the profile deletion all stay in {@code cleanup}: none of them is a signal, and every one
+         * of them can block.
+         */
+        synchronized void signalOnly() {
+            if (owner == Owner.RELEASED) { return; }
+            refreshProcessTreeSnapshot();
+            for (ProcessHandle handle : List.copyOf(descendantHandles)) {
+                if (handleAlive(handle)) {
+                    try { handle.destroy(); }
+                    catch (RuntimeException ignored) { }
+                }
+            }
+            if (isAlive(process)) {
+                try { process.destroy(); }
+                catch (RuntimeException ignored) { }
+            } else if (parentHandle != null && handleAlive(parentHandle)) {
+                try { parentHandle.destroy(); }
+                catch (RuntimeException ignored) { }
+            }
+        }
+
         synchronized void cleanup(boolean gracefulFirst) {
             long timeoutMs = gracefulFirst
                 ? PROCESS_CLOSE_TIMEOUT_MS + PROCESS_FORCE_REAP_TIMEOUT_MS
@@ -982,6 +1025,30 @@ public final class BrewShot implements AutoCloseable {
             if (beginJvmShutdown) { shutdownStarted = true; }
             initialSnapshot = List.copyOf(LIVE);
         }
+        // SIGNAL PASS -- EVERY LEASE IS ASKED TO STOP, BEFORE ANY WAITING (plan 07a0b891).
+        //
+        // This loop used to be the whole of shutdown, with one budget covering signalling AND
+        // waiting and a `deadline.expired()` return INSIDE the per-lease loop. At 500 ms per
+        // attempt against a 5 s budget that is ten attempts: with forty leases, roughly ten were
+        // asked to stop and thirty were never touched -- not killed and failed to die, never
+        // asked. Which thirty was unspecified, because LIVE is a hash set and the snapshot
+        // inherits its iteration order.
+        //
+        // The budget is meant to bound how long shutdown WAITS. It must not also bound how many
+        // children are told to stop. So every lease is signalled here first, and the deadline is
+        // created AFTERWARDS -- deliberately, so signalling cannot consume the reaping budget
+        // even if the set is large. Signalling is non-blocking; the wait is the expensive part.
+        //
+        // Only the JVM shutdown hook takes this pass. cleanupOwnedResources(false) is reached
+        // solely from runShutdownCleanupForTests, and forcibly signalling every lease there would
+        // change what existing single-pass tests exercise without fixing anything: the defect is
+        // in the hook.
+        if (beginJvmShutdown) {
+            for (ResourceLease lease : initialSnapshot) {
+                lease.signalOnly();
+            }
+        }
+
         // Admission-lock wait is deliberately outside this budget: an admitted
         // ProcessBuilder.start must return and register before shutdown may
         // finish. Once that fence is acquired, all process waits and retry
@@ -1000,11 +1067,38 @@ public final class BrewShot implements AutoCloseable {
             }
             if (snapshot.isEmpty()) { return; }
             for (ResourceLease lease : snapshot) {
-                if (deadline.expired()) { return; }
+                if (deadline.expired()) { reportAbandoned(beginJvmShutdown); return; }
                 lease.cleanup(false,
                     deadline.cappedAtMillis(SHUTDOWN_ATTEMPT_TIMEOUT_MS));
             }
         }
+        reportAbandoned(beginJvmShutdown);
+    }
+
+    /**
+     * WHAT THE EXPIRED DEADLINE MEANS FOR THE SECOND PASS, said out loud (plan 07a0b891 step 2).
+     *
+     * After the signal pass, an unreaped lease is no longer an unasked one: it has been sent
+     * SIGKILL and has not been confirmed dead within the budget. That is a materially different
+     * and much better state than the old behaviour, and it is worth distinguishing in the output
+     * rather than leaving both to look like silence.
+     *
+     * It reports rather than escalating. There is no further signal to send -- signalOnly already
+     * used destroyForcibly -- so a second forcible pass would add nothing but delay inside a
+     * shutdown hook the JVM may terminate at any moment. Reaping is what ran out of time, and
+     * more killing does not buy reaping.
+     *
+     * Silence is what let this defect live: a shutdown that abandons children without saying so
+     * looks exactly like a shutdown that had nothing to do.
+     */
+    private static void reportAbandoned(boolean beginJvmShutdown) {
+        if (!beginJvmShutdown) { return; }
+        List<ResourceLease> remaining;
+        synchronized (OWNERSHIP_LOCK) { remaining = List.copyOf(LIVE); }
+        if (remaining.isEmpty()) { return; }
+        System.err.println("brewshot: shutdown budget expired with " + remaining.size()
+            + " lease(s) signalled but not confirmed reaped"
+            + " (every live lease was sent a forcible signal before waiting began)");
     }
 
     static void runShutdownCleanupForTests() {
