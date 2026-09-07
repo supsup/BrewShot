@@ -736,6 +736,13 @@ public final class BrewShot implements AutoCloseable {
          * that is green. A repair whose first act is to break the tests around it has usually
          * changed more than it meant to.
          *
+         * THE CONSEQUENCE OF CHOOSING GRACEFUL, named so it is a decision and not an accident of
+         * whichever fixtures happened to be green: a child DEAF TO SIGTERM that the reaping budget
+         * never reaches is asked to stop, is never forcibly killed by this pass, and SURVIVES
+         * SHUTDOWN. That is strictly better than the defect this replaced -- where such a child was
+         * never contacted at all -- and it is not the same as being reaped. reportAbandoned says so
+         * on stderr rather than letting the improvement read as completion.
+         *
          * Deliberately changes NO lease state. Ownership, the orphan sweep, the release gate and
          * the profile deletion all stay in {@code cleanup}: none of them is a signal, and every one
          * of them can block.
@@ -1078,15 +1085,21 @@ public final class BrewShot implements AutoCloseable {
     /**
      * WHAT THE EXPIRED DEADLINE MEANS FOR THE SECOND PASS, said out loud (plan 07a0b891 step 2).
      *
-     * After the signal pass, an unreaped lease is no longer an unasked one: it has been sent
-     * SIGKILL and has not been confirmed dead within the budget. That is a materially different
-     * and much better state than the old behaviour, and it is worth distinguishing in the output
-     * rather than leaving both to look like silence.
+     * After the signal pass, an unreaped lease is no longer an UNASKED one: every live lease was
+     * sent SIGTERM before any waiting began. That is a materially better state than the old
+     * behaviour and it is worth distinguishing in the output rather than leaving both to look
+     * like silence.
      *
-     * It reports rather than escalating. There is no further signal to send -- signalOnly already
-     * used destroyForcibly -- so a second forcible pass would add nothing but delay inside a
-     * shutdown hook the JVM may terminate at any moment. Reaping is what ran out of time, and
-     * more killing does not buy reaping.
+     * BUT IT IS NOT A KILL, AND THIS REPORT MUST NOT CLAIM IT WAS. signalOnly sends destroy(),
+     * not destroyForcibly. A child deaf to SIGTERM that the budget never reached has therefore
+     * been ASKED and not killed, and it survives shutdown. Saying "forcible" here would replace
+     * the silence this report exists to end with a wrong sentence, which is worse: silence
+     * invites a look, and a confident false line does not.
+     *
+     * It reports rather than escalating. Escalating would mean a second forcible pass inside a
+     * hook the JVM may terminate at any moment, and reaping -- not killing -- is what ran out of
+     * time. That is a defensible trade and the operator is the one who should get to weigh it,
+     * which is exactly why the line has to be accurate about what was and was not sent.
      *
      * Silence is what let this defect live: a shutdown that abandons children without saying so
      * looks exactly like a shutdown that had nothing to do.
@@ -1097,8 +1110,9 @@ public final class BrewShot implements AutoCloseable {
         synchronized (OWNERSHIP_LOCK) { remaining = List.copyOf(LIVE); }
         if (remaining.isEmpty()) { return; }
         System.err.println("brewshot: shutdown budget expired with " + remaining.size()
-            + " lease(s) signalled but not confirmed reaped"
-            + " (every live lease was sent a forcible signal before waiting began)");
+            + " lease(s) asked to stop but not confirmed reaped"
+            + " (every live lease was sent SIGTERM before waiting began; leases not confirmed"
+            + " reaped were NOT forcibly killed by this pass and may still be running)");
     }
 
     static void runShutdownCleanupForTests() {
