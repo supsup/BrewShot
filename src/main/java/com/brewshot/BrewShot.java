@@ -1116,11 +1116,28 @@ public final class BrewShot implements AutoCloseable {
         // (plan ef90957e): while it was synchronized on the lease monitor, a stalled close() could
         // block this pass indefinitely with no deadline yet in existence to bound it. The ordering
         // is unchanged; what changed is that the pass can no longer wait on THE LEASE MONITOR, which is
-        // the unbounded wait that motivated the ordering. It is not FREE: it enumerates the host process
-        // table once per lease to observe descendants -- about 30ms here, see the argv-sweep note on
-        // orphanSweepDone -- so a large set spends real time before the deadline exists. That is bounded
-        // and proportional, unlike a stalled close(), but "waits on nothing" was false, and this file is
-        // supposed to make that kind of claim carefully (needs-fix 591 finding 3).
+        // the unbounded wait that motivated the ordering.
+        //
+        // IT IS NOT FREE, BUT IT IS CHEAP, AND THE FIRST VERSION OF THIS SENTENCE GOT THAT WRONG BY 150x
+        // (needs-fix 597 finding 1). It observes descendants once per lease, which does enumerate the host
+        // process table. I wrote "about 30ms here" and cited the argv-sweep note on orphanSweepDone --
+        // a number belonging to a DIFFERENT operation. The sweep is allProcesses() plus info().commandLine()
+        // per process, and the commandLine() read is what costs; descendants() never calls info() at all.
+        //
+        // Measured on this host, 800 processes, five runs each after warmup:
+        //     ProcessHandle.descendants()                      0.155 - 0.253 ms
+        //     allProcesses() + info().commandLine()           28.1   - 35.1   ms
+        //
+        // So at 40 leases this pass spends roughly 8ms before the deadline exists, against a 5s budget.
+        // The claim it replaced said "a large set spends real time"; that conclusion was resting on the
+        // borrowed figure and is withdrawn with it. The cost is bounded and proportional and, at any
+        // plausible lease count, negligible -- unlike a stalled close(), which is unbounded.
+        //
+        // The reason to say any of this is that "the pass can no longer wait on anything" was false in
+        // KIND even though it is nearly true in MAGNITUDE, and I replaced that false claim with a false
+        // number one round later, which is the same defect wearing the other hat. The figures above are
+        // measured rather than analogised, and they are host-dependent by nature: re-measure, do not
+        // re-cite.
         //
         // Only the JVM shutdown hook takes this pass. cleanupOwnedResources(false) is reached
         // solely from runShutdownCleanupForTests, and forcibly signalling every lease there would
