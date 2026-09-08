@@ -689,6 +689,14 @@ public final class BrewShot implements AutoCloseable {
         private final java.util.concurrent.atomic.AtomicReference<List<ProcessHandle>>
             descendantHandles = new java.util.concurrent.atomic.AtomicReference<>(List.of());
         private volatile Owner owner = Owner.LAUNCH;
+        /// Whether a destroyForcibly was ACTUALLY sent to any member of this lease's tree. Not
+        /// "was reached by the reap pass", which is what the abandoned report used to mean by it
+        /// and is a different fact: terminateProcess skips the forcible branch entirely when
+        /// allProcessesDead already holds, so an already-dead lease retained for an undeleted
+        /// profile is reached and never signalled (needs-fix 605 regression 2).
+        private volatile boolean forciblySignalled;
+
+        boolean forciblySignalled() { return forciblySignalled; }
         /** The argv sweep enumerates every process on the host (~30ms here), so
          *  it runs ONCE per lease rather than on every retry pass: reparenting
          *  happens at most once per launch, and a per-pass sweep would spend a
@@ -811,9 +819,11 @@ public final class BrewShot implements AutoCloseable {
             // Refresh while the parent is still alive and before any controlled
             // signal. Retained handles survive parent exit/reparenting.
             refreshProcessTreeSnapshot();
+            boolean[] sentForcible = { false };
             boolean processTreeReaped = terminateProcess(
                 process, parentHandle, descendantHandles.get(),
-                gracefulFirst, deadline);
+                gracefulFirst, deadline, sentForcible);
+            if (sentForcible[0]) { forciblySignalled = true; }
             // Runs BEFORE the release gate and the delete: a helper that was
             // reparented out of every handle snapshot is invisible to
             // terminateProcess, and it recreates the directory we are about to
@@ -1184,6 +1194,13 @@ public final class BrewShot implements AutoCloseable {
         // Synchronous filesystem deletion is not an interruptible Java
         // operation and is not falsely claimed to be covered by the wait bound.
         int maxPasses = beginJvmShutdown ? SHUTDOWN_CLEANUP_MAX_PASSES : 1;
+        // Which leases the reap pass REACHED. This is NOT the same as which were killed, and
+        // conflating them was needs-fix 605 regression 2: terminateProcess skips the forcible
+        // branch when allProcessesDead already holds, so a lease whose process died earlier and is
+        // retained only because its profile could not be deleted is reached and never signalled.
+        // The report asked this set "were you SIGKILLed" and it could only answer "I was visited".
+        java.util.Set<ResourceLease> reached = java.util.Collections.newSetFromMap(
+            new java.util.IdentityHashMap<>());
         for (int pass = 0; pass < maxPasses && !deadline.expired(); pass++) {
             List<ResourceLease> snapshot = initialSnapshot;
             if (pass > 0) {
@@ -1193,12 +1210,69 @@ public final class BrewShot implements AutoCloseable {
             }
             if (snapshot.isEmpty()) { return; }
             for (ResourceLease lease : snapshot) {
-                if (deadline.expired()) { reportAbandoned(beginJvmShutdown); return; }
+                if (deadline.expired()) {
+                    reportAbandoned(beginJvmShutdown, AbandonCause.BUDGET_EXPIRED, reached);
+                    return;
+                }
+                // REACHED, and nothing more. The comment that stood here claimed "a lease this line
+                // reaches is one destroyForcibly was sent to", which is FALSE whenever the tree is
+                // already dead -- the forcible branch is guarded by !allProcessesDead, not only by
+                // the deadline. I wrote that sentence as the justification for the change, in the
+                // same edit as the change, so it recorded my belief rather than checking it. What
+                // was actually sent is now reported by terminateProcess and asked of the lease.
+                reached.add(lease);
                 lease.cleanup(false,
                     deadline.cappedAtMillis(SHUTDOWN_ATTEMPT_TIMEOUT_MS));
             }
         }
-        reportAbandoned(beginJvmShutdown);
+        // WHICH CONJUNCT ENDED THE LOOP (needs-fix 605 regression 1). The for-condition has TWO
+        // exits, `pass < maxPasses` and `!deadline.expired()`, and both fell through to this one
+        // call. So a budget that ran out exactly at a pass boundary reported "passes exhausted
+        // with budget remaining" while the whole 5000ms was gone and one pass of three had run --
+        // the reviewer measured 5049ms elapsed at n=10. That is the defect this plan exists to fix,
+        // reintroduced by the fix, pointing the other way: BEFORE this branch that path said
+        // "budget expired", which was TRUE.
+        reportAbandoned(beginJvmShutdown,
+            deadline.expired() ? AbandonCause.BUDGET_EXPIRED : AbandonCause.PASSES_EXHAUSTED,
+            reached);
+    }
+
+    /// WHY the shutdown stopped. The two call sites used to pass the same argument, so one
+    /// sentence spoke for both and named the budget as the cause even when the budget had time
+    /// left and it was the PASS CAP that ran out (plan e9a58b2b).
+    private enum AbandonCause {
+        BUDGET_EXPIRED("the shutdown budget expired"),
+        PASSES_EXHAUSTED("the retry passes were exhausted with budget remaining");
+
+        private final String phrase;
+
+        AbandonCause(String phrase) {
+            this.phrase = phrase;
+        }
+
+        String phrase() {
+            return phrase;
+        }
+    }
+
+    /// The sentence must agree with what this method's own caller actually did. Two clauses of the
+    /// previous one did not: it opened "shutdown budget expired" on the passes-exhausted path where
+    /// the budget had time left, and it asserted leases were NOT forcibly killed while the pass it
+    /// reports on reaches terminateProcess with gracefulFirst=false, whose forcible branch is
+    /// gated only by the deadline. The Javadoc defending that wording reasoned about the SIGNAL
+    /// pass; this report is printed after the REAP pass.
+    static String abandonedReport(AbandonCause cause, int remaining, int killed,
+            int reachedButNotSignalled) {
+        int neverReached = Math.max(0, remaining - killed - reachedButNotSignalled);
+        return "brewshot: " + cause.phrase() + " with " + remaining
+            + " lease(s) not confirmed reaped"
+            + " (every live lease was sent SIGTERM before waiting began; of those remaining, "
+            + killed + " were sent SIGKILL by this pass and were still alive after it, "
+            + reachedButNotSignalled + " were reached but needed no kill because their tree was"
+            + " already dead and they are retained for another reason such as an undeleted"
+            + " profile, and " + neverReached + " were never reached. The " + killed + " killed"
+            + " and the " + neverReached + " unreached may still be running; the "
+            + reachedButNotSignalled + " already-dead are not.)";
     }
 
     /**
@@ -1209,11 +1283,17 @@ public final class BrewShot implements AutoCloseable {
      * behaviour and it is worth distinguishing in the output rather than leaving both to look
      * like silence.
      *
-     * BUT IT IS NOT A KILL, AND THIS REPORT MUST NOT CLAIM IT WAS. signalOnly sends destroy(),
-     * not destroyForcibly. A child deaf to SIGTERM that the budget never reached has therefore
-     * been ASKED and not killed, and it survives shutdown. Saying "forcible" here would replace
-     * the silence this report exists to end with a wrong sentence, which is worse: silence
-     * invites a look, and a confident false line does not.
+     * BUT FOR A LEASE THE REAP PASS NEVER REACHED IT IS NOT A KILL, AND THIS REPORT MUST NOT
+     * CLAIM IT WAS. signalOnly sends destroy(), not destroyForcibly. A child deaf to SIGTERM that
+     * the budget never reached has therefore been ASKED and not killed, and it survives shutdown.
+     * Saying "forcible" for THOSE would replace the silence this report exists to end with a
+     * wrong sentence, which is worse: silence invites a look, and a confident false line does not.
+     *
+     * THE SCOPE OF THAT CLAUSE is why the report now counts the two groups separately (plan
+     * e9a58b2b). A lease the pass DID reach was sent destroyForcibly -- cleanup(false, ...) goes
+     * to terminateProcess's forcible branch, gated only by the deadline -- so asserting
+     * never-killed for every remaining lease was the same species of wrong sentence as the one
+     * this block warns against, pointed the other way.
      *
      * It reports rather than escalating. Escalating would mean a second forcible pass inside a
      * hook the JVM may terminate at any moment, and reaping -- not killing -- is what ran out of
@@ -1223,15 +1303,27 @@ public final class BrewShot implements AutoCloseable {
      * Silence is what let this defect live: a shutdown that abandons children without saying so
      * looks exactly like a shutdown that had nothing to do.
      */
-    private static void reportAbandoned(boolean beginJvmShutdown) {
+    private static void reportAbandoned(boolean beginJvmShutdown, AbandonCause cause,
+            java.util.Set<ResourceLease> reached) {
         if (!beginJvmShutdown) { return; }
         List<ResourceLease> remaining;
         synchronized (OWNERSHIP_LOCK) { remaining = List.copyOf(LIVE); }
         if (remaining.isEmpty()) { return; }
-        System.err.println("brewshot: shutdown budget expired with " + remaining.size()
-            + " lease(s) asked to stop but not confirmed reaped"
-            + " (every live lease was sent SIGTERM before waiting began; leases not confirmed"
-            + " reaped were NOT forcibly killed by this pass and may still be running)");
+        int killed = 0;
+        int reachedButNotSignalled = 0;
+        for (ResourceLease lease : remaining) {
+            if (lease.forciblySignalled()) {
+                killed++;
+            } else if (reached.contains(lease)) {
+                // REACHED AND NOT SIGNALLED is its own category, not a rounding error. Reporting it
+                // as never-reached would be the same species of false clause as calling it killed:
+                // the pass DID get to it, found the tree already dead, and skipped the forcible
+                // branch. Retention is then about the profile, not about a surviving process.
+                reachedButNotSignalled++;
+            }
+        }
+        System.err.println(
+            abandonedReport(cause, remaining.size(), killed, reachedButNotSignalled));
     }
 
     static void runShutdownCleanupForTests() {
@@ -3661,10 +3753,15 @@ public final class BrewShot implements AutoCloseable {
      * and shutdown. Every captured handle waits inside one caller-supplied
      * deadline; the caller's interrupt status is restored before return.
      */
+    /// SENTFORCIBLE is an out-parameter, following this method's own `interrupted` idiom, and it
+    /// is set at each ACTUAL destroyForcibly call rather than on entering the forcible branch
+    /// (needs-fix 597 finding 2 -> needs-fix 605 regression 2). The branch can be entered and send
+    /// NOTHING: no live descendants, a dead process, a null or dead parent handle. Setting it at
+    /// the branch would reproduce the very defect this parameter exists to fix, one level in.
     private static boolean terminateProcess(
             Process process, ProcessHandle parentHandle,
             List<ProcessHandle> descendantHandles,
-            boolean gracefulFirst, Deadline deadline) {
+            boolean gracefulFirst, Deadline deadline, boolean[] sentForcible) {
         boolean[] interrupted = { Thread.interrupted() };
         try {
             if (gracefulFirst && isAlive(process) && !deadline.expired()) {
@@ -3683,15 +3780,30 @@ public final class BrewShot implements AutoCloseable {
                 // exited and descendants() now reports an empty snapshot.
                 for (ProcessHandle handle : descendantHandles) {
                     if (handleAlive(handle)) {
-                        try { handle.destroyForcibly(); }
+                        // THE RETURN VALUE IS THE ANSWER (needs-fix 608).
+                        // ProcessHandle.destroyForcibly() returns a boolean saying whether the
+                        // signal was actually SENT. Setting the flag because the call did not
+                        // THROW made it mean ATTEMPTED while the report labelled it SENT SIGKILL --
+                        // which is needs-fix 605 regression 2 one layer down, the same
+                        // substitution of a near-fact for the fact.
+                        try { sentForcible[0] |= handle.destroyForcibly(); }
                         catch (RuntimeException ignored) { }
                     }
                 }
                 if (isAlive(process)) {
-                    try { process.destroyForcibly(); }
+                    // THIS SITE IS ATTEMPT-BASED AND CANNOT CHEAPLY BE OTHERWISE, said out loud
+                    // rather than left as an inconsistency with the two sites above (needs-fix
+                    // 608). Process.destroyForcibly() returns Process, not a boolean, so there is
+                    // no send-or-not to read; a helper returning true-unless-it-throws would be a
+                    // syntactic move with identical semantics. process.toHandle().destroyForcibly()
+                    // WOULD yield the real boolean, and it is not taken here: toHandle() gives a
+                    // bare pid handle and the reviewer could not confirm it preserves the
+                    // stream-closing side effects documented for Process.destroyForcibly(). That
+                    // is a behaviour change and it owes its own test rather than riding this one.
+                    try { process.destroyForcibly(); sentForcible[0] = true; }
                     catch (RuntimeException ignored) { }
                 } else if (parentHandle != null && handleAlive(parentHandle)) {
-                    try { parentHandle.destroyForcibly(); }
+                    try { sentForcible[0] |= parentHandle.destroyForcibly(); }
                     catch (RuntimeException ignored) { }
                 }
                 List<ProcessHandle> tree = new ArrayList<>(descendantHandles);
