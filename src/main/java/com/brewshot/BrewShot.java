@@ -677,9 +677,18 @@ public final class BrewShot implements AutoCloseable {
         private final ProfileDeleter profileDeleter;
         private final ProcessTreeReleaseProof processTreeReleaseProof;
         private final ProfileAbsenceProbe profileAbsenceProbe;
-        private ProcessHandle parentHandle;
-        private final List<ProcessHandle> descendantHandles = new ArrayList<>();
-        private Owner owner = Owner.LAUNCH;
+        /// VOLATILE, and copy-on-write for the list (plan ef90957e). The shutdown signal pass
+        /// reads all three WITHOUT the lease monitor, because taking that monitor is what let a
+        /// stalled close() block signalling entirely -- before any deadline existed to bound it.
+        /// Writers still hold the monitor; readers need only a safe publication.
+        private volatile ProcessHandle parentHandle;
+        /// A CAS cell, not a plain volatile (needs-fix 591 finding 2). The signal pass now RECORDS
+        /// what it observes instead of discarding it, and it does so without the monitor, so a
+        /// blind `field = merged` from either side could drop the other's additions -- and a
+        /// dropped handle is a descendant that is never force-killed. updateAndGet retries instead.
+        private final java.util.concurrent.atomic.AtomicReference<List<ProcessHandle>>
+            descendantHandles = new java.util.concurrent.atomic.AtomicReference<>(List.of());
+        private volatile Owner owner = Owner.LAUNCH;
         /** The argv sweep enumerates every process on the host (~30ms here), so
          *  it runs ONCE per lease rather than on every retry pass: reparenting
          *  happens at most once per launch, and a per-pass sweep would spend a
@@ -724,9 +733,23 @@ public final class BrewShot implements AutoCloseable {
          * expensive part, and it was the waiting that consumed the budget while later leases went
          * untouched.
          *
-         * Refreshes the handle snapshot first, for the same reason {@code cleanup} does: a
-         * descendant that reparented after launch is invisible to a stale snapshot, and an
-         * unsignalled reparented child is precisely what this pass exists to prevent.
+         * AND THE METHOD IS NOW NON-BLOCKING TOO, WHICH IT WAS NOT WHEN THAT SENTENCE WAS WRITTEN
+         * (plan ef90957e). The claim above was true of {@code handle.destroy()} and false of this
+         * method: it was {@code synchronized} on the same monitor {@code cleanup} holds, so a lease
+         * whose close() had stalled blocked the entire pass on ENTRY, before reaching any kernel
+         * call. It is now lock-free WITH RESPECT TO THE LEASE MONITOR, which is the lock that caused the
+         * defect -- and that qualifier is the point, not throat-clearing. destroy() and isAlive() still
+         * take ProcessImpl's own ReentrantLock, and destroy() closes the three pipes, contending with the
+         * reaper's drain, which BrewShot does use. An unqualified "it is lock-free" would be exactly the
+         * layer-free claim the paragraph below tells you not to make (needs-fix 591 finding 3). A reader
+         * checking "is signalling non-blocking" should check the METHOD -- and should ask WHICH lock.
+         *
+         * Observes the tree and RECORDS what it finds, for the same reason {@code cleanup} does: a
+         * descendant that reparented after launch is invisible to a stale snapshot, and an unsignalled
+         * reparented child is precisely what this pass exists to prevent. RECORDING is the half that went
+         * missing when this method stopped being synchronized: for one revision it observed the live tree,
+         * signalled it, and threw the observation away, so a late-born descendant was asked to stop and
+         * then never force-killed (needs-fix 591 finding 2).
          *
          * GRACEFUL, not forcible, and that distinction is load-bearing. The reap path still owns
          * the first destroyForcibly; this pass only ASKS. Sending SIGKILL here would not merely be
@@ -743,14 +766,24 @@ public final class BrewShot implements AutoCloseable {
          * never contacted at all -- and it is not the same as being reaped. reportAbandoned says so
          * on stderr rather than letting the improvement read as completion.
          *
-         * Deliberately changes NO lease state. Ownership, the orphan sweep, the release gate and
-         * the profile deletion all stay in {@code cleanup}: none of them is a signal, and every one
-         * of them can block.
+         * Changes no lease state EXCEPT the recorded descendant set, which it must -- discovering a child
+         * and then forgetting it is how one survives shutdown (finding 2). Ownership, the orphan sweep,
+         * the release gate and the profile deletion all stay in {@code cleanup}: none of them is a signal,
+         * and every one of them can block.
          */
-        synchronized void signalOnly() {
+        void signalOnly() {
+            // NOT synchronized (plan ef90957e). cleanup() holds this same monitor, so a lease whose
+            // close() was stalled blocked the whole shutdown signal pass on ENTRY -- and the hook
+            // creates its deadline AFTERWARDS, deliberately, so nothing bounded that wait. The
+            // Javadoc's "signalling is a non-blocking kernel call" was true of handle.destroy() and
+            // false of the method that had to take a lock to reach it.
+            //
+            // Lock-free is the option that PRESERVES the ordering's intent rather than budgeting for it: a
+            // pass that cannot block on the lease monitor needs no share of the reaping budget, however large
+            // the lease set. The tree observation IS accumulated into shared state -- it has to be, or the
+            // reap cannot force-kill what this pass discovered -- but it goes in through a CAS, not a monitor.
             if (owner == Owner.RELEASED) { return; }
-            refreshProcessTreeSnapshot();
-            for (ProcessHandle handle : List.copyOf(descendantHandles)) {
+            for (ProcessHandle handle : observeAndRecordTreeWithoutLocking()) {
                 if (handleAlive(handle)) {
                     try { handle.destroy(); }
                     catch (RuntimeException ignored) { }
@@ -779,7 +812,7 @@ public final class BrewShot implements AutoCloseable {
             // signal. Retained handles survive parent exit/reparenting.
             refreshProcessTreeSnapshot();
             boolean processTreeReaped = terminateProcess(
-                process, parentHandle, List.copyOf(descendantHandles),
+                process, parentHandle, descendantHandles.get(),
                 gracefulFirst, deadline);
             // Runs BEFORE the release gate and the delete: a helper that was
             // reparented out of every handle snapshot is invisible to
@@ -837,6 +870,44 @@ public final class BrewShot implements AutoCloseable {
          * signal it after reparenting. This snapshot is useful termination input,
          * never evidence that membership is complete.
          */
+        /// The union of what this lease has RECORDED and what the tree shows RIGHT NOW, computed
+        /// without touching shared state so the signal pass needs no monitor. The recorded half
+        /// matters because a descendant that reparented after launch is no longer under the parent
+        /// and would be invisible to a live observation alone; the live half matters because a
+        /// child born since the last refresh is absent from the record. Signalling a handle that
+        /// has already exited is harmless -- handleAlive() gates every destroy.
+        private List<ProcessHandle> observeAndRecordTreeWithoutLocking() {
+            List<ProcessHandle> live = List.of();
+            try {
+                try (var observed = process.toHandle().descendants()) {
+                    live = observed.toList();
+                }
+            } catch (RuntimeException ignored) {
+                // Best effort, exactly as refreshProcessTreeSnapshot treats it.
+            }
+            // RECORDS, and that is the correction from 591 finding 2. The first version of this
+            // method computed the union into a local and threw it away, so a descendant born after
+            // the last refresh was SIGTERMed by this pass and never written down -- and if the
+            // parent then died of that SIGTERM, the later reap's own refresh saw nothing, the
+            // handle was in no snapshot, and it was never destroyForcibly'd. The argv sweep would
+            // usually still catch it, but "usually caught by a backstop" is not the contract this
+            // pass advertises.
+            return recordDescendants(live);
+        }
+
+        /// Merge OBSERVED into the recorded set and publish, losing nothing under concurrency.
+        /// Both the monitor-holding refresh and the lock-free signal pass go through here.
+        private List<ProcessHandle> recordDescendants(List<ProcessHandle> observed) {
+            ProcessHandle parent = parentHandle;
+            return descendantHandles.updateAndGet(current -> {
+                List<ProcessHandle> merged = new ArrayList<>(current);
+                for (ProcessHandle handle : observed) {
+                    if (!handle.equals(parent) && !merged.contains(handle)) { merged.add(handle); }
+                }
+                return List.copyOf(merged);
+            });
+        }
+
         private void refreshProcessTreeSnapshot() {
             ProcessHandle observedParent = null;
             List<ProcessHandle> observedDescendants = List.of();
@@ -851,12 +922,9 @@ public final class BrewShot implements AutoCloseable {
 
             if (observedParent != null) {
                 if (parentHandle == null) { parentHandle = observedParent; }
-                for (ProcessHandle handle : observedDescendants) {
-                    if (!handle.equals(parentHandle)
-                            && !descendantHandles.contains(handle)) {
-                        descendantHandles.add(handle);
-                    }
-                }
+                // Shared with the lock-free signal pass, so the merge is a CAS and the published
+                // list is immutable: a reader with no monitor must never see it mid-mutation.
+                recordDescendants(observedDescendants);
             }
         }
     }
@@ -1044,7 +1112,32 @@ public final class BrewShot implements AutoCloseable {
         // The budget is meant to bound how long shutdown WAITS. It must not also bound how many
         // children are told to stop. So every lease is signalled here first, and the deadline is
         // created AFTERWARDS -- deliberately, so signalling cannot consume the reaping budget
-        // even if the set is large. Signalling is non-blocking; the wait is the expensive part.
+        // even if the set is large. That ordering is only SAFE because signalOnly is lock-free
+        // (plan ef90957e): while it was synchronized on the lease monitor, a stalled close() could
+        // block this pass indefinitely with no deadline yet in existence to bound it. The ordering
+        // is unchanged; what changed is that the pass can no longer wait on THE LEASE MONITOR, which is
+        // the unbounded wait that motivated the ordering.
+        //
+        // IT IS NOT FREE, BUT IT IS CHEAP, AND THE FIRST VERSION OF THIS SENTENCE GOT THAT WRONG BY 150x
+        // (needs-fix 597 finding 1). It observes descendants once per lease, which does enumerate the host
+        // process table. I wrote "about 30ms here" and cited the argv-sweep note on orphanSweepDone --
+        // a number belonging to a DIFFERENT operation. The sweep is allProcesses() plus info().commandLine()
+        // per process, and the commandLine() read is what costs; descendants() never calls info() at all.
+        //
+        // Measured on this host, 800 processes, five runs each after warmup:
+        //     ProcessHandle.descendants()                      0.155 - 0.253 ms
+        //     allProcesses() + info().commandLine()           28.1   - 35.1   ms
+        //
+        // So at 40 leases this pass spends roughly 8ms before the deadline exists, against a 5s budget.
+        // The claim it replaced said "a large set spends real time"; that conclusion was resting on the
+        // borrowed figure and is withdrawn with it. The cost is bounded and proportional and, at any
+        // plausible lease count, negligible -- unlike a stalled close(), which is unbounded.
+        //
+        // The reason to say any of this is that "the pass can no longer wait on anything" was false in
+        // KIND even though it is nearly true in MAGNITUDE, and I replaced that false claim with a false
+        // number one round later, which is the same defect wearing the other hat. The figures above are
+        // measured rather than analogised, and they are host-dependent by nature: re-measure, do not
+        // re-cite.
         //
         // Only the JVM shutdown hook takes this pass. cleanupOwnedResources(false) is reached
         // solely from runShutdownCleanupForTests, and forcibly signalling every lease there would
