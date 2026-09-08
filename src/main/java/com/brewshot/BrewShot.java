@@ -1158,6 +1158,11 @@ public final class BrewShot implements AutoCloseable {
         // Synchronous filesystem deletion is not an interruptible Java
         // operation and is not falsely claimed to be covered by the wait bound.
         int maxPasses = beginJvmShutdown ? SHUTDOWN_CLEANUP_MAX_PASSES : 1;
+        // Which leases the reap pass actually REACHED. Without this the report cannot tell a lease
+        // that was SIGKILLed and survived from one the budget never got to, and the old sentence
+        // asserted the second for both (plan e9a58b2b).
+        java.util.Set<ResourceLease> reaped = java.util.Collections.newSetFromMap(
+            new java.util.IdentityHashMap<>());
         for (int pass = 0; pass < maxPasses && !deadline.expired(); pass++) {
             List<ResourceLease> snapshot = initialSnapshot;
             if (pass > 0) {
@@ -1167,12 +1172,55 @@ public final class BrewShot implements AutoCloseable {
             }
             if (snapshot.isEmpty()) { return; }
             for (ResourceLease lease : snapshot) {
-                if (deadline.expired()) { reportAbandoned(beginJvmShutdown); return; }
+                if (deadline.expired()) {
+                    reportAbandoned(beginJvmShutdown, AbandonCause.BUDGET_EXPIRED, reaped);
+                    return;
+                }
+                // Records that this pass REACHED the lease: cleanup(false, ...) goes to terminateProcess
+                // with gracefulFirst=false, whose FORCIBLE branch is guarded only by the deadline, so a
+                // lease this line reaches is one destroyForcibly was sent to. The REASON is load-bearing;
+                // the line's position relative to the cleanup call is not -- both orders record the same
+                // set on every path that reaches a report, since an escaping cleanup would take the hook
+                // down before one printed. Stated so the ordering is not read as a tested invariant.
+                reaped.add(lease);
                 lease.cleanup(false,
                     deadline.cappedAtMillis(SHUTDOWN_ATTEMPT_TIMEOUT_MS));
             }
         }
-        reportAbandoned(beginJvmShutdown);
+        reportAbandoned(beginJvmShutdown, AbandonCause.PASSES_EXHAUSTED, reaped);
+    }
+
+    /// WHY the shutdown stopped. The two call sites used to pass the same argument, so one
+    /// sentence spoke for both and named the budget as the cause even when the budget had time
+    /// left and it was the PASS CAP that ran out (plan e9a58b2b).
+    private enum AbandonCause {
+        BUDGET_EXPIRED("the shutdown budget expired"),
+        PASSES_EXHAUSTED("the retry passes were exhausted with budget remaining");
+
+        private final String phrase;
+
+        AbandonCause(String phrase) {
+            this.phrase = phrase;
+        }
+
+        String phrase() {
+            return phrase;
+        }
+    }
+
+    /// The sentence must agree with what this method's own caller actually did. Two clauses of the
+    /// previous one did not: it opened "shutdown budget expired" on the passes-exhausted path where
+    /// the budget had time left, and it asserted leases were NOT forcibly killed while the pass it
+    /// reports on reaches terminateProcess with gracefulFirst=false, whose forcible branch is
+    /// gated only by the deadline. The Javadoc defending that wording reasoned about the SIGNAL
+    /// pass; this report is printed after the REAP pass.
+    static String abandonedReport(AbandonCause cause, int remaining, int reachedAndSurvived) {
+        int neverReached = Math.max(0, remaining - reachedAndSurvived);
+        return "brewshot: " + cause.phrase() + " with " + remaining
+            + " lease(s) not confirmed reaped"
+            + " (every live lease was sent SIGTERM before waiting began; of those remaining, "
+            + reachedAndSurvived + " were sent SIGKILL by this pass and survived it, and "
+            + neverReached + " were never reached; all may still be running)";
     }
 
     /**
@@ -1183,11 +1231,17 @@ public final class BrewShot implements AutoCloseable {
      * behaviour and it is worth distinguishing in the output rather than leaving both to look
      * like silence.
      *
-     * BUT IT IS NOT A KILL, AND THIS REPORT MUST NOT CLAIM IT WAS. signalOnly sends destroy(),
-     * not destroyForcibly. A child deaf to SIGTERM that the budget never reached has therefore
-     * been ASKED and not killed, and it survives shutdown. Saying "forcible" here would replace
-     * the silence this report exists to end with a wrong sentence, which is worse: silence
-     * invites a look, and a confident false line does not.
+     * BUT FOR A LEASE THE REAP PASS NEVER REACHED IT IS NOT A KILL, AND THIS REPORT MUST NOT
+     * CLAIM IT WAS. signalOnly sends destroy(), not destroyForcibly. A child deaf to SIGTERM that
+     * the budget never reached has therefore been ASKED and not killed, and it survives shutdown.
+     * Saying "forcible" for THOSE would replace the silence this report exists to end with a
+     * wrong sentence, which is worse: silence invites a look, and a confident false line does not.
+     *
+     * THE SCOPE OF THAT CLAUSE is why the report now counts the two groups separately (plan
+     * e9a58b2b). A lease the pass DID reach was sent destroyForcibly -- cleanup(false, ...) goes
+     * to terminateProcess's forcible branch, gated only by the deadline -- so asserting
+     * never-killed for every remaining lease was the same species of wrong sentence as the one
+     * this block warns against, pointed the other way.
      *
      * It reports rather than escalating. Escalating would mean a second forcible pass inside a
      * hook the JVM may terminate at any moment, and reaping -- not killing -- is what ran out of
@@ -1197,15 +1251,17 @@ public final class BrewShot implements AutoCloseable {
      * Silence is what let this defect live: a shutdown that abandons children without saying so
      * looks exactly like a shutdown that had nothing to do.
      */
-    private static void reportAbandoned(boolean beginJvmShutdown) {
+    private static void reportAbandoned(boolean beginJvmShutdown, AbandonCause cause,
+            java.util.Set<ResourceLease> reaped) {
         if (!beginJvmShutdown) { return; }
         List<ResourceLease> remaining;
         synchronized (OWNERSHIP_LOCK) { remaining = List.copyOf(LIVE); }
         if (remaining.isEmpty()) { return; }
-        System.err.println("brewshot: shutdown budget expired with " + remaining.size()
-            + " lease(s) asked to stop but not confirmed reaped"
-            + " (every live lease was sent SIGTERM before waiting began; leases not confirmed"
-            + " reaped were NOT forcibly killed by this pass and may still be running)");
+        int reachedAndSurvived = 0;
+        for (ResourceLease lease : remaining) {
+            if (reaped.contains(lease)) { reachedAndSurvived++; }
+        }
+        System.err.println(abandonedReport(cause, remaining.size(), reachedAndSurvived));
     }
 
     static void runShutdownCleanupForTests() {
