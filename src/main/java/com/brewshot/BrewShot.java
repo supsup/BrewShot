@@ -689,6 +689,14 @@ public final class BrewShot implements AutoCloseable {
         private final java.util.concurrent.atomic.AtomicReference<List<ProcessHandle>>
             descendantHandles = new java.util.concurrent.atomic.AtomicReference<>(List.of());
         private volatile Owner owner = Owner.LAUNCH;
+        /// Whether a destroyForcibly was ACTUALLY sent to any member of this lease's tree. Not
+        /// "was reached by the reap pass", which is what the abandoned report used to mean by it
+        /// and is a different fact: terminateProcess skips the forcible branch entirely when
+        /// allProcessesDead already holds, so an already-dead lease retained for an undeleted
+        /// profile is reached and never signalled (needs-fix 605 regression 2).
+        private volatile boolean forciblySignalled;
+
+        boolean forciblySignalled() { return forciblySignalled; }
         /** The argv sweep enumerates every process on the host (~30ms here), so
          *  it runs ONCE per lease rather than on every retry pass: reparenting
          *  happens at most once per launch, and a per-pass sweep would spend a
@@ -811,9 +819,11 @@ public final class BrewShot implements AutoCloseable {
             // Refresh while the parent is still alive and before any controlled
             // signal. Retained handles survive parent exit/reparenting.
             refreshProcessTreeSnapshot();
+            boolean[] sentForcible = { false };
             boolean processTreeReaped = terminateProcess(
                 process, parentHandle, descendantHandles.get(),
-                gracefulFirst, deadline);
+                gracefulFirst, deadline, sentForcible);
+            if (sentForcible[0]) { forciblySignalled = true; }
             // Runs BEFORE the release gate and the delete: a helper that was
             // reparented out of every handle snapshot is invisible to
             // terminateProcess, and it recreates the directory we are about to
@@ -1158,10 +1168,12 @@ public final class BrewShot implements AutoCloseable {
         // Synchronous filesystem deletion is not an interruptible Java
         // operation and is not falsely claimed to be covered by the wait bound.
         int maxPasses = beginJvmShutdown ? SHUTDOWN_CLEANUP_MAX_PASSES : 1;
-        // Which leases the reap pass actually REACHED. Without this the report cannot tell a lease
-        // that was SIGKILLed and survived from one the budget never got to, and the old sentence
-        // asserted the second for both (plan e9a58b2b).
-        java.util.Set<ResourceLease> reaped = java.util.Collections.newSetFromMap(
+        // Which leases the reap pass REACHED. This is NOT the same as which were killed, and
+        // conflating them was needs-fix 605 regression 2: terminateProcess skips the forcible
+        // branch when allProcessesDead already holds, so a lease whose process died earlier and is
+        // retained only because its profile could not be deleted is reached and never signalled.
+        // The report asked this set "were you SIGKILLed" and it could only answer "I was visited".
+        java.util.Set<ResourceLease> reached = java.util.Collections.newSetFromMap(
             new java.util.IdentityHashMap<>());
         for (int pass = 0; pass < maxPasses && !deadline.expired(); pass++) {
             List<ResourceLease> snapshot = initialSnapshot;
@@ -1173,21 +1185,30 @@ public final class BrewShot implements AutoCloseable {
             if (snapshot.isEmpty()) { return; }
             for (ResourceLease lease : snapshot) {
                 if (deadline.expired()) {
-                    reportAbandoned(beginJvmShutdown, AbandonCause.BUDGET_EXPIRED, reaped);
+                    reportAbandoned(beginJvmShutdown, AbandonCause.BUDGET_EXPIRED, reached);
                     return;
                 }
-                // Records that this pass REACHED the lease: cleanup(false, ...) goes to terminateProcess
-                // with gracefulFirst=false, whose FORCIBLE branch is guarded only by the deadline, so a
-                // lease this line reaches is one destroyForcibly was sent to. The REASON is load-bearing;
-                // the line's position relative to the cleanup call is not -- both orders record the same
-                // set on every path that reaches a report, since an escaping cleanup would take the hook
-                // down before one printed. Stated so the ordering is not read as a tested invariant.
-                reaped.add(lease);
+                // REACHED, and nothing more. The comment that stood here claimed "a lease this line
+                // reaches is one destroyForcibly was sent to", which is FALSE whenever the tree is
+                // already dead -- the forcible branch is guarded by !allProcessesDead, not only by
+                // the deadline. I wrote that sentence as the justification for the change, in the
+                // same edit as the change, so it recorded my belief rather than checking it. What
+                // was actually sent is now reported by terminateProcess and asked of the lease.
+                reached.add(lease);
                 lease.cleanup(false,
                     deadline.cappedAtMillis(SHUTDOWN_ATTEMPT_TIMEOUT_MS));
             }
         }
-        reportAbandoned(beginJvmShutdown, AbandonCause.PASSES_EXHAUSTED, reaped);
+        // WHICH CONJUNCT ENDED THE LOOP (needs-fix 605 regression 1). The for-condition has TWO
+        // exits, `pass < maxPasses` and `!deadline.expired()`, and both fell through to this one
+        // call. So a budget that ran out exactly at a pass boundary reported "passes exhausted
+        // with budget remaining" while the whole 5000ms was gone and one pass of three had run --
+        // the reviewer measured 5049ms elapsed at n=10. That is the defect this plan exists to fix,
+        // reintroduced by the fix, pointing the other way: BEFORE this branch that path said
+        // "budget expired", which was TRUE.
+        reportAbandoned(beginJvmShutdown,
+            deadline.expired() ? AbandonCause.BUDGET_EXPIRED : AbandonCause.PASSES_EXHAUSTED,
+            reached);
     }
 
     /// WHY the shutdown stopped. The two call sites used to pass the same argument, so one
@@ -1214,13 +1235,18 @@ public final class BrewShot implements AutoCloseable {
     /// reports on reaches terminateProcess with gracefulFirst=false, whose forcible branch is
     /// gated only by the deadline. The Javadoc defending that wording reasoned about the SIGNAL
     /// pass; this report is printed after the REAP pass.
-    static String abandonedReport(AbandonCause cause, int remaining, int reachedAndSurvived) {
-        int neverReached = Math.max(0, remaining - reachedAndSurvived);
+    static String abandonedReport(AbandonCause cause, int remaining, int killed,
+            int reachedButNotSignalled) {
+        int neverReached = Math.max(0, remaining - killed - reachedButNotSignalled);
         return "brewshot: " + cause.phrase() + " with " + remaining
             + " lease(s) not confirmed reaped"
             + " (every live lease was sent SIGTERM before waiting began; of those remaining, "
-            + reachedAndSurvived + " were sent SIGKILL by this pass and survived it, and "
-            + neverReached + " were never reached; all may still be running)";
+            + killed + " were sent SIGKILL by this pass and were still alive after it, "
+            + reachedButNotSignalled + " were reached but needed no kill because their tree was"
+            + " already dead and they are retained for another reason such as an undeleted"
+            + " profile, and " + neverReached + " were never reached. The " + killed + " killed"
+            + " and the " + neverReached + " unreached may still be running; the "
+            + reachedButNotSignalled + " already-dead are not.)";
     }
 
     /**
@@ -1252,16 +1278,26 @@ public final class BrewShot implements AutoCloseable {
      * looks exactly like a shutdown that had nothing to do.
      */
     private static void reportAbandoned(boolean beginJvmShutdown, AbandonCause cause,
-            java.util.Set<ResourceLease> reaped) {
+            java.util.Set<ResourceLease> reached) {
         if (!beginJvmShutdown) { return; }
         List<ResourceLease> remaining;
         synchronized (OWNERSHIP_LOCK) { remaining = List.copyOf(LIVE); }
         if (remaining.isEmpty()) { return; }
-        int reachedAndSurvived = 0;
+        int killed = 0;
+        int reachedButNotSignalled = 0;
         for (ResourceLease lease : remaining) {
-            if (reaped.contains(lease)) { reachedAndSurvived++; }
+            if (lease.forciblySignalled()) {
+                killed++;
+            } else if (reached.contains(lease)) {
+                // REACHED AND NOT SIGNALLED is its own category, not a rounding error. Reporting it
+                // as never-reached would be the same species of false clause as calling it killed:
+                // the pass DID get to it, found the tree already dead, and skipped the forcible
+                // branch. Retention is then about the profile, not about a surviving process.
+                reachedButNotSignalled++;
+            }
         }
-        System.err.println(abandonedReport(cause, remaining.size(), reachedAndSurvived));
+        System.err.println(
+            abandonedReport(cause, remaining.size(), killed, reachedButNotSignalled));
     }
 
     static void runShutdownCleanupForTests() {
@@ -3691,10 +3727,15 @@ public final class BrewShot implements AutoCloseable {
      * and shutdown. Every captured handle waits inside one caller-supplied
      * deadline; the caller's interrupt status is restored before return.
      */
+    /// SENTFORCIBLE is an out-parameter, following this method's own `interrupted` idiom, and it
+    /// is set at each ACTUAL destroyForcibly call rather than on entering the forcible branch
+    /// (needs-fix 597 finding 2 -> needs-fix 605 regression 2). The branch can be entered and send
+    /// NOTHING: no live descendants, a dead process, a null or dead parent handle. Setting it at
+    /// the branch would reproduce the very defect this parameter exists to fix, one level in.
     private static boolean terminateProcess(
             Process process, ProcessHandle parentHandle,
             List<ProcessHandle> descendantHandles,
-            boolean gracefulFirst, Deadline deadline) {
+            boolean gracefulFirst, Deadline deadline, boolean[] sentForcible) {
         boolean[] interrupted = { Thread.interrupted() };
         try {
             if (gracefulFirst && isAlive(process) && !deadline.expired()) {
@@ -3713,15 +3754,15 @@ public final class BrewShot implements AutoCloseable {
                 // exited and descendants() now reports an empty snapshot.
                 for (ProcessHandle handle : descendantHandles) {
                     if (handleAlive(handle)) {
-                        try { handle.destroyForcibly(); }
+                        try { handle.destroyForcibly(); sentForcible[0] = true; }
                         catch (RuntimeException ignored) { }
                     }
                 }
                 if (isAlive(process)) {
-                    try { process.destroyForcibly(); }
+                    try { process.destroyForcibly(); sentForcible[0] = true; }
                     catch (RuntimeException ignored) { }
                 } else if (parentHandle != null && handleAlive(parentHandle)) {
-                    try { parentHandle.destroyForcibly(); }
+                    try { parentHandle.destroyForcibly(); sentForcible[0] = true; }
                     catch (RuntimeException ignored) { }
                 }
                 List<ProcessHandle> tree = new ArrayList<>(descendantHandles);
