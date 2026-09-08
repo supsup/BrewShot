@@ -3754,15 +3754,30 @@ public final class BrewShot implements AutoCloseable {
                 // exited and descendants() now reports an empty snapshot.
                 for (ProcessHandle handle : descendantHandles) {
                     if (handleAlive(handle)) {
-                        try { handle.destroyForcibly(); sentForcible[0] = true; }
+                        // THE RETURN VALUE IS THE ANSWER (needs-fix 608).
+                        // ProcessHandle.destroyForcibly() returns a boolean saying whether the
+                        // signal was actually SENT. Setting the flag because the call did not
+                        // THROW made it mean ATTEMPTED while the report labelled it SENT SIGKILL --
+                        // which is needs-fix 605 regression 2 one layer down, the same
+                        // substitution of a near-fact for the fact.
+                        try { sentForcible[0] |= handle.destroyForcibly(); }
                         catch (RuntimeException ignored) { }
                     }
                 }
                 if (isAlive(process)) {
+                    // THIS SITE IS ATTEMPT-BASED AND CANNOT CHEAPLY BE OTHERWISE, said out loud
+                    // rather than left as an inconsistency with the two sites above (needs-fix
+                    // 608). Process.destroyForcibly() returns Process, not a boolean, so there is
+                    // no send-or-not to read; a helper returning true-unless-it-throws would be a
+                    // syntactic move with identical semantics. process.toHandle().destroyForcibly()
+                    // WOULD yield the real boolean, and it is not taken here: toHandle() gives a
+                    // bare pid handle and the reviewer could not confirm it preserves the
+                    // stream-closing side effects documented for Process.destroyForcibly(). That
+                    // is a behaviour change and it owes its own test rather than riding this one.
                     try { process.destroyForcibly(); sentForcible[0] = true; }
                     catch (RuntimeException ignored) { }
                 } else if (parentHandle != null && handleAlive(parentHandle)) {
-                    try { parentHandle.destroyForcibly(); sentForcible[0] = true; }
+                    try { sentForcible[0] |= parentHandle.destroyForcibly(); }
                     catch (RuntimeException ignored) { }
                 }
                 List<ProcessHandle> tree = new ArrayList<>(descendantHandles);

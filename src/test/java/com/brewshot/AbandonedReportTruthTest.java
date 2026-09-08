@@ -158,6 +158,11 @@ final class AbandonedReportTruthTest {
         // with destroyForcibly calls of zero, and nothing here could see the difference.
         assertTrue(live.get(0).destroyForciblyCalls.get() > 0,
             "the report claims a SIGKILL, so destroyForcibly must actually have been invoked");
+
+        // The running clause repeats the counts; pin them there too.
+        assertTrue(r.text().contains("The 1 killed and the 0 unreached may still be running; "
+                + "the 0 already-dead are not."),
+            "the running claim must carry the same counts as the split: " + r.text());
     }
 
     @Test
@@ -244,7 +249,128 @@ final class AbandonedReportTruthTest {
 
         assertEquals(0, dead.destroyForciblyCalls.get(),
             "fixture guard: an already-dead process must not have been signalled at all");
-        assertTrue(r.text().contains("already-dead are not."),
-            "the report must not claim a dead lease may still be running: " + r.text());
+
+        // BOUND POSITIONALLY, not by the presence of the phrase (needs-fix 608, minor). This used
+        // to assert contains("already-dead are not."), which is UNCONDITIONAL template text: it
+        // passes on any report the builder produces, including one whose counting is entirely
+        // broken. It was the only spelling-keyed assertion left in a file that is otherwise
+        // behaviour-keyed.
+        //
+        // Deleting it was the offered fix. Binding it is better, because the running-claim clause
+        // is a SECOND use of all three counts and nothing else in this test reaches it -- the
+        // regex above parses only the first three positions. A mutant hard-coding the numbers in
+        // this clause alone would have survived, which is exactly the two-uses-one-assertion shape
+        // I closed in the sirentide banner and left open here.
+        assertTrue(r.text().contains("The 0 killed and the 0 unreached may still be running; "
+                + "the 1 already-dead are not."),
+            "the running claim must carry the SAME counts as the split, at every position it "
+                + "repeats them: " + r.text());
+    }
+
+    /// A handle that is ALIVE and whose destroyForcibly REFUSES, which is the JDK's own way of
+    /// saying the signal was not sent. Counts its calls so the test can prove the site was reached.
+    private static final class RefusingHandle implements ProcessHandle {
+        final java.util.concurrent.atomic.AtomicInteger destroyForciblyCalls =
+            new java.util.concurrent.atomic.AtomicInteger();
+        private final long pid;
+        private final java.util.concurrent.atomic.AtomicBoolean alive;
+        private final List<ProcessHandle> descendants;
+        private final java.util.concurrent.CompletableFuture<ProcessHandle> exited =
+            new java.util.concurrent.CompletableFuture<>();
+
+        RefusingHandle(long pid, boolean alive, List<ProcessHandle> descendants) {
+            this.pid = pid;
+            this.alive = new java.util.concurrent.atomic.AtomicBoolean(alive);
+            this.descendants = descendants;
+        }
+
+        @Override public long pid() { return pid; }
+        @Override public java.util.Optional<ProcessHandle> parent() { return java.util.Optional.empty(); }
+        @Override public java.util.stream.Stream<ProcessHandle> children() { return descendants.stream(); }
+        @Override public java.util.stream.Stream<ProcessHandle> descendants() { return descendants.stream(); }
+        @Override public Info info() { return ProcessHandle.current().info(); }
+        @Override public java.util.concurrent.CompletableFuture<ProcessHandle> onExit() { return exited; }
+        @Override public boolean supportsNormalTermination() { return true; }
+        @Override public boolean isAlive() { return alive.get(); }
+        @Override public int compareTo(ProcessHandle other) { return Long.compare(pid, other.pid()); }
+
+        void die() { alive.set(false); }
+        @Override public boolean destroy() { return false; }
+
+        /// FALSE: the JDK says the signal was NOT sent.
+        @Override public boolean destroyForcibly() {
+            destroyForciblyCalls.incrementAndGet();
+            return false;
+        }
+    }
+
+    /// A dead process that HAS a handle, so terminateProcess reaches the descendant sites at all.
+    /// UndyingProcess cannot: it leaves toHandle() throwing, so every handle site is skipped.
+    private static final class HandleBearingProcess extends Process {
+        private final ProcessHandle handle;
+
+        HandleBearingProcess(ProcessHandle handle) { this.handle = handle; }
+
+        @Override public java.io.OutputStream getOutputStream() { return java.io.OutputStream.nullOutputStream(); }
+        @Override public java.io.InputStream getInputStream() { return java.io.InputStream.nullInputStream(); }
+        @Override public java.io.InputStream getErrorStream() { return java.io.InputStream.nullInputStream(); }
+        @Override public boolean isAlive() { return false; }
+        @Override public ProcessHandle toHandle() { return handle; }
+        @Override public int exitValue() { return 0; }
+        @Override public int waitFor() { return 0; }
+        @Override public boolean waitFor(long t, java.util.concurrent.TimeUnit u) { return true; }
+        @Override public void destroy() { }
+        @Override public Process destroyForcibly() { return this; }
+    }
+
+    @Test
+    void aRefusedSignalIsNotReportedAsAKill(@TempDir Path dir) throws Exception {
+        // needs-fix 608: "sent" still meant "attempted", one layer below where I fixed it.
+        //
+        // ProcessHandle.destroyForcibly() RETURNS a boolean saying whether the signal was actually
+        // sent, and the code discarded it, setting the flag because the call did not THROW. So the
+        // flag meant ATTEMPTED while the report labelled it SENT SIGKILL -- the same substitution
+        // of a near-fact for the fact as regression 2, one level down. I verified the signature
+        // against the JDK rather than taking it: ProcessHandle.destroyForcibly returns boolean,
+        // Process.destroyForcibly returns Process, which is why one of the three sites stays
+        // attempt-based and says so.
+        //
+        // THIS FIXTURE EXISTS BECAUSE THE FIX WAS UNHELD. I reverted the two sites to
+        // attempted-means-sent and the whole class SURVIVED, because every other fake here leaves
+        // toHandle() throwing and so never reaches a handle site at all. An accuracy fix with no
+        // test is the thing I had just finished writing an essay about.
+        //
+        // The tree: process DEAD, parent handle DEAD, one descendant ALIVE whose destroyForcibly
+        // refuses. So allProcessesDead is false and the forcible branch runs; the descendant site
+        // is reached and answers NO; the process and parent sites are both skipped. Nothing was
+        // sent, and the report must not claim otherwise.
+        RefusingHandle descendant = new RefusingHandle(9101, true, List.of());
+        RefusingHandle parent = new RefusingHandle(9100, false, List.of(descendant));
+        HandleBearingProcess process = new HandleBearingProcess(parent);
+
+        Path profile = Files.createDirectories(dir.resolve("refused"));
+        BrewShot.registerContainedLaunchLeaseForTests(process, profile, d -> { });
+
+        Report r;
+        try {
+            r = runShutdownAndParse(List.of());
+        } finally {
+            // DRAIN. This lease can never release on its own -- its descendant is alive and its
+            // destroyForcibly always refuses -- so without this it stays in LIVE for the rest of
+            // the JVM and every later arm reads "2 lease(s)". It did, on the first run: two sibling
+            // arms failed with a count that belonged to this fixture.
+            descendant.die();
+            BrewShot.runJvmShutdownCleanupForTests();
+        }
+
+        assertTrue(descendant.destroyForciblyCalls.get() > 0,
+            "fixture guard: the descendant site must actually have been REACHED, or this test "
+                + "proves nothing about what it does with the answer");
+        assertEquals(1, r.remaining(), r.text());
+        assertEquals(0, r.killed(),
+            "destroyForcibly returned FALSE, so no signal was sent and the report must not claim "
+                + "a SIGKILL: " + r.text());
+        assertEquals(1, r.reachedNotSignalled(),
+            "the pass reached it and sent nothing, which is the middle category: " + r.text());
     }
 }
