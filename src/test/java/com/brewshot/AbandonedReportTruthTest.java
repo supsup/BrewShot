@@ -373,4 +373,45 @@ final class AbandonedReportTruthTest {
         assertEquals(1, r.reachedNotSignalled(),
             "the pass reached it and sent nothing, which is the middle category: " + r.text());
     }
+
+    @Test
+    void aRefusedSignalToTheParentHandleIsNotReportedAsAKill(@TempDir Path dir) throws Exception {
+        // THE MIRROR ARM (needs-fix 610), and the finding behind it is my own lesson applied to
+        // only one of the two sites I changed.
+        //
+        // I reported that reverting BOTH changed sites together went red, which is true and
+        // misleading: a mutant proves only the site it mutates. Reverted individually, the
+        // descendant-loop site went RED and the parentHandle site went GREEN, because the fixture
+        // above builds a tree whose parent handle is DEAD -- so `else if (parentHandle != null &&
+        // handleAlive(parentHandle))` is never entered, and no other fake in the tree reaches any
+        // handle site at all.
+        //
+        // This tree is the mirror: process DEAD, NO descendants, parent handle ALIVE and REFUSING.
+        // allProcessesDead is false because the parent lives, so the forcible branch runs; the
+        // descendant loop has nothing to do; isAlive(process) is false so the else-if is taken; and
+        // the parent answers NO. Nothing was sent, and the report must not claim otherwise.
+        RefusingHandle parent = new RefusingHandle(9201, true, List.of());
+        HandleBearingProcess process = new HandleBearingProcess(parent);
+
+        Path profile = Files.createDirectories(dir.resolve("refused-parent"));
+        BrewShot.registerContainedLaunchLeaseForTests(process, profile, d -> { });
+
+        Report r;
+        try {
+            r = runShutdownAndParse(List.of());
+        } finally {
+            parent.die();
+            BrewShot.runJvmShutdownCleanupForTests();
+        }
+
+        assertTrue(parent.destroyForciblyCalls.get() > 0,
+            "fixture guard: the PARENT-HANDLE site must actually have been reached, which is the "
+                + "whole point of this arm -- the sibling fixture never enters it");
+        assertEquals(1, r.remaining(), r.text());
+        assertEquals(0, r.killed(),
+            "parentHandle.destroyForcibly returned FALSE, so no signal was sent and the report "
+                + "must not claim a SIGKILL: " + r.text());
+        assertEquals(1, r.reachedNotSignalled(),
+            "reached and correctly sent nothing, which is the middle category: " + r.text());
+    }
 }
