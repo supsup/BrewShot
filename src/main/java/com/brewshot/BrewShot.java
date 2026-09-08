@@ -897,15 +897,41 @@ public final class BrewShot implements AutoCloseable {
 
         /// Merge OBSERVED into the recorded set and publish, losing nothing under concurrency.
         /// Both the monitor-holding refresh and the lock-free signal pass go through here.
+        /// TEST-ONLY seam for plan bc038abe: ONE null-guarded Runnable, ONE call site, fired inside
+        /// the merge below so a test can force a compare-and-set COLLISION deterministically.
+        ///
+        /// WHY A SEAM AT ALL. The AtomicReference exists so two writers cannot lose each other's
+        /// handles, and a lost handle is a descendant nothing force-kills. Replacing updateAndGet
+        /// with a plain get/merge/set passed the ENTIRE suite: the code was correct and nothing
+        /// would have noticed it becoming incorrect.
+        ///
+        /// WHY IT IS DETERMINISTIC AND NOT A RACE. updateAndGet calls its function BEFORE the
+        /// compareAndSet and re-runs it on failure, so a competing write performed inside the FIRST
+        /// invocation is guaranteed to land between the read and the CAS. The collision is forced by
+        /// construction: no threads, no latch, no sleep, and no flake for the suite to inherit.
+        ///
+        /// Null by default, written only by tests, and when unset the merge is the merge it was.
+        /// Same shape as the undervoice fault seams already audited and accepted.
+        static volatile Runnable casCollisionHookForTests;
+
         private List<ProcessHandle> recordDescendants(List<ProcessHandle> observed) {
             ProcessHandle parent = parentHandle;
-            return descendantHandles.updateAndGet(current -> {
-                List<ProcessHandle> merged = new ArrayList<>(current);
-                for (ProcessHandle handle : observed) {
-                    if (!handle.equals(parent) && !merged.contains(handle)) { merged.add(handle); }
-                }
-                return List.copyOf(merged);
-            });
+            return descendantHandles.updateAndGet(current -> mergeObserved(current, observed, parent));
+        }
+
+        /// The merge, extracted so the CAS and the merge are SEPARATELY replaceable. That matters
+        /// for exactly one reason: the discriminating mutant swaps updateAndGet for a plain
+        /// get/merge/set and must still run the SAME merge, or the experiment would be measuring two
+        /// changes at once.
+        private static List<ProcessHandle> mergeObserved(List<ProcessHandle> current,
+                List<ProcessHandle> observed, ProcessHandle parent) {
+            Runnable collide = casCollisionHookForTests;
+            if (collide != null) { collide.run(); }
+            List<ProcessHandle> merged = new ArrayList<>(current);
+            for (ProcessHandle handle : observed) {
+                if (!handle.equals(parent) && !merged.contains(handle)) { merged.add(handle); }
+            }
+            return List.copyOf(merged);
         }
 
         private void refreshProcessTreeSnapshot() {
