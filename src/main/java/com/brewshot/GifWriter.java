@@ -2,6 +2,7 @@ package com.brewshot;
 
 import java.awt.image.BufferedImage;
 import java.awt.image.IndexColorModel;
+import java.awt.image.SampleModel;
 import java.awt.image.WritableRaster;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
@@ -99,13 +100,24 @@ final class GifWriter {
 
     /**
      * Reject a frame set whose decoded-raster accounting would exceed the budget,
-     * BEFORE any full decode. This Σ w*h*4 ceiling does not include compressed
-     * inputs, Java image objects, palette/index state, or encoder buffers. Reads
-     * only each PNG's header dimensions via an
-     * {@link ImageReader} (no pixel array is allocated), so an over-dimension /
-     * over-frame-count / over-decoded-budget input fails loud and cheap instead
-     * of OOMing in {@link #write}'s decode loop. Package-private so it is unit-
-     * testable browser-free.
+     * BEFORE any full decode. This Σ w*h*bytesPerPixel ceiling does not include
+     * compressed inputs, Java image objects, palette/index state, or encoder
+     * buffers. Reads only each frame's HEADER -- dimensions and the raw image
+     * type -- via an {@link ImageReader} (no pixel array is allocated), so an
+     * over-dimension / over-frame-count / over-decoded-budget input fails loud
+     * and cheap instead of OOMing in {@link #write}'s decode loop.
+     * Package-private so it is unit-testable browser-free.
+     *
+     * <p>THE PER-PIXEL COST COMES FROM THE HEADER, NEVER FROM A CONSTANT
+     * (brewshot/639). It charged a flat 4 bytes per pixel, which is right only
+     * for 8-bit RGBA: a 16-bit-per-channel PNG decodes to 8 bytes (RGBA) or 6
+     * (RGB), so the retained working set could reach 2x the budget through the
+     * public {@code gif(List, ...)} entry. Measured against the decoded
+     * {@code DataBuffer} across ten header shapes, the new accounting charges at
+     * or above actual on every one -- exactly 1.00x for the byte-aligned types
+     * and 8.00x for sub-byte ones, whose rasters pack several pixels per byte.
+     * Over-charging is the safe direction for a ceiling; under-charging is the
+     * defect.</p>
      */
     static void enforceDecodeBounds(List<byte[]> pngFrames) throws IOException {
         int frameLimit = maxFrames();
@@ -120,6 +132,7 @@ final class GifWriter {
             byte[] png = pngFrames.get(i);
             int w;
             int h;
+            int bytesPerPixel;
             try (ImageInputStream iis =
                      ImageIO.createImageInputStream(new ByteArrayInputStream(png))) {
                 Iterator<ImageReader> readers =
@@ -133,6 +146,7 @@ final class GifWriter {
                     reader.setInput(iis, true, true);
                     w = reader.getWidth(0);
                     h = reader.getHeight(0);
+                    bytesPerPixel = bytesPerPixelOf(rawTypeOf(reader));
                 } finally {
                     reader.dispose();
                 }
@@ -141,13 +155,90 @@ final class GifWriter {
                 throw new IOException("gif refused: frame " + i + " is " + w + "x" + h
                     + ", exceeds max axis " + maxDim + " (brewshot.gif.maxFrameDimension)");
             }
-            decoded += (long) w * h * 4;
+            decoded += (long) w * h * bytesPerPixel;
             if (decoded > maxDecoded) {
                 throw new IOException("gif refused: decoded raster accounting reaches " + decoded
-                    + " bytes by frame " + i + " of " + pngFrames.size() + ", exceeds "
+                    + " bytes by frame " + i + " of " + pngFrames.size() + " (" + w + "x" + h
+                    + " at " + bytesPerPixel + " bytes/pixel), exceeds "
                     + maxDecoded + " (brewshot.gif.maxDecodedBytes)");
             }
         }
+    }
+
+    /**
+     * The worst decoded cost per pixel BrewShot can be handed: 16 bits across four
+     * bands. Charged whenever the header cannot say, because the alternative --
+     * assuming the common case -- is what brewshot/639 found.
+     */
+    private static final int WORST_CASE_BYTES_PER_PIXEL = 8;
+
+    /**
+     * The frame's raw header type, or null when this reader will not say.
+     *
+     * <p>{@code getRawImageType} is the stored layout; {@code getImageTypes} is the
+     * reader's list of what it can produce, whose FIRST entry is its own default.
+     * A reader may answer either, both or neither, and a malformed header can make
+     * it throw rather than return -- so both are attempted and every failure lands
+     * on null, where the caller charges the worst case. Reading a type is header
+     * work; no raster is allocated by either call.
+
+     */
+    private static ImageTypeSpecifier rawTypeOf(ImageReader reader) {
+        try {
+            ImageTypeSpecifier raw = reader.getRawImageType(0);
+            if (raw != null) {
+                return raw;
+            }
+        } catch (IOException | RuntimeException unreadable) {
+            // fall through to the type list, then to the worst case
+        }
+        try {
+            Iterator<ImageTypeSpecifier> types = reader.getImageTypes(0);
+            if (types != null && types.hasNext()) {
+                return types.next();
+            }
+        } catch (IOException | RuntimeException unreadable) {
+            // fall through to the worst case
+        }
+        return null;
+    }
+
+    /**
+     * Decoded bytes per pixel for a header type: the sample sizes of every band,
+     * summed and rounded UP to whole bytes. Null, a missing sample model or a
+     * nonsensical width all charge {@link #WORST_CASE_BYTES_PER_PIXEL} -- never 4,
+     * which is the specific wrong answer brewshot/639 was filed about.
+     *
+     * <p>Rounding up is what keeps a sub-byte type safe: a 1-bit raster packs eight
+     * pixels into a byte, so charging one byte each over-charges by 8x rather than
+     * under-charging. Package-private ONLY so the unknown-type arm can be driven
+     * directly: no image format in the JDK's reader set returns a null type, so that
+     * arm is unreachable through a real fixture and a test that fed it files would
+     * certify nothing about it. Everything else about this method is measured through
+     * {@link #enforceDecodeBounds}, because a census of a helper is not a census of
+     * the line that calls it.</p>
+     */
+    static int bytesPerPixelOf(ImageTypeSpecifier type) {
+        if (type == null) {
+            return WORST_CASE_BYTES_PER_PIXEL;
+        }
+        SampleModel sampleModel;
+        try {
+            sampleModel = type.getSampleModel();
+        } catch (RuntimeException unusable) {
+            return WORST_CASE_BYTES_PER_PIXEL;
+        }
+        if (sampleModel == null || sampleModel.getNumBands() <= 0) {
+            return WORST_CASE_BYTES_PER_PIXEL;
+        }
+        int bits = 0;
+        for (int band = 0; band < sampleModel.getNumBands(); band++) {
+            bits += sampleModel.getSampleSize(band);
+        }
+        if (bits <= 0) {
+            return WORST_CASE_BYTES_PER_PIXEL;
+        }
+        return (bits + 7) / 8;
     }
 
     private GifWriter() { }
