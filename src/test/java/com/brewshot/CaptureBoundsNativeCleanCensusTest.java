@@ -46,24 +46,6 @@ class CaptureBoundsNativeCleanCensusTest {
     private static final List<String> FORBIDDEN = List.of("javax.imageio", "java.awt", "ImageIO");
 
     /**
-     * Strip comments before scanning, because the census must judge CODE and not PROSE.
-     *
-     * <p>Found the moment this guard first went green-adjacent: a bare substring match on
-     * "ImageIO" flags the javadoc that EXPLAINS why ImageIO is banned, and a pre-existing
-     * comment elsewhere in the file that mentions it in passing. A rule that forbids naming
-     * the thing it forbids cannot be documented, so it would have been deleted or weakened
-     * by whoever hit it next. Matching a pattern is not matching the concept.
-     *
-     * <p>String literals are NOT stripped, deliberately. That is the safe direction: a
-     * literal containing one of these tokens would be flagged rather than missed, and a
-     * false alarm is cheap here while a miss is the whole defect.
-     */
-    private static String withoutComments(String source) {
-        String noBlock = source.replaceAll("(?s)/\\*.*?\\*/", " ");
-        return noBlock.replaceAll("(?m)//.*$", " ");
-    }
-
-    /**
      * Resolve a repo-relative source file, failing LOUDLY when it cannot be found.
      * A census that silently reads nothing passes for the wrong reason.
      */
@@ -80,6 +62,83 @@ class CaptureBoundsNativeCleanCensusTest {
         throw new IllegalStateException(
             "census cannot find " + relative + "; looked at " + tried
             + ". A census that cannot read its subject must FAIL, never pass quietly.");
+    }
+
+    /**
+     * Strip comments before scanning, because the census must judge CODE and not PROSE.
+     *
+     * <p>A bare substring match on "ImageIO" flags the javadoc that EXPLAINS why ImageIO is
+     * banned, and a pre-existing comment elsewhere in the file that mentions it in passing. A
+     * rule that forbids naming the thing it forbids cannot be documented, so it would have been
+     * weakened or deleted by whoever hit it next. Matching a pattern is not matching the concept.
+     *
+     * <p>LITERAL-AWARE, and the first version was not (should-fix S2, brewshot/634). It used
+     * {@code //.*$}, which also strips from a {@code //} INSIDE A STRING LITERAL to the end of
+     * the line — and this very file carries such literals, at the websocket URL patterns. So
+     * {@code "ws://..."} followed by a fully qualified {@code ImageIO} call ON THE SAME LINE
+     * left the census green, which made the sentence I had written here — that a literal "would
+     * be flagged rather than missed" — FALSE. The scanner below tracks string and char literals
+     * and their escapes, so a {@code //} inside one is not a comment and code after it is still
+     * scanned. {@code theStripperDoesNotTreatASlashSlashInsideAStringAsAComment} pins it.
+     *
+     * <p>NOT HANDLED: text blocks. This file contains none (checked), and adding them would need
+     * a third state; saying so beats leaving a reader to assume coverage that is not there.
+     */
+    static String withoutComments(String source) {
+        StringBuilder out = new StringBuilder(source.length());
+        int i = 0;
+        final int n = source.length();
+        while (i < n) {
+            char c = source.charAt(i);
+            char next = (i + 1 < n) ? source.charAt(i + 1) : '\0';
+            if (c == '/' && next == '/') {
+                while (i < n && source.charAt(i) != '\n') { i++; }
+            } else if (c == '/' && next == '*') {
+                i += 2;
+                while (i + 1 < n && !(source.charAt(i) == '*' && source.charAt(i + 1) == '/')) { i++; }
+                i = Math.min(i + 2, n);
+                out.append(' ');
+            } else if (c == '"' || c == '\'') {
+                char quote = c;
+                out.append(c);
+                i++;
+                while (i < n) {
+                    char d = source.charAt(i);
+                    out.append(d);
+                    i++;
+                    if (d == '\\' && i < n) { out.append(source.charAt(i)); i++; continue; }
+                    if (d == quote) { break; }
+                }
+            } else {
+                out.append(c);
+                i++;
+            }
+        }
+        return out.toString();
+    }
+
+    /**
+     * Pins should-fix S2 with the exact evasion the reviewer named: a string literal carrying
+     * {@code //} on the same line as a forbidden reference. The old regex stripper returned
+     * everything after the literal's slashes, so the census read this line as empty and passed.
+     */
+    @Test
+    void theStripperDoesNotTreatASlashSlashInsideAStringAsAComment() {
+        String line = "String u = \"ws://127.0.0.1\"; javax.imageio.ImageIO.read(null);";
+        String stripped = withoutComments(line);
+        assertTrue(stripped.contains("javax.imageio.ImageIO"),
+            "code after a string literal containing // must survive stripping, or the census "
+            + "can be evaded by putting a URL on the same line. Got: " + stripped);
+    }
+
+    @Test
+    void theStripperStillRemovesRealComments() {
+        String src = "int a = 1; // javax.imageio.ImageIO here is prose\nint b = 2;\n"
+            + "/* and java.awt.Toolkit here is prose too */ int c = 3;";
+        String stripped = withoutComments(src);
+        assertFalse(stripped.contains("javax.imageio.ImageIO"), "line comment must be stripped");
+        assertFalse(stripped.contains("java.awt.Toolkit"), "block comment must be stripped");
+        assertTrue(stripped.contains("int c = 3;"), "code after a block comment must survive");
     }
 
     @Test

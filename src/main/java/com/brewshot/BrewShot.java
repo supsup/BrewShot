@@ -456,6 +456,10 @@ public final class BrewShot implements AutoCloseable {
             if (b[i] != PNG_SIGNATURE[i]) { return null; }
         }
         if (b[12] != 'I' || b[13] != 'H' || b[14] != 'D' || b[15] != 'R') { return null; }
+        // N2 (brewshot/634): IHDR's declared length is fixed at 13 by the PNG spec. A chunk
+        // claiming otherwise is not an IHDR we can read positionally, so refuse rather than
+        // trust offsets 16 and 20 inside it.
+        if (beInt(b, 8) != 13) { return null; }
         int w = beInt(b, 16);
         int h = beInt(b, 20);
         return (w > 0 && h > 0) ? new int[] { w, h } : null;
@@ -484,6 +488,10 @@ public final class BrewShot implements AutoCloseable {
             boolean frameHeader = marker >= 0xC0 && marker <= 0xCF
                 && marker != 0xC4 && marker != 0xC8 && marker != 0xCC;
             if (frameHeader) {
+                // N1 (brewshot/634): an SOF segment declaring a length below 8 cannot contain
+                // precision + height + width. Without this, `FFD8 FFC0 0002 08 0005 0005` was
+                // admitted as 5x5 by reading PAST the segment it declared.
+                if (segLen < 8) { return null; }
                 if (pos + 8 >= b.length) { return null; }
                 int h = ((b[pos + 5] & 0xFF) << 8) | (b[pos + 6] & 0xFF);
                 int w = ((b[pos + 7] & 0xFF) << 8) | (b[pos + 8] & 0xFF);

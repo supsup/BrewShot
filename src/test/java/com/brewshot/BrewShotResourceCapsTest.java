@@ -227,6 +227,81 @@ class BrewShotResourceCapsTest {
         }
     }
 
+    // ===== crafted JPEG marker bytes, and the declared-length guards (S3/N1/N2) =====
+    // Real encoders put DHT AFTER SOF and never emit fill bytes, so every one of these
+    // branches was UNPINNED: the reviewer showed that deleting the C4/C8/CC exclusion, the
+    // fill-byte handling, or the standalone-marker handling all left 0 red. Correct code with
+    // no test is a coin that has not been flipped.
+
+    /** SOI, then the given segment bytes, then a minimal SOF0 declaring 16x32. */
+    private static byte[] jpegWith(byte[] before) {
+        byte[] sof = { (byte) 0xFF, (byte) 0xC0, 0x00, 0x11, 0x08,
+                       0x00, 0x20,            // height 32
+                       0x00, 0x10,            // width 16
+                       0x03, 0x01, 0x11, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01 };
+        byte[] out = new byte[2 + before.length + sof.length];
+        out[0] = (byte) 0xFF; out[1] = (byte) 0xD8;
+        System.arraycopy(before, 0, out, 2, before.length);
+        System.arraycopy(sof, 0, out, 2 + before.length, sof.length);
+        return out;
+    }
+
+    @Test
+    void aDhtSegmentBeforeTheFrameHeaderIsSkippedNotMistakenForOne() {
+        // 0xC4 sits inside the SOF0..SOF15 numeric range but describes Huffman tables, not a
+        // frame. Reading it as a frame header yields garbage dimensions.
+        byte[] dht = { (byte) 0xFF, (byte) 0xC4, 0x00, 0x06, 0x00, 0x01, 0x02, 0x03 };
+        int[] wh = BrewShot.readImageHeaderDimensions(jpegWith(dht));
+        assertNotNull(wh, "a DHT before the SOF must be skipped, not fail the walk");
+        assertEquals(16, wh[0], "width after skipping DHT");
+        assertEquals(32, wh[1], "height after skipping DHT");
+    }
+
+    @Test
+    void fillBytesBeforeAMarkerAreResynchronisedOver() {
+        byte[] fill = { (byte) 0xFF, (byte) 0xFF, (byte) 0xFF };
+        int[] wh = BrewShot.readImageHeaderDimensions(jpegWith(fill));
+        assertNotNull(wh, "0xFF fill bytes are legal padding and must not desync the walk");
+        assertEquals(16, wh[0]);
+        assertEquals(32, wh[1]);
+    }
+
+    @Test
+    void aStandaloneMarkerBeforeTheFrameHeaderCarriesNoLength() {
+        // TEM (0x01) and the RSTn markers have no length field; treating them as if they did
+        // reads a length out of the following bytes and walks off into the middle of a segment.
+        byte[] standalone = { (byte) 0xFF, 0x01, (byte) 0xFF, (byte) 0xD0 };
+        int[] wh = BrewShot.readImageHeaderDimensions(jpegWith(standalone));
+        assertNotNull(wh, "standalone markers must be stepped over without reading a length");
+        assertEquals(16, wh[0]);
+        assertEquals(32, wh[1]);
+    }
+
+    @Test
+    void anSofDeclaringALengthTooSmallToHoldDimensionsIsRefused() {
+        // N1: segment length 2 cannot hold precision + height + width. Before the guard this
+        // was admitted as 5x5 by reading PAST the segment it declared.
+        byte[] shortSof = { (byte) 0xFF, (byte) 0xD8, (byte) 0xFF, (byte) 0xC0,
+                            0x00, 0x02, 0x08, 0x00, 0x05, 0x00, 0x05 };
+        assertNull(BrewShot.readImageHeaderDimensions(shortSof),
+            "an SOF cannot declare a length of 2 and still carry dimensions");
+        assertThrows(IllegalStateException.class,
+            () -> BrewShot.enforceCaptureBounds(shortSof));
+    }
+
+    @Test
+    void aPngWhoseIhdrDeclaresTheWrongLengthIsRefused() {
+        // N2: IHDR is fixed at 13 bytes. A chunk claiming otherwise is not one we can read
+        // positionally, so offsets 16 and 20 are not trustworthy.
+        byte[] png = new byte[] {
+            (byte) 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A,
+            0x00, 0x00, 0x00, 0x0C, 'I', 'H', 'D', 'R',   // length 12, not 13
+            0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x30
+        };
+        assertNull(BrewShot.readImageHeaderDimensions(png),
+            "an IHDR declaring a length other than 13 must not be read positionally");
+    }
+
     // ===== AT the limit, and one past it (must-fix M1, brewshot/634) =====
     // The first round had fixtures only WELL under and WELL over, so `w > maxDim` mutated to
     // `>=` left all 27 tests green: nothing ever sat exactly ON the boundary, which is the one
