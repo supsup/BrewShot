@@ -181,12 +181,9 @@ final class GifWriter {
      * it throw rather than return -- so both are attempted and every failure lands
      * on null, where the caller charges the worst case. Reading a type is header
      * work; no raster is allocated by either call.
-     *
-     * <p>Package-private for the same reason {@link #bytesPerPixelOf} is: the census
-     * that compares what we CHARGE against the decoded {@code DataBuffer} has to walk
-     * the production lookup, not a second copy of it written in the test.</p>
+
      */
-    static ImageTypeSpecifier rawTypeOf(ImageReader reader) {
+    private static ImageTypeSpecifier rawTypeOf(ImageReader reader) {
         try {
             ImageTypeSpecifier raw = reader.getRawImageType(0);
             if (raw != null) {
@@ -214,9 +211,12 @@ final class GifWriter {
      *
      * <p>Rounding up is what keeps a sub-byte type safe: a 1-bit raster packs eight
      * pixels into a byte, so charging one byte each over-charges by 8x rather than
-     * under-charging. Package-private so the unknown-type arm can be driven
-     * directly -- no image format in the JDK's reader set returns a null type, so
-     * that arm is unreachable through a real fixture.</p>
+     * under-charging. Package-private ONLY so the unknown-type arm can be driven
+     * directly: no image format in the JDK's reader set returns a null type, so that
+     * arm is unreachable through a real fixture and a test that fed it files would
+     * certify nothing about it. Everything else about this method is measured through
+     * {@link #enforceDecodeBounds}, because a census of a helper is not a census of
+     * the line that calls it.</p>
      */
     static int bytesPerPixelOf(ImageTypeSpecifier type) {
         if (type == null) {
