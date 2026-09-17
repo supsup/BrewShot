@@ -227,6 +227,60 @@ class BrewShotResourceCapsTest {
         }
     }
 
+    // ===== AT the limit, and one past it (must-fix M1, brewshot/634) =====
+    // The first round had fixtures only WELL under and WELL over, so `w > maxDim` mutated to
+    // `>=` left all 27 tests green: nothing ever sat exactly ON the boundary, which is the one
+    // input that distinguishes the two operators. Each pair below is at-limit (must PASS) and
+    // limit+1 (must REFUSE), for both axes and both formats.
+
+    @Test
+    void captureBoundsAdmitsAPngExactlyAtTheDimensionLimit() throws IOException {
+        setProp("brewshot.maxImageDimension", "200");
+        setProp("brewshot.maxImagePixels", "67108864");
+        BrewShot.enforceCaptureBounds(png(200, 120)); // exactly AT: > is false, >= would refuse
+    }
+
+    @Test
+    void captureBoundsRefusesAPngOnePastTheDimensionLimit() throws IOException {
+        setProp("brewshot.maxImageDimension", "200");
+        setProp("brewshot.maxImagePixels", "67108864");
+        IllegalStateException e = assertThrows(IllegalStateException.class,
+            () -> BrewShot.enforceCaptureBounds(png(201, 120)));
+        assertTrue(e.getMessage().contains("201x120"), "names the offending size: " + e.getMessage());
+    }
+
+    @Test
+    void captureBoundsAdmitsAJpegExactlyAtTheDimensionLimit() throws IOException {
+        setProp("brewshot.maxImageDimension", "200");
+        setProp("brewshot.maxImagePixels", "67108864");
+        BrewShot.enforceCaptureBounds(jpeg(200, 120));
+    }
+
+    @Test
+    void captureBoundsRefusesAJpegOnePastTheDimensionLimit() throws IOException {
+        setProp("brewshot.maxImageDimension", "200");
+        setProp("brewshot.maxImagePixels", "67108864");
+        assertThrows(IllegalStateException.class,
+            () -> BrewShot.enforceCaptureBounds(jpeg(201, 120)));
+    }
+
+    @Test
+    void captureBoundsAdmitsAnImageExactlyAtThePixelBudget() throws IOException {
+        setProp("brewshot.maxImageDimension", "16384");
+        setProp("brewshot.maxImagePixels", "9600"); // 120*80 exactly
+        BrewShot.enforceCaptureBounds(png(120, 80));
+    }
+
+    @Test
+    void captureBoundsRefusesAnImageOnePixelPastTheBudget() throws IOException {
+        setProp("brewshot.maxImageDimension", "16384");
+        setProp("brewshot.maxImagePixels", "9599"); // 120*80 = 9600, one over
+        IllegalStateException e = assertThrows(IllegalStateException.class,
+            () -> BrewShot.enforceCaptureBounds(png(120, 80)));
+        assertTrue(e.getMessage().contains("9600") && e.getMessage().contains("maxImagePixels"),
+            "names the pixel budget: " + e.getMessage());
+    }
+
     // ===== an UNREADABLE header must be REFUSED, not skipped (ruling brewshot/632) =====
     // Today enforceCaptureBounds returns on an unreadable header, with the comment
     // "not a size problem; leave decode errors to the consumer". The ruling is that this is
