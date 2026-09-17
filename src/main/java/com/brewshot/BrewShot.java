@@ -41,9 +41,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.IntConsumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import javax.imageio.ImageIO;
-import javax.imageio.ImageReader;
-import javax.imageio.stream.ImageInputStream;
 
 /**
  * BrewShot — Java brews screenshots. A self-contained Chrome DevTools Protocol
@@ -390,35 +387,38 @@ public final class BrewShot implements AutoCloseable {
     }
 
     /**
-     * Reject a captured image whose DECODED dimensions exceed the configured
-     * ceiling, inspected via an {@link ImageReader} on the RETURNED bytes — the
-     * Base64 string and decoded compressed byte array already exist, but no full
-     * pixel raster is decoded here — so refusal lands BEFORE any downstream
-     * full-pixel decode or artifact write. Enforced
-     * on the {@code screenshot}/{@code screenshotClip} capture paths. Bytes whose
-     * header is unreadable are left alone (decodability is a different concern,
-     * handled by the consumer). Package-private for browser-free unit testing.
+     * Reject a captured image whose DECODED dimensions exceed the configured ceiling,
+     * read STRAIGHT OUT OF THE HEADER BYTES — no {@code javax.imageio}, no {@code java.awt}.
+     * Enforced on the {@code screenshot}/{@code screenshotClip} capture paths, so refusal
+     * lands BEFORE any downstream full-pixel decode or artifact write.
+     *
+     * <p>WHY NOT {@code ImageIO}, which is the obvious way to read a header. It was the
+     * previous way, and it broke the native binary completely (plan d9a42ced, ruling
+     * brewshot/632). The old code was careful about the expensive OPERATION — it read the
+     * header and decoded no pixel raster — but not about the expensive DEPENDENCY: touching
+     * {@code ImageIO} at all runs its class initializer, which reaches {@code IIORegistry}
+     * to {@code AppContext} to {@code java.awt.Toolkit} to {@code libawt}. GraalVM
+     * native-image has no {@code libawt} on macOS, so EVERY capture died with
+     * {@code UnsatisfiedLinkError} while the whole JVM suite stayed green. The build script
+     * and README both promise the PNG path is native-clean; this keeps that true, and
+     * {@code CaptureBoundsNativeCleanCensusTest} fails if the import ever returns.
+     *
+     * <p>AN UNREADABLE HEADER IS REFUSED, not waved through. The previous code returned on
+     * one, reasoning that decodability was "a different concern". That is the wrong call for
+     * a SIZE bound: bytes whose size cannot be established are exactly the bytes a size bound
+     * must not admit. Package-private for browser-free unit testing.
      */
     static void enforceCaptureBounds(byte[] imageBytes) {
         int maxDim = maxImageDimension();
         long maxPixels = maxImagePixels();
-        int w;
-        int h;
-        try (ImageInputStream iis =
-                 ImageIO.createImageInputStream(new ByteArrayInputStream(imageBytes))) {
-            Iterator<ImageReader> readers = iis == null ? null : ImageIO.getImageReaders(iis);
-            if (readers == null || !readers.hasNext()) { return; }
-            ImageReader reader = readers.next();
-            try {
-                reader.setInput(iis, true, true);
-                w = reader.getWidth(0);
-                h = reader.getHeight(0);
-            } finally {
-                reader.dispose();
-            }
-        } catch (IOException unreadable) {
-            return; // not a size problem; leave decode errors to the consumer
+        int[] wh = readImageHeaderDimensions(imageBytes);
+        if (wh == null) {
+            throw new IllegalStateException("capture refused: image header is unreadable ("
+                + (imageBytes == null ? 0 : imageBytes.length) + " bytes) — a size bound cannot "
+                + "admit bytes whose size it could not establish. Expected a PNG or JPEG header.");
         }
+        int w = wh[0];
+        int h = wh[1];
         if (w > maxDim || h > maxDim) {
             throw new IllegalStateException("capture refused: image is " + w + "x" + h
                 + ", exceeds max axis " + maxDim + " (brewshot.maxImageDimension)");
@@ -427,6 +427,77 @@ public final class BrewShot implements AutoCloseable {
             throw new IllegalStateException("capture refused: image is " + w + "x" + h + " = "
                 + ((long) w * h) + " px, exceeds " + maxPixels + " (brewshot.maxImagePixels)");
         }
+    }
+
+    /** PNG's fixed 8-byte signature. */
+    private static final byte[] PNG_SIGNATURE = {
+        (byte) 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A
+    };
+
+    /**
+     * Width and height from a PNG or JPEG header, or {@code null} when neither can be
+     * established. Header bytes only; never a pixel raster, and never {@code ImageIO}.
+     * Package-private so a test can check it against a reference decoder without the
+     * production path depending on one.
+     */
+    static int[] readImageHeaderDimensions(byte[] b) {
+        if (b == null) { return null; }
+        int[] png = readPngDimensions(b);
+        return png != null ? png : readJpegDimensions(b);
+    }
+
+    /**
+     * PNG: the 8-byte signature, then the IHDR chunk, whose width and height are big-endian
+     * 32-bit ints at offsets 16 and 20. Anything shorter than 24 bytes cannot carry them.
+     */
+    private static int[] readPngDimensions(byte[] b) {
+        if (b.length < 24) { return null; }
+        for (int i = 0; i < PNG_SIGNATURE.length; i++) {
+            if (b[i] != PNG_SIGNATURE[i]) { return null; }
+        }
+        if (b[12] != 'I' || b[13] != 'H' || b[14] != 'D' || b[15] != 'R') { return null; }
+        int w = beInt(b, 16);
+        int h = beInt(b, 20);
+        return (w > 0 && h > 0) ? new int[] { w, h } : null;
+    }
+
+    /**
+     * JPEG: walk the marker segments to the first frame header (SOF0..SOF15), EXCLUDING the
+     * three markers that share that numeric range without describing a frame — DHT (0xC4),
+     * JPG (0xC8) and DAC (0xCC). An SOF payload is precision, then height, then width, so
+     * HEIGHT COMES FIRST; reading them in the other order is the classic way to get a
+     * transposed image size. Returns null on desync, on reaching SOS or EOI without a frame
+     * header, or on a truncated one.
+     */
+    private static int[] readJpegDimensions(byte[] b) {
+        if (b.length < 4 || (b[0] & 0xFF) != 0xFF || (b[1] & 0xFF) != 0xD8) { return null; }
+        int pos = 2;
+        while (pos + 1 < b.length) {
+            if ((b[pos] & 0xFF) != 0xFF) { return null; }
+            int marker = b[pos + 1] & 0xFF;
+            if (marker == 0xFF) { pos++; continue; }          // fill byte, resynchronise
+            if (marker == 0x01 || (marker >= 0xD0 && marker <= 0xD8)) { pos += 2; continue; }
+            if (marker == 0xD9 || marker == 0xDA) { return null; }  // EOI or start of scan
+            if (pos + 3 >= b.length) { return null; }
+            int segLen = ((b[pos + 2] & 0xFF) << 8) | (b[pos + 3] & 0xFF);
+            if (segLen < 2) { return null; }
+            boolean frameHeader = marker >= 0xC0 && marker <= 0xCF
+                && marker != 0xC4 && marker != 0xC8 && marker != 0xCC;
+            if (frameHeader) {
+                if (pos + 8 >= b.length) { return null; }
+                int h = ((b[pos + 5] & 0xFF) << 8) | (b[pos + 6] & 0xFF);
+                int w = ((b[pos + 7] & 0xFF) << 8) | (b[pos + 8] & 0xFF);
+                return (w > 0 && h > 0) ? new int[] { w, h } : null;
+            }
+            pos += 2 + segLen;
+        }
+        return null;
+    }
+
+    /** A big-endian 32-bit int at {@code off}. */
+    private static int beInt(byte[] b, int off) {
+        return ((b[off] & 0xFF) << 24) | ((b[off + 1] & 0xFF) << 16)
+             | ((b[off + 2] & 0xFF) << 8) | (b[off + 3] & 0xFF);
     }
 
     // ---- discovery ---------------------------------------------------------

@@ -46,6 +46,24 @@ class CaptureBoundsNativeCleanCensusTest {
     private static final List<String> FORBIDDEN = List.of("javax.imageio", "java.awt", "ImageIO");
 
     /**
+     * Strip comments before scanning, because the census must judge CODE and not PROSE.
+     *
+     * <p>Found the moment this guard first went green-adjacent: a bare substring match on
+     * "ImageIO" flags the javadoc that EXPLAINS why ImageIO is banned, and a pre-existing
+     * comment elsewhere in the file that mentions it in passing. A rule that forbids naming
+     * the thing it forbids cannot be documented, so it would have been deleted or weakened
+     * by whoever hit it next. Matching a pattern is not matching the concept.
+     *
+     * <p>String literals are NOT stripped, deliberately. That is the safe direction: a
+     * literal containing one of these tokens would be flagged rather than missed, and a
+     * false alarm is cheap here while a miss is the whole defect.
+     */
+    private static String withoutComments(String source) {
+        String noBlock = source.replaceAll("(?s)/\\*.*?\\*/", " ");
+        return noBlock.replaceAll("(?m)//.*$", " ");
+    }
+
+    /**
      * Resolve a repo-relative source file, failing LOUDLY when it cannot be found.
      * A census that silently reads nothing passes for the wrong reason.
      */
@@ -66,7 +84,7 @@ class CaptureBoundsNativeCleanCensusTest {
 
     @Test
     void theCapturePathReferencesNoImageIoOrAwt() throws IOException {
-        String source = readSource(CAPTURE_PATH_SOURCE);
+        String source = withoutComments(readSource(CAPTURE_PATH_SOURCE));
 
         // Anti-vacuity: prove we read the real file before trusting a clean result.
         assertTrue(source.length() > 10_000,
@@ -93,7 +111,7 @@ class CaptureBoundsNativeCleanCensusTest {
      */
     @Test
     void theCensusCanActuallyDetectAnImageIoReference() throws IOException {
-        String gifWriter = readSource(IMAGEIO_USING_SOURCE);
+        String gifWriter = withoutComments(readSource(IMAGEIO_USING_SOURCE));
         assertTrue(gifWriter.length() > 1_000,
             "control file read too small to be real: " + gifWriter.length() + " chars");
 

@@ -2,6 +2,7 @@ package com.brewshot;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -172,6 +173,58 @@ class BrewShotResourceCapsTest {
         setProp("brewshot.maxImageDimension", "16384");
         setProp("brewshot.maxImagePixels", "67108864");
         BrewShot.enforceCaptureBounds(png(64, 48)); // must NOT throw
+    }
+
+    // ===== JPEG capture caps, and the parser checked against a reference decoder =====
+
+    private static byte[] jpeg(int w, int h) throws IOException {
+        BufferedImage img = new BufferedImage(w, h, BufferedImage.TYPE_INT_RGB);
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                img.setRGB(x, y, ((x * 11 + y * 29) & 0xFF) << 16 | 0x3050);
+            }
+        }
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        assertTrue(ImageIO.write(img, "jpg", out), "the JPEG fixture must actually encode");
+        return out.toByteArray();
+    }
+
+    @Test
+    void captureBoundsRejectsAnOverDimensionJpeg() throws IOException {
+        setProp("brewshot.maxImageDimension", "100");
+        IllegalStateException e = assertThrows(IllegalStateException.class,
+            () -> BrewShot.enforceCaptureBounds(jpeg(200, 50)));
+        assertTrue(e.getMessage().contains("200x50") && e.getMessage().contains("max axis 100"),
+            "the JPEG refusal names the real dimensions and the limit: " + e.getMessage());
+    }
+
+    @Test
+    void captureBoundsPassesAnInBoundsJpeg() throws IOException {
+        setProp("brewshot.maxImageDimension", "16384");
+        setProp("brewshot.maxImagePixels", "67108864");
+        BrewShot.enforceCaptureBounds(jpeg(64, 48)); // must NOT throw
+    }
+
+    /**
+     * EQUIVALENCE against a reference decoder. The production path must not depend on
+     * ImageIO, but the parser still has to be RIGHT, and "I read the spec carefully" is not
+     * evidence. ImageIO appears here in TEST code only — that is the sanctioned use, and the
+     * census in CaptureBoundsNativeCleanCensusTest covers the production file, not this one.
+     *
+     * <p>The non-square sizes are deliberate: a JPEG SOF stores HEIGHT BEFORE WIDTH, so a
+     * transposition bug is invisible on a square fixture and obvious on 200x50.
+     */
+    @Test
+    void theHeaderParserAgreesWithAReferenceDecoder() throws IOException {
+        byte[][] fixtures = { png(64, 48), png(200, 50), png(1, 1), jpeg(64, 48), jpeg(200, 50) };
+        for (byte[] bytes : fixtures) {
+            BufferedImage reference = ImageIO.read(new java.io.ByteArrayInputStream(bytes));
+            assertNotNull(reference, "fixture did not decode; the test data is wrong, not the parser");
+            int[] parsed = BrewShot.readImageHeaderDimensions(bytes);
+            assertNotNull(parsed, "the header parser returned nothing for a valid image");
+            assertEquals(reference.getWidth(), parsed[0], "width disagrees with the reference decoder");
+            assertEquals(reference.getHeight(), parsed[1], "height disagrees with the reference decoder");
+        }
     }
 
     // ===== an UNREADABLE header must be REFUSED, not skipped (ruling brewshot/632) =====
