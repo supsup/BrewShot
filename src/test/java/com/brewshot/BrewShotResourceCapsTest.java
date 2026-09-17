@@ -2,6 +2,7 @@ package com.brewshot;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -172,6 +173,232 @@ class BrewShotResourceCapsTest {
         setProp("brewshot.maxImageDimension", "16384");
         setProp("brewshot.maxImagePixels", "67108864");
         BrewShot.enforceCaptureBounds(png(64, 48)); // must NOT throw
+    }
+
+    // ===== JPEG capture caps, and the parser checked against a reference decoder =====
+
+    private static byte[] jpeg(int w, int h) throws IOException {
+        BufferedImage img = new BufferedImage(w, h, BufferedImage.TYPE_INT_RGB);
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                img.setRGB(x, y, ((x * 11 + y * 29) & 0xFF) << 16 | 0x3050);
+            }
+        }
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        assertTrue(ImageIO.write(img, "jpg", out), "the JPEG fixture must actually encode");
+        return out.toByteArray();
+    }
+
+    @Test
+    void captureBoundsRejectsAnOverDimensionJpeg() throws IOException {
+        setProp("brewshot.maxImageDimension", "100");
+        IllegalStateException e = assertThrows(IllegalStateException.class,
+            () -> BrewShot.enforceCaptureBounds(jpeg(200, 50)));
+        assertTrue(e.getMessage().contains("200x50") && e.getMessage().contains("max axis 100"),
+            "the JPEG refusal names the real dimensions and the limit: " + e.getMessage());
+    }
+
+    @Test
+    void captureBoundsPassesAnInBoundsJpeg() throws IOException {
+        setProp("brewshot.maxImageDimension", "16384");
+        setProp("brewshot.maxImagePixels", "67108864");
+        BrewShot.enforceCaptureBounds(jpeg(64, 48)); // must NOT throw
+    }
+
+    /**
+     * EQUIVALENCE against a reference decoder. The production path must not depend on
+     * ImageIO, but the parser still has to be RIGHT, and "I read the spec carefully" is not
+     * evidence. ImageIO appears here in TEST code only — that is the sanctioned use, and the
+     * census in CaptureBoundsNativeCleanCensusTest covers the production file, not this one.
+     *
+     * <p>The non-square sizes are deliberate: a JPEG SOF stores HEIGHT BEFORE WIDTH, so a
+     * transposition bug is invisible on a square fixture and obvious on 200x50.
+     */
+    @Test
+    void theHeaderParserAgreesWithAReferenceDecoder() throws IOException {
+        byte[][] fixtures = { png(64, 48), png(200, 50), png(1, 1), jpeg(64, 48), jpeg(200, 50) };
+        for (byte[] bytes : fixtures) {
+            BufferedImage reference = ImageIO.read(new java.io.ByteArrayInputStream(bytes));
+            assertNotNull(reference, "fixture did not decode; the test data is wrong, not the parser");
+            int[] parsed = BrewShot.readImageHeaderDimensions(bytes);
+            assertNotNull(parsed, "the header parser returned nothing for a valid image");
+            assertEquals(reference.getWidth(), parsed[0], "width disagrees with the reference decoder");
+            assertEquals(reference.getHeight(), parsed[1], "height disagrees with the reference decoder");
+        }
+    }
+
+    // ===== crafted JPEG marker bytes, and the declared-length guards (S3/N1/N2) =====
+    // Real encoders put DHT AFTER SOF and never emit fill bytes, so every one of these
+    // branches was UNPINNED: the reviewer showed that deleting the C4/C8/CC exclusion, the
+    // fill-byte handling, or the standalone-marker handling all left 0 red. Correct code with
+    // no test is a coin that has not been flipped.
+
+    /** SOI, then the given segment bytes, then a minimal SOF0 declaring 16x32. */
+    private static byte[] jpegWith(byte[] before) {
+        byte[] sof = { (byte) 0xFF, (byte) 0xC0, 0x00, 0x11, 0x08,
+                       0x00, 0x20,            // height 32
+                       0x00, 0x10,            // width 16
+                       0x03, 0x01, 0x11, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01 };
+        byte[] out = new byte[2 + before.length + sof.length];
+        out[0] = (byte) 0xFF; out[1] = (byte) 0xD8;
+        System.arraycopy(before, 0, out, 2, before.length);
+        System.arraycopy(sof, 0, out, 2 + before.length, sof.length);
+        return out;
+    }
+
+    @Test
+    void aDhtSegmentBeforeTheFrameHeaderIsSkippedNotMistakenForOne() {
+        // 0xC4 sits inside the SOF0..SOF15 numeric range but describes Huffman tables, not a
+        // frame. Reading it as a frame header yields garbage dimensions.
+        byte[] dht = { (byte) 0xFF, (byte) 0xC4, 0x00, 0x06, 0x00, 0x01, 0x02, 0x03 };
+        int[] wh = BrewShot.readImageHeaderDimensions(jpegWith(dht));
+        assertNotNull(wh, "a DHT before the SOF must be skipped, not fail the walk");
+        assertEquals(16, wh[0], "width after skipping DHT");
+        assertEquals(32, wh[1], "height after skipping DHT");
+    }
+
+    @Test
+    void fillBytesBeforeAMarkerAreResynchronisedOver() {
+        byte[] fill = { (byte) 0xFF, (byte) 0xFF, (byte) 0xFF };
+        int[] wh = BrewShot.readImageHeaderDimensions(jpegWith(fill));
+        assertNotNull(wh, "0xFF fill bytes are legal padding and must not desync the walk");
+        assertEquals(16, wh[0]);
+        assertEquals(32, wh[1]);
+    }
+
+    @Test
+    void aStandaloneMarkerBeforeTheFrameHeaderCarriesNoLength() {
+        // TEM (0x01) and the RSTn markers have no length field; treating them as if they did
+        // reads a length out of the following bytes and walks off into the middle of a segment.
+        byte[] standalone = { (byte) 0xFF, 0x01, (byte) 0xFF, (byte) 0xD0 };
+        int[] wh = BrewShot.readImageHeaderDimensions(jpegWith(standalone));
+        assertNotNull(wh, "standalone markers must be stepped over without reading a length");
+        assertEquals(16, wh[0]);
+        assertEquals(32, wh[1]);
+    }
+
+    @Test
+    void anSofDeclaringALengthTooSmallToHoldDimensionsIsRefused() {
+        // N1: segment length 2 cannot hold precision + height + width. Before the guard this
+        // was admitted as 5x5 by reading PAST the segment it declared.
+        byte[] shortSof = { (byte) 0xFF, (byte) 0xD8, (byte) 0xFF, (byte) 0xC0,
+                            0x00, 0x02, 0x08, 0x00, 0x05, 0x00, 0x05 };
+        assertNull(BrewShot.readImageHeaderDimensions(shortSof),
+            "an SOF cannot declare a length of 2 and still carry dimensions");
+        assertThrows(IllegalStateException.class,
+            () -> BrewShot.enforceCaptureBounds(shortSof));
+    }
+
+    @Test
+    void aPngWhoseIhdrDeclaresTheWrongLengthIsRefused() {
+        // N2: IHDR is fixed at 13 bytes. A chunk claiming otherwise is not one we can read
+        // positionally, so offsets 16 and 20 are not trustworthy.
+        byte[] png = new byte[] {
+            (byte) 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A,
+            0x00, 0x00, 0x00, 0x0C, 'I', 'H', 'D', 'R',   // length 12, not 13
+            0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x30
+        };
+        assertNull(BrewShot.readImageHeaderDimensions(png),
+            "an IHDR declaring a length other than 13 must not be read positionally");
+    }
+
+    // ===== AT the limit, and one past it (must-fix M1, brewshot/634) =====
+    // The first round had fixtures only WELL under and WELL over, so `w > maxDim` mutated to
+    // `>=` left all 27 tests green: nothing ever sat exactly ON the boundary, which is the one
+    // input that distinguishes the two operators. Each pair below is at-limit (must PASS) and
+    // limit+1 (must REFUSE), for both axes and both formats.
+
+    @Test
+    void captureBoundsAdmitsAPngExactlyAtTheDimensionLimit() throws IOException {
+        setProp("brewshot.maxImageDimension", "200");
+        setProp("brewshot.maxImagePixels", "67108864");
+        BrewShot.enforceCaptureBounds(png(200, 120)); // exactly AT: > is false, >= would refuse
+    }
+
+    @Test
+    void captureBoundsRefusesAPngOnePastTheDimensionLimit() throws IOException {
+        setProp("brewshot.maxImageDimension", "200");
+        setProp("brewshot.maxImagePixels", "67108864");
+        IllegalStateException e = assertThrows(IllegalStateException.class,
+            () -> BrewShot.enforceCaptureBounds(png(201, 120)));
+        assertTrue(e.getMessage().contains("201x120"), "names the offending size: " + e.getMessage());
+    }
+
+    @Test
+    void captureBoundsAdmitsAJpegExactlyAtTheDimensionLimit() throws IOException {
+        setProp("brewshot.maxImageDimension", "200");
+        setProp("brewshot.maxImagePixels", "67108864");
+        BrewShot.enforceCaptureBounds(jpeg(200, 120));
+    }
+
+    @Test
+    void captureBoundsRefusesAJpegOnePastTheDimensionLimit() throws IOException {
+        setProp("brewshot.maxImageDimension", "200");
+        setProp("brewshot.maxImagePixels", "67108864");
+        assertThrows(IllegalStateException.class,
+            () -> BrewShot.enforceCaptureBounds(jpeg(201, 120)));
+    }
+
+    @Test
+    void captureBoundsAdmitsAnImageExactlyAtThePixelBudget() throws IOException {
+        setProp("brewshot.maxImageDimension", "16384");
+        setProp("brewshot.maxImagePixels", "9600"); // 120*80 exactly
+        BrewShot.enforceCaptureBounds(png(120, 80));
+    }
+
+    @Test
+    void captureBoundsRefusesAnImageOnePixelPastTheBudget() throws IOException {
+        setProp("brewshot.maxImageDimension", "16384");
+        setProp("brewshot.maxImagePixels", "9599"); // 120*80 = 9600, one over
+        IllegalStateException e = assertThrows(IllegalStateException.class,
+            () -> BrewShot.enforceCaptureBounds(png(120, 80)));
+        assertTrue(e.getMessage().contains("9600") && e.getMessage().contains("maxImagePixels"),
+            "names the pixel budget: " + e.getMessage());
+    }
+
+    // ===== an UNREADABLE header must be REFUSED, not skipped (ruling brewshot/632) =====
+    // Today enforceCaptureBounds returns on an unreadable header, with the comment
+    // "not a size problem; leave decode errors to the consumer". The ruling is that this is
+    // the wrong call when the check EXISTS to bound size: bytes whose size cannot be
+    // established are exactly the bytes a size bound must not wave through. These three are
+    // a DELIBERATE BEHAVIOUR CHANGE, not a refactor, which is why they are pinned separately
+    // from the dimension and pixel cases above.
+
+    @Test
+    void captureBoundsRefusesATruncatedPngRatherThanSkippingTheBound() {
+        // PNG signature + the IHDR length and type, and then nothing: the stream announces a
+        // PNG and stops before width and height exist.
+        byte[] truncated = new byte[] {
+            (byte) 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A,
+            0x00, 0x00, 0x00, 0x0D, 'I', 'H', 'D', 'R'
+        };
+        IllegalStateException e = assertThrows(IllegalStateException.class,
+            () -> BrewShot.enforceCaptureBounds(truncated),
+            "a truncated PNG header leaves the size unknown, so the size bound must REFUSE it");
+        assertTrue(e.getMessage().toLowerCase().contains("header"),
+            "the refusal names the header as the reason: " + e.getMessage());
+    }
+
+    @Test
+    void captureBoundsRefusesAJpegWithNoFrameHeader() {
+        // SOI, then a COMMENT segment (FFFE) carrying two payload bytes, then EOI. Structurally
+        // a JPEG, but it never reaches an SOF marker, so no dimensions are ever declared.
+        byte[] noSof = new byte[] {
+            (byte) 0xFF, (byte) 0xD8,
+            (byte) 0xFF, (byte) 0xFE, 0x00, 0x04, 0x41, 0x42,
+            (byte) 0xFF, (byte) 0xD9
+        };
+        assertThrows(IllegalStateException.class,
+            () -> BrewShot.enforceCaptureBounds(noSof),
+            "a JPEG with no SOF never declares a size, so the size bound must REFUSE it");
+    }
+
+    @Test
+    void captureBoundsRefusesBytesThatAreNotAnImageAtAll() {
+        byte[] notAnImage = "this is not an image, it is a sentence".getBytes(StandardCharsets.UTF_8);
+        assertThrows(IllegalStateException.class,
+            () -> BrewShot.enforceCaptureBounds(notAnImage),
+            "unrecognised bytes have no establishable size, so the size bound must REFUSE them");
     }
 
     @Test
