@@ -174,6 +174,51 @@ class BrewShotResourceCapsTest {
         BrewShot.enforceCaptureBounds(png(64, 48)); // must NOT throw
     }
 
+    // ===== an UNREADABLE header must be REFUSED, not skipped (ruling brewshot/632) =====
+    // Today enforceCaptureBounds returns on an unreadable header, with the comment
+    // "not a size problem; leave decode errors to the consumer". The ruling is that this is
+    // the wrong call when the check EXISTS to bound size: bytes whose size cannot be
+    // established are exactly the bytes a size bound must not wave through. These three are
+    // a DELIBERATE BEHAVIOUR CHANGE, not a refactor, which is why they are pinned separately
+    // from the dimension and pixel cases above.
+
+    @Test
+    void captureBoundsRefusesATruncatedPngRatherThanSkippingTheBound() {
+        // PNG signature + the IHDR length and type, and then nothing: the stream announces a
+        // PNG and stops before width and height exist.
+        byte[] truncated = new byte[] {
+            (byte) 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A,
+            0x00, 0x00, 0x00, 0x0D, 'I', 'H', 'D', 'R'
+        };
+        IllegalStateException e = assertThrows(IllegalStateException.class,
+            () -> BrewShot.enforceCaptureBounds(truncated),
+            "a truncated PNG header leaves the size unknown, so the size bound must REFUSE it");
+        assertTrue(e.getMessage().toLowerCase().contains("header"),
+            "the refusal names the header as the reason: " + e.getMessage());
+    }
+
+    @Test
+    void captureBoundsRefusesAJpegWithNoFrameHeader() {
+        // SOI, then a COMMENT segment (FFFE) carrying two payload bytes, then EOI. Structurally
+        // a JPEG, but it never reaches an SOF marker, so no dimensions are ever declared.
+        byte[] noSof = new byte[] {
+            (byte) 0xFF, (byte) 0xD8,
+            (byte) 0xFF, (byte) 0xFE, 0x00, 0x04, 0x41, 0x42,
+            (byte) 0xFF, (byte) 0xD9
+        };
+        assertThrows(IllegalStateException.class,
+            () -> BrewShot.enforceCaptureBounds(noSof),
+            "a JPEG with no SOF never declares a size, so the size bound must REFUSE it");
+    }
+
+    @Test
+    void captureBoundsRefusesBytesThatAreNotAnImageAtAll() {
+        byte[] notAnImage = "this is not an image, it is a sentence".getBytes(StandardCharsets.UTF_8);
+        assertThrows(IllegalStateException.class,
+            () -> BrewShot.enforceCaptureBounds(notAnImage),
+            "unrecognised bytes have no establishable size, so the size bound must REFUSE them");
+    }
+
     @Test
     void aMinusDOverrideChangesTheImageLimit() throws IOException {
         byte[] img = png(200, 200);
