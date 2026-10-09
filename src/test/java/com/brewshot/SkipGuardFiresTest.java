@@ -65,16 +65,20 @@ class SkipGuardFiresTest {
                 }
             }
             """);
+        // The gate call is assembled from two pieces ON PURPOSE. The real build derives its
+        // Chrome-test catalog by scanning src/test/java for the literal gate call, and a
+        // whole literal here put a phantom "SkipGuardFiresTest.browser" into that catalog.
+        String gateCall = "TestChrome" + ".requireChromeOrLoudSkip(";
         Files.writeString(pkg.resolve("FixtureChromeTest.java"), """
             package com.brewshot;
             import org.junit.jupiter.api.Test;
             class FixtureChromeTest {
                 @Test
                 void browser() {
-                    TestChrome.requireChromeOrLoudSkip("FixtureChromeTest");
+                    %s"FixtureChromeTest");
                 }
             }
-            """);
+            """.formatted(gateCall));
         Files.writeString(pkg.resolve("FixturePlainTest.java"), """
             package com.brewshot;
             import org.junit.jupiter.api.Test;
