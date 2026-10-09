@@ -577,7 +577,7 @@ Run a persistent local-HTML worker with writable input and output mounts:
 
 ```sh
 mkdir -p Input Output
-docker run -d --name brewshot-worker --restart unless-stopped \
+docker run -d --init --name brewshot-worker --restart unless-stopped \
   --user "$(id -u):$(id -g)" \
   --mount type=bind,src="$PWD/Input",dst=/brewshot/input \
   --mount type=bind,src="$PWD/Output",dst=/brewshot/output \
@@ -613,6 +613,45 @@ Existing outputs, diagnostics, and archives are never overwritten; collisions
 are retained under job-id directories. Valid processing claims recover after a
 restart, and multiple workers may share the same mounts. Set
 `BREWSHOT_WATCH_POLL_MS` to `10` through `60000` milliseconds (default `500`).
+
+#### When the temporary Chrome profile is deleted
+
+Every capture launches Chrome with a fresh generated `brewshot-*` profile under
+the temp directory. BrewShot deletes it only when it can PROVE every process of
+that launch has exited. Enumerating the launched process tree is not such a
+proof: on Linux the two `chrome_crashpad_handler` helpers reparent to pid 1,
+take their own process groups and carry no profile path in argv, so an
+enumeration can miss a live helper that would recreate the directory.
+
+The one proof BrewShot accepts is **container cgroup containment**, and only
+under strict conditions:
+
+- the run opted in with `BREWSHOT_RELEASE_PROOF=container-cgroup` (the image's
+  `watch` entrypoint sets it; `-e BREWSHOT_RELEASE_PROOF=off` opts out);
+- `/proc/self/cgroup` is exactly the single line `0::/` (cgroup v2 with a
+  private cgroup namespace, the Docker default on cgroup v2 hosts);
+- `/sys/fs/cgroup/cgroup.procs` is readable and lists this JVM's own pid.
+
+The membership set is read before Chrome starts. That baseline is computed,
+not assumed: it is `{1}` when the JVM is pid 1 and `{1, <jvm pid>}` under
+`--init`. At teardown BrewShot re-reads the file in-process about every 50 ms
+until it equals the baseline, for at most 5 seconds (less if the teardown
+budget has less left). Equality proves release and the profile is deleted.
+Anything else is UNPROVEN and the profile is kept: a survivor, a process you
+`docker exec`ed into the container during the capture, or any other cgroup
+shape (cgroup v1, a non-root path, an unreadable file). stderr names the
+outcome, the time it took and, on refusal, the extra pids.
+
+**Run the worker with `docker run --init`.** Without it the JVM is pid 1,
+nothing reaps Chrome's exited helpers, and each capture leaves zombie
+processes behind (7 per capture, measured). Zombies are not cgroup members, but
+the JDK still reports them alive, so the release is refused before the cgroup
+is even read and every profile is kept. Under `--init` the init process reaps
+them and release was measured proven, with the profile deleted.
+
+Outside such a container (the plain CLI on macOS, Windows or a Linux host, and
+the container CLI without the opt-in) release stays UNPROVEN by decision: the
+profile is kept rather than deleted on an unproven claim.
 
 > [!WARNING]
 > On Linux, map the process to the host UID/GID as above or make the bind
