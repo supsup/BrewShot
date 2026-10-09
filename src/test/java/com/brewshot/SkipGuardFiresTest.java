@@ -119,6 +119,16 @@ class SkipGuardFiresTest {
     }
 
     @Test
+    void settingTheFlagRerunsASuiteThatRecordedSkips() {
+        // A run without the flag records a skip and is green. Setting the flag must rerun
+        // the suite and fail, not report :test UP-TO-DATE over the recorded skip.
+        passes(false, "test");
+        BuildResult result = fails(true, "test");
+        assertEquals(TaskOutcome.FAILED, testOutcome(result), result.getOutput());
+        assertTrue(result.getOutput().contains(SKIP_VERDICT), result.getOutput());
+    }
+
+    @Test
     void disabledXmlReportFailsClosed() throws IOException {
         appendToFixtureScript("tasks.test { reports.junitXml.required = false }");
         BuildResult result = fails(true, "test", "--tests", PASSING_ONLY);

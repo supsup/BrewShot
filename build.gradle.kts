@@ -77,11 +77,12 @@ fun org.gradle.api.tasks.testing.Test.configureBrewShotTests() {
     // catches any future test that forgets the gate and skips on its own.
     val requireChrome = System.getenv("BREWSHOT_REQUIRE_CHROME")
         ?.let { it == "1" || it.equals("true", true) || it.equals("yes", true) } ?: false
-    // The flag is a task INPUT so flipping it reruns the suite. Without this, a run
-    // that recorded skips with the flag unset stays UP-TO-DATE when the flag is then
-    // set, the guard never executes, and the build is green over recorded skips
-    // (measured on 7ec1d19: 56 skipped in the XML, BUILD SUCCESSFUL, `:test UP-TO-DATE`).
-    inputs.property("brewshotRequireChrome", requireChrome)
+    // Setting the flag must RERUN a suite that recorded skips. The old afterSuite
+    // listener did not change the task, so `:test` stayed UP-TO-DATE and the build was
+    // green over recorded skips (measured on 7ec1d19: 56 skipped in the XML, BUILD
+    // SUCCESSFUL). The guard is now a task action, and Gradle reruns a task whose
+    // actions changed ("One or more additional actions for task ':test' have changed").
+    // SkipGuardFiresTest.settingTheFlagRerunsASuiteThatRecordedSkips pins that.
     // SkipGuardFiresTest runs THIS file in a nested build, so an edit to the guard
     // must rerun the suite that proves it.
     inputs.files(layout.projectDirectory.file("build.gradle.kts"))
