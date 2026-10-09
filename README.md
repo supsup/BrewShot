@@ -715,6 +715,18 @@ The test lanes are explicit:
   executed rather than skipped.
 - `./gradlew test` remains the backward-compatible aggregate suite.
 
+The no-skip guard behind those lanes reads the JUnit XML report each test task
+writes, after the tests finish. Any skip recorded there fails the build. So does
+missing evidence: a disabled report, no report files, an unparseable report, or
+reports that record zero tests all fail the lane rather than letting an
+unverified run report green. With `BREWSHOT_REQUIRE_CHROME` unset, `test` and
+`chromeTest` still allow skips, so a machine without Chrome can run the suite.
+`SkipGuardFiresTest` runs this repository's own `build.gradle.kts` in a nested
+Gradle TestKit build (test scope only) to prove the guard fires, stays off
+without the flag, and fails closed on each missing-evidence shape. That nested
+build resolves JUnit into a TestKit directory under `build/`, so a clean build
+needs Maven Central for it, as the outer build already does.
+
 The browser-free lane still includes descendant-process teardown fixtures. An
 inherited macOS Codex Seatbelt can deny the JDK's `ProcessHandle` enumeration
 through `sysctl`; use a normal Terminal or a Linux control with a PID-1 reaper

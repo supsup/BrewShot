@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **The CI no-skip guard no longer rides a deprecated Gradle API, and a test proves it
+  fires** (plan bbb87517). The `BREWSHOT_REQUIRE_CHROME` / `unitTest` guard was an
+  `afterSuite(Closure)` listener, which Gradle 9 deprecates for removal in Gradle 10; once
+  removed it would have stopped running without a sound and skips would have gone green
+  again. It is now a named `doLast` that reads the test task's JUnit XML and fails closed
+  when that evidence is disabled, absent, unparseable, or records zero tests. Setting the
+  flag after a skipping run now reruns the suite: the old listener left `:test` UP-TO-DATE
+  and green over 56 recorded skips. `SkipGuardFiresTest` drives the real `build.gradle.kts`
+  through Gradle TestKit (test scope only; runtime stays zero-dependency). Build and test
+  only; no library or CLI behaviour changed.
 - **Orphan one-shot wait timeouts now fail loud before side effects.** An explicit
   `--wait-timeout` without `--wait-js` is a usage error instead of a silently
   discarded contract. Both spaced and `--wait-timeout=...` spellings receive the
