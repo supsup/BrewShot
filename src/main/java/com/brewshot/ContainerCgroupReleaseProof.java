@@ -35,12 +35,19 @@ import java.util.function.LongSupplier;
  * including both crashpad handlers; exactly {1} again after exit. A setsid survivor kept the
  * after-set different, which is the refusal working.
  *
- * <p>ZOMBIES DO NOT BLOCK THE PROOF, AND THE PROOF DOES NOT REAP. cgroup v2 removes an exited task
- * from cgroup.procs when it exits, before its parent reaps it. Measured in the dogfood on
- * 2026-10-09: with the JVM as pid 1, every capture left 7 zombie children of pid 1 and none of
- * them appeared in cgroup.procs. Equality therefore says "no LIVE member beyond the baseline",
- * which is the property the profile deletion needs; the zombies themselves are an accumulation
- * problem for long watch runs, solved by {@code docker run --init}, not by this class.
+ * <p>ZOMBIES DO NOT BLOCK THIS PROOF, AND IT DOES NOT REAP. cgroup v2 removes an exited task from
+ * cgroup.procs when it exits, before its parent reaps it. Measured in the dogfood on 2026-10-09:
+ * with the JVM as pid 1, every capture left 7 zombie children of pid 1 and none of them appeared
+ * in cgroup.procs. Equality therefore says "no LIVE member beyond the baseline", which is the
+ * property the profile deletion needs.
+ *
+ * <p>BUT ZOMBIES DO BLOCK THE LEASE GATE IN FRONT OF IT, measured with this branch's image on
+ * 2026-10-09: with the JVM as pid 1, Chrome's reparented children become unreaped zombies of the
+ * JVM itself, the lease's JDK handles still report them alive, the tree is "not confirmed reaped"
+ * and this proof is never consulted, so the profile is retained (fail-closed, and reported through
+ * {@link #releaseNotConsulted}). Under {@code docker run --init} the init process reaps them and
+ * release is proven. So {@code --init} is what makes release possible, not only what stops zombie
+ * accumulation in long watch runs.
  *
  * <p>FAIL-CLOSED SHAPES. Any other process that joins the cgroup during the wait (a
  * {@code docker exec}, a concurrent launch in the same JVM, a survivor) keeps the set unequal and
@@ -283,6 +290,14 @@ final class ContainerCgroupReleaseProof implements BrewShot.ProcessTreeReleasePr
             + TimeUnit.NANOSECONDS.toMillis(limitNanos) + " ms); " + why
             + "; release UNPROVEN, profile retained");
         return false;
+    }
+
+    @Override
+    public void releaseNotConsulted(String why) {
+        lastOutcome = "NOT CONSULTED: " + why;
+        log.accept(PREFIX + "not consulted, an earlier release gate refused: " + why
+            + " (a zombie child of a pid-1 JVM reads as alive there; run the container with"
+            + " --init); release UNPROVEN, profile retained");
     }
 
     private long elapsedMillis(long started) {

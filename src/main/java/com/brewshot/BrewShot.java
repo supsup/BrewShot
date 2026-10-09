@@ -738,6 +738,13 @@ public final class BrewShot implements AutoCloseable {
         default boolean releaseSafe(long waitBudgetNanos) {
             return releaseSafe();
         }
+
+        /**
+         * Told when cleanup did NOT ask the question because an earlier gate already refused
+         * (the tree is not confirmed reaped, or an argv-matching orphan survived). A proof that
+         * reports its decisions says so, so a retained profile is never silent. Default: nothing.
+         */
+        default void releaseNotConsulted(String why) { }
     }
 
     @FunctionalInterface
@@ -927,6 +934,11 @@ public final class BrewShot implements AutoCloseable {
             }
             boolean releaseProven =
                 processTreeReaped && orphansReaped && processTreeReleaseSafe(deadline);
+            if (!processTreeReaped || !orphansReaped) {
+                processTreeReleaseNotConsulted(!processTreeReaped
+                    ? "a JDK handle of the launched tree still reports a member alive"
+                    : "a process with this profile in its argv survived the orphan sweep");
+            }
             if (releaseProven) {
                 try { profileDeleter.delete(profileDir); }
                 catch (RuntimeException ignored) {
@@ -955,6 +967,11 @@ public final class BrewShot implements AutoCloseable {
                 // A failed proof is no proof. Retain the profile and lease.
                 return false;
             }
+        }
+
+        private void processTreeReleaseNotConsulted(String why) {
+            try { processTreeReleaseProof.releaseNotConsulted(why); }
+            catch (RuntimeException ignored) { }
         }
 
         private boolean profileAbsenceProven() {

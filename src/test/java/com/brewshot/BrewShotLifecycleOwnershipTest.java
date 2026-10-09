@@ -493,6 +493,36 @@ class BrewShotLifecycleOwnershipTest {
     }
 
     @Test
+    void anUnreapedTreeLeavesTheCgroupProofUnconsultedAndSaysSo(@TempDir Path temp)
+            throws Exception {
+        // The pid-1 JVM shape measured on 2026-10-09: the cgroup is back at its baseline (zombies
+        // are not members) but a JDK handle still reports the tree alive. The earlier gate refuses,
+        // the proof is not asked, and the retained profile is reported rather than silent.
+        FakeProcess process = new FakeProcess(Integer.MAX_VALUE);
+        Path profile = profile(temp, "cgroup-unreaped");
+        ContainerCgroupReleaseProofTest.FakeCgroup cgroup =
+            new ContainerCgroupReleaseProofTest.FakeCgroup()
+                .selfCgroup("0::/\n").procs("1\n");
+        ContainerCgroupReleaseProof proof = cgroup.proof(50, 5_000);
+        BrewShot.ResourceLease lease =
+            BrewShot.registerLaunchLeaseWithReleaseProofForTests(
+                process, profile, BrewShotLifecycleOwnershipTest::deleteProfile, proof);
+
+        BrewShot.runShutdownCleanupForTests();
+
+        assertTrue(Files.exists(profile));
+        assertTrue(lease.isOwned());
+        assertEquals(1, cgroup.procsReads.get(), "only the baseline read; the proof was not asked");
+        assertTrue(proof.lastOutcome().startsWith("NOT CONSULTED"), proof.lastOutcome());
+        assertTrue(cgroup.lastLog().contains("still reports a member alive"), cgroup.lastLog());
+
+        process.exitParentAndOrphanChildren();
+        BrewShot.runShutdownCleanupForTests();
+        assertFalse(Files.exists(profile));
+        assertFalse(lease.isOwned());
+    }
+
+    @Test
     void theLeaseHandsTheProofItsRemainingCleanupBudget(@TempDir Path temp)
             throws Exception {
         FakeHandle parentHandle = new FakeHandle(34, false, List.of());
