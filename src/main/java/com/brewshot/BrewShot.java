@@ -723,10 +723,21 @@ public final class BrewShot implements AutoCloseable {
      * {@link ProcessHandle#descendants()} snapshot is deliberately not such a
      * proof: a child can be created after the snapshot and reparent before
      * another enumeration observes it.
+     *
+     * The one production proof is {@link ContainerCgroupReleaseProof}, and only behind an explicit
+     * opt-in ({@link #launchReleaseProof}); every other launch is UNPROVEN by decision.
      */
     @FunctionalInterface
     interface ProcessTreeReleaseProof {
         boolean releaseSafe();
+
+        /**
+         * The same question, told how much of the caller's cleanup budget is left. A proof that
+         * WAITS must not wait past it; a proof that does not wait ignores it.
+         */
+        default boolean releaseSafe(long waitBudgetNanos) {
+            return releaseSafe();
+        }
     }
 
     @FunctionalInterface
@@ -915,7 +926,7 @@ public final class BrewShot implements AutoCloseable {
                     allHandlesDead(sweepOrphansByProfilePath(profileDir, deadline));
             }
             boolean releaseProven =
-                processTreeReaped && orphansReaped && processTreeReleaseSafe();
+                processTreeReaped && orphansReaped && processTreeReleaseSafe(deadline);
             if (releaseProven) {
                 try { profileDeleter.delete(profileDir); }
                 catch (RuntimeException ignored) {
@@ -938,8 +949,8 @@ public final class BrewShot implements AutoCloseable {
             if (owner != Owner.RELEASED) { refreshProcessTreeSnapshot(); }
         }
 
-        private boolean processTreeReleaseSafe() {
-            try { return processTreeReleaseProof.releaseSafe(); }
+        private boolean processTreeReleaseSafe(Deadline deadline) {
+            try { return processTreeReleaseProof.releaseSafe(deadline.remainingNanos()); }
             catch (RuntimeException ignored) {
                 // A failed proof is no proof. Retain the profile and lease.
                 return false;
@@ -1107,6 +1118,54 @@ public final class BrewShot implements AutoCloseable {
         return startOwnedProcess(
             profileDir, starter, BrewShot::deleteRecursively,
             afterStartBeforeRegistration);
+    }
+
+    /** Launch with an explicit per-launch release proof (see {@link #launchReleaseProof}). */
+    static ResourceLease startLaunchProcess(Path profileDir, ProcessStarter starter,
+                                            Runnable afterStartBeforeRegistration,
+                                            ProcessTreeReleaseProof processTreeReleaseProof)
+            throws IOException {
+        return startOwnedProcess(
+            profileDir, starter, BrewShot::deleteRecursively,
+            afterStartBeforeRegistration, processTreeReleaseProof);
+    }
+
+    /**
+     * The release proof for ONE launch, chosen from the environment and created BEFORE Chrome
+     * starts, because the cgroup proof's baseline must not contain Chrome.
+     *
+     * UNPROVEN unless {@code BREWSHOT_RELEASE_PROOF=container-cgroup} is set. The opt-in is
+     * explicit, not inferred from "the cgroup file looks right", so the plain CLI on an arbitrary
+     * Linux host with an unusual cgroup layout keeps exactly the behaviour it had. The Docker
+     * image's watch entrypoint sets it. Even when opted in, the proof's own strict detection can
+     * still refuse (and say why); there is no fallback to any enumeration.
+     */
+    static ProcessTreeReleaseProof launchReleaseProof(
+            Map<String, String> env,
+            java.util.function.Supplier<? extends ProcessTreeReleaseProof> containerCgroupProof) {
+        String requested = env.get(ContainerCgroupReleaseProof.OPT_IN_ENV);
+        if (requested == null || requested.isBlank() || requested.equals("off")) {
+            return UNPROVEN_PROCESS_TREE_RELEASE;
+        }
+        if (!requested.equals(ContainerCgroupReleaseProof.OPT_IN_VALUE)) {
+            System.err.println("brewshot: release proof: unknown "
+                + ContainerCgroupReleaseProof.OPT_IN_ENV + " value '" + requested
+                + "' (only '" + ContainerCgroupReleaseProof.OPT_IN_VALUE
+                + "' or 'off' is recognised); release UNPROVEN, profile retained");
+            return UNPROVEN_PROCESS_TREE_RELEASE;
+        }
+        try {
+            return Objects.requireNonNull(containerCgroupProof.get(), "container cgroup proof");
+        } catch (RuntimeException e) {
+            System.err.println("brewshot: release proof: could not be created (" + e
+                + "); release UNPROVEN, profile retained");
+            return UNPROVEN_PROCESS_TREE_RELEASE;
+        }
+    }
+
+    /** Test seam: whether a proof is the production default (UNPROVEN) object. */
+    static boolean isUnprovenDefaultForTests(ProcessTreeReleaseProof proof) {
+        return proof == UNPROVEN_PROCESS_TREE_RELEASE;
     }
 
     static ResourceLease startContainedOwnedProcessForTests(
@@ -1481,6 +1540,9 @@ public final class BrewShot implements AutoCloseable {
             args.addAll(List.of(extra.trim().split("\\s+")));
         }
         args.add("about:blank");
+        // Created HERE, before the starter runs: the cgroup proof reads its baseline now.
+        ProcessTreeReleaseProof releaseProof =
+            launchReleaseProof(System.getenv(), ContainerCgroupReleaseProof::forLaunch);
         ResourceLease lease = startLaunchProcess(
             profile,
             () -> chromeProcessBuilder(args, environmentOverrides)
@@ -1490,7 +1552,8 @@ public final class BrewShot implements AutoCloseable {
                 .redirectOutput(ProcessBuilder.Redirect.PIPE)
                 .redirectError(ProcessBuilder.Redirect.PIPE)
                 .start(),
-            () -> { });
+            () -> { },
+            releaseProof);
         Process p = lease.process;
 
         String wsUrl;

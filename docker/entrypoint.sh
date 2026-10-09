@@ -12,6 +12,11 @@ fi
 case "${1-}" in
     watch)
         shift
+        # Opt the long-running worker into the container-cgroup release proof, so a
+        # proven capture's Chrome profile is deleted instead of retained. BrewShot
+        # still refuses (UNPROVEN, profile kept) unless its strict cgroup v2 detection
+        # passes. An operator can opt out with -e BREWSHOT_RELEASE_PROOF=off.
+        export BREWSHOT_RELEASE_PROOF="${BREWSHOT_RELEASE_PROOF-container-cgroup}"
         exec java -cp \
             /opt/brewshot/brewshot.jar:/opt/brewshot/brewshot-worker.jar \
             com.brewshot.BrewShotFolderWorker "$@"

@@ -464,6 +464,70 @@ class BrewShotLifecycleOwnershipTest {
     }
 
     @Test
+    void containerCgroupProofRetainsTheProfileWhileASurvivorIsInTheCgroup(
+            @TempDir Path temp)
+            throws Exception {
+        // End to end through the lease: the parent is dead and every JDK view is empty, the
+        // survivor (pid 812) is visible ONLY as a cgroup member. Release must be refused.
+        FakeHandle parentHandle = new FakeHandle(33, false, List.of());
+        FakeProcess process = new FakeProcess(1, false, parentHandle);
+        Path profile = profile(temp, "cgroup-survivor");
+        ContainerCgroupReleaseProofTest.FakeCgroup cgroup =
+            new ContainerCgroupReleaseProofTest.FakeCgroup()
+                .selfCgroup("0::/\n").procs("1\n", "1\n812\n");
+        ContainerCgroupReleaseProof proof = cgroup.proof(50, 5_000);
+        BrewShot.ResourceLease lease =
+            BrewShot.registerLaunchLeaseWithReleaseProofForTests(
+                process, profile, BrewShotLifecycleOwnershipTest::deleteProfile, proof);
+
+        BrewShot.runShutdownCleanupForTests();
+
+        assertTrue(Files.exists(profile), "a live cgroup member is no proof of release");
+        assertTrue(lease.isOwned());
+        assertTrue(proof.lastOutcome().startsWith("UNPROVEN by deadline"), proof.lastOutcome());
+
+        cgroup.procs("1\n");
+        BrewShot.runShutdownCleanupForTests();
+        assertFalse(Files.exists(profile), "membership back at the baseline proves release");
+        assertFalse(lease.isOwned());
+    }
+
+    @Test
+    void theLeaseHandsTheProofItsRemainingCleanupBudget(@TempDir Path temp)
+            throws Exception {
+        FakeHandle parentHandle = new FakeHandle(34, false, List.of());
+        FakeProcess process = new FakeProcess(1, false, parentHandle);
+        Path profile = profile(temp, "cgroup-budget");
+        java.util.concurrent.atomic.AtomicLong budget =
+            new java.util.concurrent.atomic.AtomicLong(-1);
+        AtomicBoolean allow = new AtomicBoolean();
+        BrewShot.ProcessTreeReleaseProof recording = new BrewShot.ProcessTreeReleaseProof() {
+            @Override public boolean releaseSafe() {
+                throw new AssertionError("the lease must ask the budgeted question");
+            }
+            @Override public boolean releaseSafe(long waitBudgetNanos) {
+                budget.set(waitBudgetNanos);
+                return allow.get();
+            }
+        };
+        BrewShot.ResourceLease lease = BrewShot.registerLaunchLeaseWithReleaseProofForTests(
+            process, profile, BrewShotLifecycleOwnershipTest::deleteProfile, recording);
+
+        BrewShot.runShutdownCleanupForTests();
+
+        assertTrue(budget.get() > 0, "budget " + budget.get());
+        assertTrue(budget.get() <= TimeUnit.MILLISECONDS.toNanos(500),
+            "a shutdown attempt is capped at 500 ms and the proof must not wait past it: "
+                + budget.get());
+        assertTrue(Files.exists(profile));
+
+        allow.set(true);
+        BrewShot.runShutdownCleanupForTests();
+        assertFalse(Files.exists(profile));
+        assertFalse(lease.isOwned());
+    }
+
+    @Test
     void unstableEnumerationCannotBypassContainmentProof(
             @TempDir Path temp)
             throws Exception {
