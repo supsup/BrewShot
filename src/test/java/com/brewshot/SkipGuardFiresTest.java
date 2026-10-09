@@ -99,6 +99,31 @@ class SkipGuardFiresTest {
     }
 
     @Test
+    void skipsInSeveralReportsAreAllCounted() throws IOException {
+        // The guard must add up skips across EVERY report file, not stop at the first. A
+        // second skipping class writes its own TEST-*.xml, so the verdict must say 2. This
+        // pins aggregation deterministically: a guard that reads only some reports reports
+        // the wrong count whatever order listFiles returns the files in (a mutant reading
+        // only the first report survived requiredRunWithASkipFailsTheBuild, because there
+        // the one skipping report happened to sort first).
+        String gateCall = "TestChrome" + ".requireChromeOrLoudSkip(";
+        Files.writeString(fixture.resolve("src/test/java/com/brewshot/ZzzSecondChromeTest.java"), """
+            package com.brewshot;
+            import org.junit.jupiter.api.Test;
+            class ZzzSecondChromeTest {
+                @Test
+                void browserToo() {
+                    %s"ZzzSecondChromeTest");
+                }
+            }
+            """.formatted(gateCall));
+        BuildResult result = fails(true, "test");
+        assertEquals(TaskOutcome.FAILED, testOutcome(result), result.getOutput());
+        assertTrue(result.getOutput().contains(
+            "BREWSHOT_REQUIRE_CHROME is set but 2 test(s) were SKIPPED"), result.getOutput());
+    }
+
+    @Test
     void requiredRunWithNoSkipPasses() throws IOException {
         // Control for the case above: same fixture, same flag, the skipping test filtered out.
         BuildResult result = passes(true, "test", "--tests", PASSING_ONLY, "--warning-mode", "all");
