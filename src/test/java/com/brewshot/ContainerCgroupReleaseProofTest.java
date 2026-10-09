@@ -484,4 +484,18 @@ class ContainerCgroupReleaseProofTest {
         assertTrue(proof.releaseSafe());
         assertEquals(100, fake.elapsedMillisSince(start), "two refused polls, proven on the third");
     }
+
+    // ---- the watch worker's one-time pid-1 warning (plan 558d8abe) ----------------------------
+
+    @Test
+    void pidOneWarningFiresOnlyForAnOptedInPidOneJvm() {
+        java.util.Map<String, String> optIn = Map.of(
+            ContainerCgroupReleaseProof.OPT_IN_ENV, ContainerCgroupReleaseProof.OPT_IN_VALUE);
+        String w = ContainerCgroupReleaseProof.pidOneWarning(1, optIn);
+        assertTrue(w != null && w.contains("pid 1") && w.contains("--init"), String.valueOf(w));
+        assertNull(ContainerCgroupReleaseProof.pidOneWarning(6, optIn), "under tini the JVM is not pid 1");
+        assertNull(ContainerCgroupReleaseProof.pidOneWarning(1, Map.of()), "no opt-in, no proof to starve");
+        assertNull(ContainerCgroupReleaseProof.pidOneWarning(1,
+            Map.of(ContainerCgroupReleaseProof.OPT_IN_ENV, "off")), "opted out");
+    }
 }

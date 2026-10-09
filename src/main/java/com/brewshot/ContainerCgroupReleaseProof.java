@@ -78,6 +78,21 @@ final class ContainerCgroupReleaseProof implements BrewShot.ProcessTreeReleasePr
     static final Path DEFAULT_SELF_CGROUP = Path.of("/proc/self/cgroup");
     static final Path DEFAULT_CGROUP_PROCS = Path.of("/sys/fs/cgroup/cgroup.procs");
     static final Path DEFAULT_PROC_ROOT = Path.of("/proc");
+    /**
+     * The warning the watch worker prints once at start when the cgroup proof is opted in but this
+     * JVM is pid 1, or null when there is nothing to warn about. A pid-1 JVM never reaps Chrome's
+     * reparented helpers, so their zombies keep the lease's reaped-tree gate refusing and this
+     * proof is never consulted: every profile is kept, quietly, one stderr line per job. The image
+     * runs tini as pid 1 to prevent it; this catches an overridden entrypoint.
+     */
+    static String pidOneWarning(long selfPid, java.util.Map<String, String> env) {
+        if (selfPid != 1 || !OPT_IN_VALUE.equals(env.get(OPT_IN_ENV))) { return null; }
+        return "brewshot-watch: WARNING: this JVM is pid 1, so nothing reaps Chrome's exited helpers."
+            + " Their zombies keep every capture's release UNPROVEN and every Chrome profile in /tmp"
+            + " (several MB per job). Use the image's own entrypoint (tini), or docker run --init, or"
+            + " Compose init: true, or Kubernetes shareProcessNamespace / an init process.";
+    }
+
     /** cgroup.stat sits beside cgroup.procs in the same cgroup directory. */
     static Path statOf(Path cgroupProcs) { return cgroupProcs.resolveSibling("cgroup.stat"); }
     static final long DEFAULT_POLL_MILLIS = 50;

@@ -18,6 +18,7 @@ ARG CHROMIUM_VERSION=149.0.7827.53-r0
 ARG FONT_LIBERATION_VERSION=2.1.5-r2
 ARG FONT_DEJAVU_VERSION=2.37-r6
 ARG FONT_NOTO_EMOJI_VERSION=2.048-r0
+ARG TINI_VERSION=0.19.0-r3
 
 # ---- build the jar -------------------------------------------------------
 FROM ${TEMURIN_JDK_IMAGE} AS build
@@ -65,7 +66,9 @@ ARG CHROMIUM_VERSION
 ARG FONT_LIBERATION_VERSION
 ARG FONT_DEJAVU_VERSION
 ARG FONT_NOTO_EMOJI_VERSION
+ARG TINI_VERSION
 RUN apk add --no-cache \
+        tini="${TINI_VERSION}" \
         chromium="${CHROMIUM_VERSION}" \
         font-liberation="${FONT_LIBERATION_VERSION}" \
         font-dejavu="${FONT_DEJAVU_VERSION}" \
@@ -100,5 +103,9 @@ ENV HOME=/home/brewshot
 # uses absolute /brewshot/input and /brewshot/output roots, so it does not
 # depend on the process working directory.
 WORKDIR /work
-ENTRYPOINT ["/opt/brewshot/entrypoint.sh"]
+# tini is pid 1 and reaps: Chrome's helpers reparent to pid 1, and with the JVM there they
+# would become unreaped zombies (7 per capture, measured), which keeps the cgroup release
+# proof from ever being consulted and every profile on disk. -s makes tini a subreaper, so it
+# still reaps when someone ALSO passes docker run --init (then docker-init is pid 1).
+ENTRYPOINT ["/sbin/tini", "-s", "--", "/opt/brewshot/entrypoint.sh"]
 CMD ["--help"]
