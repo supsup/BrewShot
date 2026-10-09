@@ -159,7 +159,8 @@ class SkipGuardFiresTest {
     }
 
     @Test
-    void zeroRecordedTestsFailsClosed() throws IOException {
+    void aRunThatMatchesNoTestsFailsClosed() throws IOException {
+        // Zero tests ran, so the task writes no report at all.
         appendToFixtureScript("""
             tasks.test {
                 filter {
@@ -171,6 +172,20 @@ class SkipGuardFiresTest {
         BuildResult result = fails(true, "test");
         assertEquals(TaskOutcome.FAILED, testOutcome(result), result.getOutput());
         assertTrue(result.getOutput().contains(NO_EVIDENCE), result.getOutput());
+        assertTrue(result.getOutput().contains("no TEST-*.xml report"), result.getOutput());
+    }
+
+    @Test
+    void reportsThatRecordZeroTestsFailClosed() throws IOException {
+        // Stand-in for a future Gradle that writes well-formed but empty suites: replace the
+        // real report with one that parses and records nothing.
+        appendBeforeGuard("reports.junitXml.outputLocation.get().asFile.listFiles()!!.forEach { it.delete() }; "
+            + "reports.junitXml.outputLocation.get().file(\"TEST-com.brewshot.Empty.xml\").asFile.writeText("
+            + "\"<testsuite name='com.brewshot.Empty' tests='0' skipped='0' failures='0' errors='0'/>\")");
+        BuildResult result = fails(true, "test", "--tests", PASSING_ONLY);
+        assertEquals(TaskOutcome.FAILED, testOutcome(result), result.getOutput());
+        assertTrue(result.getOutput().contains(NO_EVIDENCE), result.getOutput());
+        assertTrue(result.getOutput().contains("record zero tests"), result.getOutput());
     }
 
     /**
