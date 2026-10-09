@@ -28,6 +28,10 @@ dependencies {
     testImplementation(platform("org.junit:junit-bom:5.11.4"))
     testImplementation("org.junit.jupiter:junit-jupiter")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
+    // Test scope only, and shipped inside the Gradle distribution (no extra download):
+    // SkipGuardFiresTest runs this build script in a nested build to prove the
+    // no-skip guard fires. Nothing here reaches the runtime classpath.
+    testImplementation(gradleTestKit())
 }
 
 application {
@@ -67,27 +71,94 @@ fun org.gradle.api.tasks.testing.Test.configureBrewShotTests() {
     }
 
     // CI-honesty guard: when BREWSHOT_REQUIRE_CHROME is set (CI sets it), NO test
-    // may skip — the Chrome-driving suite must run or fail, never report
+    // may skip. The Chrome-driving suite must run or fail, never report
     // skipped==green. TestChrome.requireChromeOrLoudSkip turns absence into a
     // failure per-test under REQUIRE; this is the belt-and-suspenders that also
     // catches any future test that forgets the gate and skips on its own.
     val requireChrome = System.getenv("BREWSHOT_REQUIRE_CHROME")
         ?.let { it == "1" || it.equals("true", true) || it.equals("yes", true) } ?: false
+    // The flag is a task INPUT so flipping it reruns the suite. Without this, a run
+    // that recorded skips with the flag unset stays UP-TO-DATE when the flag is then
+    // set, the guard never executes, and the build is green over recorded skips
+    // (measured on 7ec1d19: 56 skipped in the XML, BUILD SUCCESSFUL, `:test UP-TO-DATE`).
+    inputs.property("brewshotRequireChrome", requireChrome)
+    // SkipGuardFiresTest runs THIS file in a nested build, so an edit to the guard
+    // must rerun the suite that proves it.
+    inputs.files(layout.projectDirectory.file("build.gradle.kts"))
+        .withPropertyName("buildScript")
+        .withPathSensitivity(PathSensitivity.RELATIVE)
     if (requireChrome) {
         failOnSkippedTests("BREWSHOT_REQUIRE_CHROME is set")
     }
 }
 
+// The guard reads the durable evidence the task leaves behind, the JUnit XML
+// report, in a named doLast. It used to be an afterSuite(Closure) listener, which
+// Gradle 9 deprecated for removal in Gradle 10 (upgrading_version_9.html,
+// "deprecated_test_methods"). A removed listener API would not have failed loud:
+// the closure would simply stop being called and every skip would go green again.
+// Reading the report instead fails CLOSED. No report, an unreadable report, or zero
+// recorded tests all fail the build, so a future Gradle that moves or drops the
+// evidence turns this guard red rather than silent. SkipGuardFiresTest drives this
+// exact file through Gradle TestKit to prove it fires.
 fun org.gradle.api.tasks.testing.Test.failOnSkippedTests(reason: String) {
-    afterSuite(KotlinClosure2<TestDescriptor, TestResult, Unit>({ desc, result ->
-        if (desc.parent == null && result.skippedTestCount > 0) {
+    val xmlRequired = reports.junitXml.required
+    val xmlDir = reports.junitXml.outputLocation
+    doLast("brewshotNoSkipGuard") {
+        if (!xmlRequired.get()) {
             throw GradleException(
-                "$reason but ${result.skippedTestCount} test(s) were " +
-                "SKIPPED — a required run must execute or fail every test, never skip " +
-                "(green-that-tested-nothing guard)."
+                "$reason but the JUnit XML report is disabled, so the no-skip guard has no " +
+                "evidence to read. Failing closed (green-that-tested-nothing guard)."
             )
         }
-    }))
+        verifyNoSkippedTests(xmlDir.get().asFile, reason)
+    }
+}
+
+fun verifyNoSkippedTests(resultsDir: File, reason: String) {
+    fun noEvidence(why: String): Nothing = throw GradleException(
+        "$reason but the no-skip guard found no usable test evidence: $why. " +
+        "Failing closed rather than reporting an unverified run green " +
+        "(green-that-tested-nothing guard)."
+    )
+    if (!resultsDir.isDirectory) noEvidence("results directory $resultsDir does not exist")
+    val reports = resultsDir.listFiles { f -> f.isFile && f.name.startsWith("TEST-") && f.name.endsWith(".xml") }
+        ?.sortedBy { it.name }
+        .orEmpty()
+    if (reports.isEmpty()) noEvidence("no TEST-*.xml report in $resultsDir")
+
+    val factory = javax.xml.parsers.DocumentBuilderFactory.newInstance().apply {
+        setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)
+        isXIncludeAware = false
+        isExpandEntityReferences = false
+    }
+    var tests = 0
+    var skipped = 0
+    for (report in reports) {
+        val root = try {
+            factory.newDocumentBuilder().parse(report).documentElement
+        } catch (e: Exception) {
+            noEvidence("${report.name} is not parseable XML (${e.message})")
+        }
+        if (root.tagName != "testsuite") noEvidence("${report.name} has root <${root.tagName}>, not <testsuite>")
+        fun count(name: String): Int = root.getAttribute(name).toIntOrNull()
+            ?: noEvidence("${report.name} has no integer '$name' attribute")
+        // Either signal of a skip counts: the suite attribute or a <skipped/> child.
+        val skippedChildren = (0 until root.childNodes.length)
+            .map { root.childNodes.item(it) }
+            .filterIsInstance<org.w3c.dom.Element>()
+            .filter { it.tagName == "testcase" }
+            .count { case -> case.getElementsByTagName("skipped").length > 0 }
+        tests += count("tests")
+        skipped += maxOf(count("skipped"), skippedChildren)
+    }
+    if (tests == 0) noEvidence("${reports.size} report(s) in $resultsDir record zero tests")
+    if (skipped > 0) {
+        throw GradleException(
+            "$reason but $skipped test(s) were SKIPPED: a required run must execute or fail " +
+            "every test, never skip (green-that-tested-nothing guard)."
+        )
+    }
 }
 
 // Browser tests have historically lived beside pure-JDK/ImageIO tests, and a
