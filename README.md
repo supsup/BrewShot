@@ -630,16 +630,21 @@ under strict conditions:
   `watch` entrypoint sets it; `-e BREWSHOT_RELEASE_PROOF=off` opts out);
 - `/proc/self/cgroup` is exactly the single line `0::/` (cgroup v2 with a
   private cgroup namespace, the Docker default on cgroup v2 hosts);
-- `/sys/fs/cgroup/cgroup.procs` is readable and lists this JVM's own pid.
+- `/sys/fs/cgroup/cgroup.procs` is readable and lists this JVM's own pid;
+- `/sys/fs/cgroup/cgroup.stat` reports `nr_descendants 0`: no child cgroup
+  exists. `cgroup.procs` lists only the root cgroup's own members, so where the
+  hierarchy is writable (`--privileged`, a read-write cgroup mount) a process
+  could move into a child cgroup and vanish from the set while still alive.
+  This is checked at the start and again on every read at teardown.
 
 The membership set is read before Chrome starts. That baseline is computed,
 not assumed: it is `{1}` when the JVM is pid 1 and `{1, <jvm pid>}` under
 `--init`. At teardown BrewShot re-reads the file in-process about every 50 ms
-until it equals the baseline, for at most 5 seconds (less if the teardown
+until it equals the baseline with no child cgroup, for at most 5 seconds (less if the teardown
 budget has less left). Equality proves release and the profile is deleted.
 Anything else is UNPROVEN and the profile is kept: a survivor, a process you
 `docker exec`ed into the container during the capture, or any other cgroup
-shape (cgroup v1, a non-root path, an unreadable file). stderr names the
+shape (cgroup v1, a non-root path, a child cgroup, an unreadable file). stderr names the
 outcome, the time it took and, on refusal, the extra pids.
 
 **Run the worker with `docker run --init`.** Without it the JVM is pid 1,

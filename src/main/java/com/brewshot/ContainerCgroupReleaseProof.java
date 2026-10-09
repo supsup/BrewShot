@@ -20,14 +20,21 @@ import java.util.function.LongSupplier;
  * <p>WHY THIS AND NOT AN ENUMERATION. No enumeration of the launched tree is a proof: on Linux
  * the two chrome_crashpad_handler processes reparent to pid 1, take their own process groups and
  * carry no profile path in argv, so descendants(), a pgid sweep and the argv sweep can all miss a
- * live member. A cgroup is different in kind: every task forked inside it stays inside it,
- * whatever it does to its parentage, session or argv.
+ * live member. A cgroup is different in kind: a task forked inside it stays inside it whatever it
+ * does to its parentage, session or argv, UNLESS it can write to the cgroup hierarchy. Where
+ * /sys/fs/cgroup is writable (docker run --privileged, a read-write cgroup mount, root), a task
+ * can create a CHILD cgroup and move into it, and cgroup.procs lists only the root cgroup's own
+ * members, not its descendants' (measured by Fixpoint, brewshot/668: a sleep moved into
+ * /sys/fs/cgroup/x stayed alive and left the root set, with cgroup.stat nr_descendants 1). So the
+ * proof also requires cgroup.stat to report nr_descendants 0, at detection and on EVERY poll:
+ * with no descendant cgroup there is nowhere inside the namespace for a task to hide.
  *
  * <p>THE PROOF. Inside a Docker container with cgroup v2 and a private cgroup namespace, the
  * container's whole cgroup is the namespace root, and {@code /sys/fs/cgroup/cgroup.procs} lists
  * every process in it, readable without privilege. This object reads that set BEFORE Chrome is
  * started (the baseline; it is computed, never assumed to be {1}) and, at release, polls the
- * same file until the set EQUALS the baseline or a bounded deadline passes. Equality means every
+ * same file until the set EQUALS the baseline, with no descendant cgroup, or a bounded deadline
+ * passes. Equality means every
  * process created since the baseline, Chrome and everything it spawned, has left the cgroup.
  * Deadline expiry is UNPROVEN, and the lease keeps the profile.
  *
@@ -55,7 +62,9 @@ import java.util.function.LongSupplier;
  * rather than hidden: a survivor that is assigned the pid of a baseline member that exited in the
  * meantime would make the sets compare equal. That needs the baseline member to exit (refused on
  * its own, since the set would then lack it) AND the pid allocator to wrap round to exactly that
- * number inside one capture.
+ * number inside one capture. Also named: on kernels before 5.3, cgroup.procs omits a process
+ * whose thread-group leader has exited while its other threads still run (fixed upstream in
+ * c03cd7738a83), so on such a kernel a process in that state is invisible to this proof.
  *
  * <p>The membership file is read in-process with a plain file read. It must never be read by
  * spawning a process: the reader's own child would be a member of the set it is measuring.
@@ -69,6 +78,8 @@ final class ContainerCgroupReleaseProof implements BrewShot.ProcessTreeReleasePr
     static final Path DEFAULT_SELF_CGROUP = Path.of("/proc/self/cgroup");
     static final Path DEFAULT_CGROUP_PROCS = Path.of("/sys/fs/cgroup/cgroup.procs");
     static final Path DEFAULT_PROC_ROOT = Path.of("/proc");
+    /** cgroup.stat sits beside cgroup.procs in the same cgroup directory. */
+    static Path statOf(Path cgroupProcs) { return cgroupProcs.resolveSibling("cgroup.stat"); }
     static final long DEFAULT_POLL_MILLIS = 50;
     static final long DEFAULT_DEADLINE_MILLIS = 5_000;
 
@@ -166,13 +177,33 @@ final class ContainerCgroupReleaseProof implements BrewShot.ProcessTreeReleasePr
         } catch (IOException | RuntimeException e) {
             return Detection.unusable("cannot read " + cgroupProcs + ": " + e);
         }
-        return detect(self, procs, selfPid);
+        Path statPath = statOf(cgroupProcs);
+        String stat;
+        try {
+            stat = reader.read(statPath);
+        } catch (IOException | RuntimeException e) {
+            return Detection.unusable("cannot read " + statPath + ": " + e);
+        }
+        return detect(self, procs, stat, selfPid);
+    }
+
+    /**
+     * Pure detection for tests that are not about cgroup.stat: as {@link #detect(String, String,
+     * String, long)} with a stat that reports no descendants. Production never uses this; the
+     * Path overload always reads the real cgroup.stat.
+     */
+    static Detection detect(String selfCgroupContent, String cgroupProcsContent, long selfPid) {
+        return detect(selfCgroupContent, cgroupProcsContent,
+            "nr_descendants 0\nnr_dying_descendants 0\n", selfPid);
     }
 
     /** Pure detection over file contents: the unit-testable half. */
-    static Detection detect(String selfCgroupContent, String cgroupProcsContent, long selfPid) {
+    static Detection detect(String selfCgroupContent, String cgroupProcsContent, String statContent,
+            long selfPid) {
         String shape = selfCgroupShapeRefusal(selfCgroupContent);
         if (shape != null) { return Detection.unusable(shape); }
+        String descendants = descendantsRefusal(statContent);
+        if (descendants != null) { return Detection.unusable(descendants); }
         Set<Long> members;
         try {
             members = parseProcs(cgroupProcsContent);
@@ -202,6 +233,42 @@ final class ContainerCgroupReleaseProof implements BrewShot.ProcessTreeReleasePr
         }
         return "/proc/self/cgroup names a non-root cgroup path " + quote(body.substring(3))
             + " (no private cgroup namespace; the membership file would not be this container's)";
+    }
+
+    /**
+     * The nr_descendants value of a cgroup.stat file: exactly one "nr_descendants N" line, N a
+     * non-negative decimal. Other keys (nr_dying_descendants, and whatever later kernels add) are
+     * ignored; a missing, repeated or malformed nr_descendants line is refused.
+     */
+    static long parseNrDescendants(String content) {
+        if (content == null) { throw new IllegalArgumentException("cgroup.stat is empty"); }
+        Long found = null;
+        for (String line : content.split("\n", -1)) {
+            if (!line.startsWith("nr_descendants ")) { continue; }
+            String value = line.substring("nr_descendants ".length());
+            if (value.isEmpty() || value.length() > 19 || !value.chars().allMatch(Character::isDigit)) {
+                throw new IllegalArgumentException("cgroup.stat line " + quote(line) + " is not a count");
+            }
+            if (found != null) {
+                throw new IllegalArgumentException("cgroup.stat has more than one nr_descendants line");
+            }
+            found = Long.parseLong(value);
+        }
+        if (found == null) { throw new IllegalArgumentException("cgroup.stat has no nr_descendants line"); }
+        return found;
+    }
+
+    /** Null when the stat content reports no descendant cgroup, else the reason to refuse. */
+    static String descendantsRefusal(String statContent) {
+        long d;
+        try {
+            d = parseNrDescendants(statContent);
+        } catch (IllegalArgumentException e) {
+            return e.getMessage();
+        }
+        return d == 0 ? null : "cgroup.stat reports nr_descendants " + d + ": a child cgroup exists, so"
+            + " cgroup.procs does not list every live process in this container (the hierarchy is"
+            + " writable, e.g. --privileged)";
     }
 
     /** One positive decimal pid per line; a final newline is allowed, nothing else is. */
@@ -246,12 +313,16 @@ final class ContainerCgroupReleaseProof implements BrewShot.ProcessTreeReleasePr
         int polls = 0;
         Set<Long> last = null;
         String lastReadFailure = null;
+        String lastDescendants = null;
         while (true) {
             polls++;
             try {
                 last = parseProcs(reader.read(cgroupProcs));
                 lastReadFailure = null;
-                if (last.equals(baseline)) {
+                // Read the stat AFTER the membership: a child cgroup created between the two reads
+                // is still seen here, and one created after both is the next poll's problem.
+                lastDescendants = descendantsRefusal(reader.read(statOf(cgroupProcs)));
+                if (lastDescendants == null && last.equals(baseline)) {
                     long ms = elapsedMillis(started);
                     lastOutcome = "PROVEN after " + ms + " ms";
                     log.accept(PREFIX + "membership returned to baseline " + baseline
@@ -280,6 +351,8 @@ final class ContainerCgroupReleaseProof implements BrewShot.ProcessTreeReleasePr
         String why;
         if (last == null) {
             why = "the last read of " + cgroupProcs + " failed: " + lastReadFailure;
+        } else if (lastDescendants != null) {
+            why = lastDescendants;
         } else {
             why = "extra pids " + describe(difference(last, baseline))
                 + ", missing baseline pids " + difference(baseline, last);

@@ -30,6 +30,8 @@ class ContainerCgroupReleaseProofTest {
     static final Path SELF = Path.of("/fake/proc/self/cgroup");
     static final Path PROCS = Path.of("/fake/sys/fs/cgroup/cgroup.procs");
     static final Path PROC = Path.of("/fake/proc");
+    static final Path STAT = ContainerCgroupReleaseProof.statOf(PROCS);
+    static final String NO_DESCENDANTS = "nr_descendants 0\nnr_dying_descendants 0\n";
 
     /**
      * Fake cgroup files. cgroup.procs answers from a queue of successive contents (the last one
@@ -38,6 +40,8 @@ class ContainerCgroupReleaseProofTest {
     static final class FakeCgroup {
         final Map<Path, String> files = new HashMap<>();
         final Deque<String> procsSequence = new ArrayDeque<>();
+        /** cgroup.stat answers like cgroup.procs: successive contents, the last one repeats. */
+        final Deque<String> statSequence = new ArrayDeque<>(List.of(NO_DESCENDANTS));
         final AtomicInteger procsReads = new AtomicInteger();
         final List<String> log = new ArrayList<>();
         long nowNanos = 1_000_000_000L;
@@ -48,6 +52,12 @@ class ContainerCgroupReleaseProofTest {
         FakeCgroup procs(String... contents) {
             procsSequence.clear();
             procsSequence.addAll(List.of(contents));
+            return this;
+        }
+
+        FakeCgroup stat(String... contents) {
+            statSequence.clear();
+            statSequence.addAll(List.of(contents));
             return this;
         }
 
@@ -62,6 +72,13 @@ class ContainerCgroupReleaseProofTest {
             if (path.equals(PROCS)) {
                 procsReads.incrementAndGet();
                 String next = procsSequence.size() > 1 ? procsSequence.poll() : procsSequence.peek();
+                if (next == null || next.equals("<unreadable>")) {
+                    throw new java.nio.file.AccessDeniedException(path.toString());
+                }
+                return next;
+            }
+            if (path.equals(STAT)) {
+                String next = statSequence.size() > 1 ? statSequence.poll() : statSequence.peek();
                 if (next == null || next.equals("<unreadable>")) {
                     throw new java.nio.file.AccessDeniedException(path.toString());
                 }
@@ -409,5 +426,62 @@ class ContainerCgroupReleaseProofTest {
         assertFalse(fake.lastLog().contains("--init"),
             "an argv survivor of the orphan sweep is not a zombie; --init would not help: " + fake.lastLog());
         assertTrue(fake.lastLog().endsWith("release UNPROVEN, profile retained"), fake.lastLog());
+    }
+
+    // ---- a descendant cgroup is a hiding place: nr_descendants must be 0 (Fixpoint, brewshot/668) ----
+
+    @Test
+    void detectionRefusesWhenAChildCgroupExists() {
+        ContainerCgroupReleaseProof.Detection d = ContainerCgroupReleaseProof.detect(
+            "0::/\n", "1\n", "nr_descendants 1\nnr_dying_descendants 0\n", 1);
+        assertFalse(d.isUsable());
+        assertTrue(d.reason().contains("nr_descendants 1"), d.reason());
+    }
+
+    @Test
+    void detectionRefusesAMissingRepeatedOrMalformedDescendantsLine() {
+        for (String stat : new String[] {"nr_dying_descendants 0\n", "", "nr_descendants\n",
+                "nr_descendants -1\n", "nr_descendants 1x\n", "nr_descendants 0\nnr_descendants 0\n",
+                "nr_descendants  0\n"}) {
+            ContainerCgroupReleaseProof.Detection d =
+                ContainerCgroupReleaseProof.detect("0::/\n", "1\n", stat, 1);
+            assertFalse(d.isUsable(), "must refuse cgroup.stat " + stat.replace("\n", "\\n"));
+        }
+        assertTrue(ContainerCgroupReleaseProof.detect("0::/\n", "1\n",
+            "nr_descendants 0\nnr_dying_descendants 3\nnr_subsys_cpu 1\n", 1).isUsable(),
+            "dying descendants and other keys do not refuse: only live child cgroups can hold a task");
+    }
+
+    @Test
+    void detectionRefusesAnUnreadableStatFile() {
+        FakeCgroup fake = new FakeCgroup().selfCgroup("0::/\n").procs("1\n").stat("<unreadable>");
+        ContainerCgroupReleaseProof proof = fake.proof(50, 5_000);
+        assertFalse(proof.detection().isUsable());
+        assertTrue(proof.detection().reason().contains("cgroup.stat"), proof.detection().reason());
+    }
+
+    @Test
+    void aSurvivorHiddenInAChildCgroupKeepsReleaseRefusedByDeadline() {
+        // Fixpoint's measured false-proven path: under a writable hierarchy a survivor moves into
+        // /sys/fs/cgroup/x and leaves the root set while alive. Membership returns EXACTLY to the
+        // baseline, so equality alone would prove; nr_descendants 1 must keep it refused.
+        FakeCgroup fake = new FakeCgroup().selfCgroup("0::/\n").procs("1\n");
+        ContainerCgroupReleaseProof proof = fake.proof(50, 5_000);
+        assertTrue(proof.detection().isUsable(), proof.detection().reason());
+        fake.stat("nr_descendants 1\nnr_dying_descendants 0\n");
+        long start = fake.nowNanos;
+        assertFalse(proof.releaseSafe());
+        assertEquals(5_000, fake.elapsedMillisSince(start), "refused by deadline, not at once");
+        assertTrue(fake.lastLog().contains("nr_descendants 1"), fake.lastLog());
+    }
+
+    @Test
+    void releaseIsProvenOnlyOnceTheChildCgroupIsGone() {
+        FakeCgroup fake = new FakeCgroup().selfCgroup("0::/\n").procs("1\n");
+        ContainerCgroupReleaseProof proof = fake.proof(50, 5_000);
+        fake.stat("nr_descendants 1\n", "nr_descendants 1\n", "nr_descendants 0\n");
+        long start = fake.nowNanos;
+        assertTrue(proof.releaseSafe());
+        assertEquals(100, fake.elapsedMillisSince(start), "two refused polls, proven on the third");
     }
 }
