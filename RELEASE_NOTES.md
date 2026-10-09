@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **The watch worker now deletes a capture's temporary Chrome profile when release is
+  proven by container cgroup containment.** Under `BREWSHOT_RELEASE_PROOF=container-cgroup`
+  (set by the image's `watch` entrypoint) each launch reads `/sys/fs/cgroup/cgroup.procs`
+  before Chrome starts, and at teardown polls it in-process until it equals that computed
+  baseline, for at most 5 s, with `cgroup.stat` reporting no child cgroup at every read (a
+  writable hierarchy could otherwise hide a live process in one). Equality deletes the profile; a survivor, a `docker exec`ed
+  process or a timeout keeps it and stderr names the extra pids. Detection is strict: only a
+  `/proc/self/cgroup` of exactly `0::/` with the JVM's pid in the membership file qualifies,
+  and there is no fallback to process enumeration. Run the worker with `docker run --init`:
+  with the JVM as pid 1 the unreaped Chrome zombies still read as alive and every profile is
+  kept (measured). Without the opt-in nothing changes: the plain CLI on any host, macOS, and
+  any run that does not set `BREWSHOT_RELEASE_PROOF=container-cgroup` stay UNPROVEN and keep
+  the profile. (The opt-in, not watch mode, is what enables the proof: a CLI run inside the
+  container that sets it is proven the same way.)
 - **The CI no-skip guard no longer rides a deprecated Gradle API, and a test proves it
   fires** (plan bbb87517). The `BREWSHOT_REQUIRE_CHROME` / `unitTest` guard was an
   `afterSuite(Closure)` listener, which Gradle 9 deprecates for removal in Gradle 10; once
