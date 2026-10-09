@@ -727,6 +727,12 @@ public final class BrewShot implements AutoCloseable {
      * The one production proof is {@link ContainerCgroupReleaseProof}, and only behind an explicit
      * opt-in ({@link #launchReleaseProof}); every other launch is UNPROVEN by decision.
      */
+    /** Why cleanup did not consult the release proof (passed to releaseNotConsulted). */
+    static final String RELEASE_GATE_TREE_NOT_REAPED =
+        "a JDK handle of the launched tree still reports a member alive";
+    static final String RELEASE_GATE_ORPHAN_SURVIVED =
+        "a process with this profile in its argv survived the orphan sweep";
+
     @FunctionalInterface
     interface ProcessTreeReleaseProof {
         boolean releaseSafe();
@@ -936,8 +942,7 @@ public final class BrewShot implements AutoCloseable {
                 processTreeReaped && orphansReaped && processTreeReleaseSafe(deadline);
             if (!processTreeReaped || !orphansReaped) {
                 processTreeReleaseNotConsulted(!processTreeReaped
-                    ? "a JDK handle of the launched tree still reports a member alive"
-                    : "a process with this profile in its argv survived the orphan sweep");
+                    ? RELEASE_GATE_TREE_NOT_REAPED : RELEASE_GATE_ORPHAN_SURVIVED);
             }
             if (releaseProven) {
                 try { profileDeleter.delete(profileDir); }

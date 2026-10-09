@@ -250,12 +250,17 @@ The default remains that one-shot CLI. `cli` is an optional explicit spelling;
 
 ```sh
 mkdir -p Input Output
-docker run -d --name brewshot-worker --restart unless-stopped \
+docker run -d --init --name brewshot-worker --restart unless-stopped \
   --user "$(id -u):$(id -g)" \
   --mount type=bind,src="$PWD/Input",dst=/brewshot/input \
   --mount type=bind,src="$PWD/Output",dst=/brewshot/output \
   brewshot watch
 ```
+
+`--init` makes a small init process pid 1, so Chrome's exited helpers are reaped and a
+capture whose processes have all left the container can delete its Chrome profile (see
+the README, "When the temporary Chrome profile is deleted"). Without it the worker
+still runs, but every profile is kept.
 
 Drop a complete, self-contained `.html` or `.htm` file directly in `Input`.
 Success publishes `Output/<source-name>.png` and archives the source under

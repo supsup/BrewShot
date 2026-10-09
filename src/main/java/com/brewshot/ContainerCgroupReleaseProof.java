@@ -295,9 +295,13 @@ final class ContainerCgroupReleaseProof implements BrewShot.ProcessTreeReleasePr
     @Override
     public void releaseNotConsulted(String why) {
         lastOutcome = "NOT CONSULTED: " + why;
+        // The --init hint belongs only to the reaped-tree gate: an unreaped zombie child of a
+        // pid-1 JVM reads as alive there. An orphan-sweep refusal has a different cause.
+        String hint = BrewShot.RELEASE_GATE_TREE_NOT_REAPED.equals(why)
+            ? " (a zombie child of a pid-1 JVM reads as alive there; run the container with --init)"
+            : "";
         log.accept(PREFIX + "not consulted, an earlier release gate refused: " + why
-            + " (a zombie child of a pid-1 JVM reads as alive there; run the container with"
-            + " --init); release UNPROVEN, profile retained");
+            + hint + "; release UNPROVEN, profile retained");
     }
 
     private long elapsedMillis(long started) {

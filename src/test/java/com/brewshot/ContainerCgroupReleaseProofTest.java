@@ -392,4 +392,22 @@ class ContainerCgroupReleaseProofTest {
         assertNull(ContainerCgroupReleaseProof.selfCgroupShapeRefusal("0::/\n"));
         assertNull(ContainerCgroupReleaseProof.selfCgroupShapeRefusal("0::/"));
     }
+
+    // ---- the not-consulted report names the right cause --------------------------------------
+
+    @Test
+    void notConsultedPointsAtInitOnlyForTheUnreapedTreeGate() {
+        FakeCgroup fake = new FakeCgroup().selfCgroup("0::/\n").procs("1\n");
+        ContainerCgroupReleaseProof proof = fake.proof(50, 5_000);
+
+        proof.releaseNotConsulted(BrewShot.RELEASE_GATE_TREE_NOT_REAPED);
+        assertTrue(fake.lastLog().contains(BrewShot.RELEASE_GATE_TREE_NOT_REAPED), fake.lastLog());
+        assertTrue(fake.lastLog().contains("--init"), "a zombie of a pid-1 JVM is the known cause: " + fake.lastLog());
+
+        proof.releaseNotConsulted(BrewShot.RELEASE_GATE_ORPHAN_SURVIVED);
+        assertTrue(fake.lastLog().contains(BrewShot.RELEASE_GATE_ORPHAN_SURVIVED), fake.lastLog());
+        assertFalse(fake.lastLog().contains("--init"),
+            "an argv survivor of the orphan sweep is not a zombie; --init would not help: " + fake.lastLog());
+        assertTrue(fake.lastLog().endsWith("release UNPROVEN, profile retained"), fake.lastLog());
+    }
 }
