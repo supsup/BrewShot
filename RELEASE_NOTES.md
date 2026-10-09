@@ -10,9 +10,10 @@
   writable hierarchy could otherwise hide a live process in one). Equality deletes the profile; a survivor, a `docker exec`ed
   process or a timeout keeps it and stderr names the extra pids. Detection is strict: only a
   `/proc/self/cgroup` of exactly `0::/` with the JVM's pid in the membership file qualifies,
-  and there is no fallback to process enumeration. Run the worker with `docker run --init`:
-  with the JVM as pid 1 the unreaped Chrome zombies still read as alive and every profile is
-  kept (measured). Without the opt-in nothing changes: the plain CLI on any host, macOS, and
+  and there is no fallback to process enumeration. The image runs `tini -s` as pid 1 so
+  Chrome's exited helpers are reaped; with the JVM as pid 1 the unreaped zombies would still
+  read as alive and every profile would be kept (measured), and the worker now prints one
+  WARNING at start in that case. Without the opt-in nothing changes: the plain CLI on any host, macOS, and
   any run that does not set `BREWSHOT_RELEASE_PROOF=container-cgroup` stay UNPROVEN and keep
   the profile. (The opt-in, not watch mode, is what enables the proof: a CLI run inside the
   container that sets it is proven the same way.)

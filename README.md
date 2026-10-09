@@ -577,7 +577,7 @@ Run a persistent local-HTML worker with writable input and output mounts:
 
 ```sh
 mkdir -p Input Output
-docker run -d --init --name brewshot-worker --restart unless-stopped \
+docker run -d --name brewshot-worker --restart unless-stopped \
   --user "$(id -u):$(id -g)" \
   --mount type=bind,src="$PWD/Input",dst=/brewshot/input \
   --mount type=bind,src="$PWD/Output",dst=/brewshot/output \
@@ -638,8 +638,8 @@ under strict conditions:
   This is checked at the start and again on every read at teardown.
 
 The membership set is read before Chrome starts. That baseline is computed,
-not assumed: it is `{1}` when the JVM is pid 1 and `{1, <jvm pid>}` under
-`--init`. At teardown BrewShot re-reads the file in-process about every 50 ms
+not assumed: with the image's own entrypoint it is `{1, <jvm pid>}` (tini is
+pid 1), and with `docker run --init` as well it also holds tini's pid. At teardown BrewShot re-reads the file in-process about every 50 ms
 until it equals the baseline with no child cgroup, for at most 5 seconds (less if the teardown
 budget has less left). Equality proves release and the profile is deleted.
 Anything else is UNPROVEN and the profile is kept: a survivor, a process you
@@ -647,12 +647,17 @@ Anything else is UNPROVEN and the profile is kept: a survivor, a process you
 shape (cgroup v1, a non-root path, a child cgroup, an unreadable file). stderr names the
 outcome, the time it took and, on refusal, the extra pids.
 
-**Run the worker with `docker run --init`.** Without it the JVM is pid 1,
-nothing reaps Chrome's exited helpers, and each capture leaves zombie
-processes behind (7 per capture, measured). Zombies are not cgroup members, but
-the JDK still reports them alive, so the release is refused before the cgroup
-is even read and every profile is kept. Under `--init` the init process reaps
-them and release was measured proven, with the profile deleted.
+**The image runs tini as pid 1, so `--init` is not needed.** Something has to
+reap Chrome's exited helpers: they reparent to pid 1, and if the JVM were pid 1
+each capture would leave zombies behind (7 per capture, measured). Zombies are
+not cgroup members, but the JDK still reports them alive, so the release would
+be refused before the cgroup is even read and every profile would be kept. The
+image's entrypoint is `tini -s`, which reaps them; `-s` keeps that true when you
+also pass `--init`, which is harmless. Measured with three jobs each: plain
+`docker run` and `docker run --init` both prove every release, with no
+leftover profile and no zombie. If you override the entrypoint so that the JVM
+itself is pid 1 (or run under an orchestrator with no init), the worker prints
+one WARNING at start, and every profile is kept.
 
 Outside such a container (the plain CLI on macOS, Windows or a Linux host, and
 the container CLI without the opt-in) release stays UNPROVEN by decision: the

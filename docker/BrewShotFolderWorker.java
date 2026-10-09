@@ -81,6 +81,11 @@ public final class BrewShotFolderWorker {
             System.err.println("brewshot-watch: no arguments accepted");
             System.exit(2);
         }
+        String pidOne = ContainerCgroupReleaseProof.pidOneWarning(
+            ProcessHandle.current().pid(), System.getenv());
+        if (pidOne != null) {
+            System.err.println(pidOne);
+        }
         try {
             Path input = envPath("BREWSHOT_INPUT_DIR", DEFAULT_INPUT);
             Path output = envPath("BREWSHOT_OUTPUT_DIR", DEFAULT_OUTPUT);
