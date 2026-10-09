@@ -28,9 +28,10 @@ dependencies {
     testImplementation(platform("org.junit:junit-bom:5.11.4"))
     testImplementation("org.junit.jupiter:junit-jupiter")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
-    // Test scope only, and shipped inside the Gradle distribution (no extra download):
-    // SkipGuardFiresTest runs this build script in a nested build to prove the
-    // no-skip guard fires. Nothing here reaches the runtime classpath.
+    // Test scope only. The TestKit API ships inside the Gradle distribution, but the
+    // nested build SkipGuardFiresTest runs (this build script, to prove the no-skip
+    // guard fires) resolves JUnit itself, so a clean build fetches it from Maven
+    // Central a second time (see README). Nothing here reaches the runtime classpath.
     testImplementation(gradleTestKit())
 }
 
