@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **A launch now removes OTHER leftover profiles whose Chrome has exited** (plan 3a45f8fe).
+  A profile whose release is unproven is still kept, by decision, so on macOS and outside the
+  opted-in container every capture used to leave one `brewshot-*` directory behind for good.
+  Each launch now looks at its sibling `brewshot-<digits>` directories and deletes one only
+  when it is a plain directory owned by the same uid, whose directory was last modified at least an hour ago, and whose
+  Chrome `SingletonLock` names this host and a pid that no longer exists, with no visible
+  process naming the path in its argv. Anything it cannot answer is kept, and if this
+  launch's own lock is unreadable nothing is removed. At most 32 per launch; the lock is
+  deleted last, so a partial delete is retried next time. This is cleanup, never a release
+  proof: it does not change what any launch reports about its own profile. stderr gets one
+  line when something was removed.
 - **The watch worker now deletes a capture's temporary Chrome profile when release is
   proven by container cgroup containment.** Under `BREWSHOT_RELEASE_PROOF=container-cgroup`
   (set by the image's `watch` entrypoint) each launch reads `/sys/fs/cgroup/cgroup.procs`

@@ -1486,6 +1486,11 @@ public final class BrewShot implements AutoCloseable {
             abandonedReport(cause, remaining.size(), killed, reachedButNotSignalled));
     }
 
+    /** Test seam: this session's generated Chrome profile directory. */
+    Path profileDirForTests() {
+        return profileDir;
+    }
+
     static void runShutdownCleanupForTests() {
         cleanupOwnedResources(false);
     }
@@ -1586,6 +1591,10 @@ public final class BrewShot implements AutoCloseable {
             lease.cleanup(false);
             throw e;
         }
+        // Our Chrome is up and has written its own SingletonLock, the host the
+        // reaper compares against. Cleanup of OTHER dead profiles only; never a
+        // release proof, and it cannot fail this launch.
+        StaleProfileReaper.reapBeside(profile);
         BrewShot shot = finishLaunch(lease, wsUrl, HTTP_CONNECTOR, envTimeoutMs());
         if (devicePixelRatio != null) {
             try {

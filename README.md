@@ -663,6 +663,23 @@ Outside such a container (the plain CLI on macOS, Windows or a Linux host, and
 the container CLI without the opt-in) release stays UNPROVEN by decision: the
 profile is kept rather than deleted on an unproven claim.
 
+**Leftover profiles are cleaned up later, and that is not a proof.** Each launch
+deletes OTHER `brewshot-<digits>` directories beside its own profile, but only
+when all of these hold: it is a plain directory (not a link) owned by the same
+uid; its directory was last modified (top-level entries only) at least an hour
+ago; its Chrome `SingletonLock`
+points at this host and a pid that no longer exists in BrewShot's own process
+namespace; and no process BrewShot can see names that path in its command line.
+Do not share one temp directory and hostname between a host and a container (or
+two containers) that both run BrewShot as the same uid: a live Chrome in the
+other process namespace looks exited from here, and its profile could be removed. Anything uncertain (no lock, a
+lock from another host, an unreadable owner, a live pid) is kept, and nothing
+is removed when the launch cannot read its own lock. This is CLEANUP of
+profiles that an earlier, unproven release left behind; it never decides
+whether a release is proven, and it never touches the launch's own profile.
+Windows, which has no unix uid, keeps everything. stderr gets one line when
+something was removed.
+
 > [!WARNING]
 > On Linux, map the process to the host UID/GID as above or make the bind
 > folders writable by the image's `10001:10001` user. Docker Desktop usually

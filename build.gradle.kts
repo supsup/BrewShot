@@ -60,6 +60,14 @@ fun org.gradle.api.tasks.testing.Test.configureBrewShotTests() {
     // Keep the test JVM explicit and deterministic on both desktop and CI hosts.
     systemProperty("java.awt.headless", "true")
 
+    // Every BrewShot.launch() creates its profile under java.io.tmpdir and then runs the
+    // stale-profile reaper beside it, so a test run on the host default would delete the
+    // developer's own leftover brewshot-<digits> profiles as a side effect. The test JVM
+    // gets a temp dir of its own under build/, created before the run.
+    val testTmp = project.layout.buildDirectory.dir("test-tmp").get().asFile
+    systemProperty("java.io.tmpdir", testTmp.absolutePath)
+    doFirst { testTmp.mkdirs() }
+
     // Browser tests loud-skip when no local Chrome exists; keep CI honest.
     // A red CI that doesn't show WHY is only half-honest — surface full
     // exceptions (expected-vs-actual) so a failure names its own cause.
