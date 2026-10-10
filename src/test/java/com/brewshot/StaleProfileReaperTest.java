@@ -316,7 +316,11 @@ class StaleProfileReaperTest {
         // End to end: launch() calls the reaper. The first launch tells us the host
         // string Chrome writes into its own lock; a planted sibling with that host,
         // an exited pid and an old mtime must be gone after the second launch.
-        assumeTrue(BrewShot.available(), "no Chrome on this host");
+        // TestChrome, not assumeTrue(BrewShot.available()): discoverChromeTests routes only tests
+        // that call this gate to chromeTest. Under a bare assume the test landed in unitTest,
+        // where it would launch Chrome on a host that has one (BrewShot.available() does not read
+        // BREWSHOT_FORBID_CHROME) or skip and fail the lane's no-skip rule on a host without.
+        TestChrome.requireChromeOrLoudSkip("StaleProfileReaperTest");
         String host;
         try (BrewShot first = BrewShot.launch()) {
             String target = Files.readSymbolicLink(
