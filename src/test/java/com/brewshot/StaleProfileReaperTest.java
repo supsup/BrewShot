@@ -268,6 +268,41 @@ class StaleProfileReaperTest {
         assertEquals(Set.of(live), outcome.kept().keySet());
     }
 
+    @Test
+    void aRealLaunchRemovesAStaleSiblingProfile() throws Exception {
+        // End to end: launch() calls the reaper. The first launch tells us the host
+        // string Chrome writes into its own lock; a planted sibling with that host,
+        // an exited pid and an old mtime must be gone after the second launch.
+        assumeTrue(BrewShot.available(), "no Chrome on this host");
+        String host;
+        try (BrewShot first = BrewShot.launch()) {
+            String target = Files.readSymbolicLink(
+                first.profileDirForTests().resolve(StaleProfileReaper.LOCK)).toString();
+            host = target.substring(0, target.lastIndexOf('-'));
+        }
+        Process exited = new ProcessBuilder("true").start();
+        assertEquals(0, exited.waitFor());
+        assumeTrue(ProcessHandle.of(exited.pid()).isEmpty(), "the pid was reused already");
+
+        Path stale = Files.createTempDirectory("brewshot-");
+        try {
+            Files.createDirectories(stale.resolve("Default"));
+            Files.createSymbolicLink(stale.resolve(StaleProfileReaper.LOCK),
+                Path.of(host + "-" + exited.pid()));
+            touch(stale, Instant.now().minus(Duration.ofHours(2)));
+
+            try (BrewShot second = BrewShot.launch()) {
+                assertTrue(Files.notExists(stale, LinkOption.NOFOLLOW_LINKS),
+                    "launch did not remove a stale sibling profile");
+                assertTrue(Files.isDirectory(second.profileDirForTests()));
+            }
+        } finally {
+            if (Files.exists(stale, LinkOption.NOFOLLOW_LINKS)) {
+                StaleProfileReaper.deleteLockLast(stale);
+            }
+        }
+    }
+
     // -- fixtures ------------------------------------------------------------
 
     private StaleProfileReaper.Outcome run(Path own, StaleProfileReaper.Liveness liveness,

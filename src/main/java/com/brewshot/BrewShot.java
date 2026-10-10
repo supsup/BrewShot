@@ -1486,6 +1486,11 @@ public final class BrewShot implements AutoCloseable {
             abandonedReport(cause, remaining.size(), killed, reachedButNotSignalled));
     }
 
+    /** Test seam: this session's generated Chrome profile directory. */
+    Path profileDirForTests() {
+        return profileDir;
+    }
+
     static void runShutdownCleanupForTests() {
         cleanupOwnedResources(false);
     }
