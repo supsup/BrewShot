@@ -269,6 +269,39 @@ class StaleProfileReaperTest {
     }
 
     @Test
+    void realArgvProbeKeepsAProfileThatALiveProcessNames() throws Exception {
+        // The real argv probe, not a fake: a live child process carries the profile path in
+        // its command line while the lock names an exited pid. Liveness alone would reap it;
+        // only the argv check keeps it.
+        Process exited = new ProcessBuilder("true").start();
+        assertEquals(0, exited.waitFor());
+        long deadPid = exited.pid();
+        assumeTrue(ProcessHandle.of(deadPid).isEmpty(), "the pid was reused already");
+        Path named = profile("brewshot-410", HOST + "-" + deadPid, old());
+        Process holder = new ProcessBuilder("/bin/sh", "-c", "sleep 30",
+            "holder", named.toAbsolutePath().toString()).start();
+        try {
+            assumeTrue(holder.info().commandLine().isPresent(),
+                "this host does not expose command lines");
+            StaleProfileReaper.Outcome outcome = StaleProfileReaper.reap(own(), NOW, AGE,
+                StaleProfileReaper::processProvablyDead, new StaleProfileReaper.LiveArgvProbe(),
+                StaleProfileReaper::unixUid);
+            assertKept(outcome, named, "a running process names this profile");
+        } finally {
+            holder.destroyForcibly().waitFor();
+        }
+    }
+
+    @Test
+    void testsRunInATempDirOfTheirOwn() {
+        // The reaper runs on every launch() beside the new profile, so the suite must not use
+        // the host's temp dir, where a developer's real leftover profiles live.
+        String tmp = System.getProperty("java.io.tmpdir");
+        assertTrue(tmp.replace('\\', '/').contains("/build/test-tmp"),
+            "tests must run with java.io.tmpdir under build/test-tmp, not " + tmp);
+    }
+
+    @Test
     void aRealLaunchRemovesAStaleSiblingProfile() throws Exception {
         // End to end: launch() calls the reaper. The first launch tells us the host
         // string Chrome writes into its own lock; a planted sibling with that host,

@@ -668,8 +668,11 @@ deletes OTHER `brewshot-<digits>` directories beside its own profile, but only
 when all of these hold: it is a plain directory (not a link) owned by the same
 uid; its directory was last modified (top-level entries only) at least an hour
 ago; its Chrome `SingletonLock`
-points at this host and a pid that no longer exists; and no process BrewShot
-can see names that path in its command line. Anything uncertain (no lock, a
+points at this host and a pid that no longer exists in BrewShot's own process
+namespace; and no process BrewShot can see names that path in its command line.
+Do not share one temp directory and hostname between a host and a container (or
+two containers) that both run BrewShot as the same uid: a live Chrome in the
+other process namespace looks exited from here, and its profile could be removed. Anything uncertain (no lock, a
 lock from another host, an unreadable owner, a live pid) is kept, and nothing
 is removed when the launch cannot read its own lock. This is CLEANUP of
 profiles that an earlier, unproven release left behind; it never decides
