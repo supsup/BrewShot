@@ -278,11 +278,21 @@ class StaleProfileReaperTest {
         long deadPid = exited.pid();
         assumeTrue(ProcessHandle.of(deadPid).isEmpty(), "the pid was reused already");
         Path named = profile("brewshot-410", HOST + "-" + deadPid, old());
-        Process holder = new ProcessBuilder("/bin/sh", "-c", "sleep 30",
+        // "sleep 30; true", not "sleep 30": a shell EXECs the last simple command of -c in
+        // place, which would replace its argv with "sleep 30" and drop the path within
+        // milliseconds (measured on macOS sh and busybox, Confluence brewshot/683). With a
+        // second command the shell must stay, and its argv keeps the path for the whole sleep.
+        Process holder = new ProcessBuilder("/bin/sh", "-c", "sleep 30; true",
             "holder", named.toAbsolutePath().toString()).start();
         try {
             assumeTrue(holder.info().commandLine().isPresent(),
                 "this host does not expose command lines");
+            // Precondition, read after a pause: the holder still names the path, so the
+            // probe below is tested against a live argv and cannot pass by timing.
+            Thread.sleep(500);
+            String line = holder.info().commandLine().orElse("");
+            assertTrue(line.contains(named.toAbsolutePath().toString()),
+                "the holder's argv no longer names the profile: " + line);
             StaleProfileReaper.Outcome outcome = StaleProfileReaper.reap(own(), NOW, AGE,
                 StaleProfileReaper::processProvablyDead, new StaleProfileReaper.LiveArgvProbe(),
                 StaleProfileReaper::unixUid);
