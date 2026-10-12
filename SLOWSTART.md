@@ -175,6 +175,28 @@ page: it produces an inconclusive receipt and exit 5. `console.error` remains a
 separate stronger opt-in (`--fail-console-errors`) because third-party console
 noise and uncaught page exceptions are not the same policy signal.
 
+**Sam's pipeline does not have to run `ps` after every shot.** A capture that
+leaves no Chrome running prints nothing about cleanup. If one is still alive
+after close, the run says so three ways: a stderr line naming the pid(s) and the
+`ps -p` command, exit 6 in place of 0 (the image was written and is good), and a
+`cleanup` object in the `--json` receipt whose `state` is `process-unconfirmed`
+and whose `livePids` lists them. A pipeline that wants to keep the artifact and
+flag the runner can branch on exactly that:
+
+```bash
+brewshot current/page.html -o current/page.png --json current/page.json
+case $? in
+  0) ;;                                   # clean
+  6) echo "runner left a Chrome behind; see cleanup.livePids in page.json" >&2 ;;
+  *) exit 1 ;;
+esac
+```
+
+The usual `state` on a developer machine or a plain CI runner is `profile-kept`:
+Chrome is gone and its temporary profile directory was retained, with the reason
+in the same object. That is quiet and exits 0, and it is deliberately not called
+`released`.
+
 ---
 
 ## 4. An agent — "I need eyes"

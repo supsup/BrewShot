@@ -24,6 +24,11 @@ might still be writing to, and JVM exit leaves an unproven profile on disk. See 
 entry in [RELEASE_NOTES.md](RELEASE_NOTES.md), which corrects the older "no leaked temp
 dirs" claim.
 
+After `close()`, `shot.cleanupOutcome()` says what was left as a value: `RELEASED`,
+`PROFILE_KEPT` (the usual case: Chrome gone, profile retained, with the reason),
+`PROFILE_NOT_REMOVED`, or `PROCESS_UNCONFIRMED` with `livePids()` to check. A run that
+leaves no process alive prints nothing about cleanup.
+
 ## Feed it a page — two ways
 
 ```java
@@ -148,6 +153,10 @@ brewshot page.html -o shot.png --json shot.json --fail-console-errors
 # uncaught page errors and console.error are separate signals. Exit 4 means an
 # observed gate failed; exit 5 means the requested bounded evidence was incomplete.
 # Pixels and the private 0600 JSON explanation are written before either exit.
+
+# cleanup is quiet when nothing is left running. If a Chrome of the capture is still
+# alive after close: stderr names the pid(s) with a ps -p command, a run that otherwise
+# succeeded exits 6 (the output is written and good), and --json has it under "cleanup".
 
 # film it instead of freezing it: N frames as a looping GIF (jar path)
 brewshot ./fx.html --gif 40 -o fx.gif                        # full page

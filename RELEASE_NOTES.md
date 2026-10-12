@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- **Cleanup reporting is quiet on a clean run and typed when it is not** (plan f5f02722).
+  Almost every successful capture used to end with "N lease(s) not confirmed reaped ... may
+  still be running" on stderr, although no Chrome was left: a launch whose release is
+  unproven keeps its profile by decision, so its lease is still registered at JVM exit, and
+  the shutdown report counted every registered lease as an unreaped process (and, because the
+  SIGKILL flag set at close is sticky, described it as killed and still alive). Each lease is
+  now classified by what is observed alive when the report is made. A capture that leaves no
+  process alive prints nothing about cleanup. One that does gets a stderr line naming the
+  pid(s) with a `ps -p` command, **exit 6** in place of 0 (the output is written; a run that
+  already failed keeps its own code), and a `cleanup` object in `--json` (`state`,
+  `livePids`, `liveWithoutPid`, `exitedUnreapedPids`, `profile`, `profileRemoved`, `reason`).
+  The four states are `released`, `profile-kept`, `profile-not-removed` and
+  `process-unconfirmed`; a kept profile is quiet and is never reported as `released`, and a
+  profile that should have been removed and was not gets its own line. Library callers read
+  the same value from `BrewShot.cleanupOutcome()` after `close()`. Changed for existing
+  callers: every `--json` capture manifest now has a `cleanup` key; the shutdown line's
+  wording changed and it now appears only when a process is alive (it reads "sent SIGKILL
+  and were still alive afterwards", "reached without a SIGKILL being sent to their launched
+  tree", and ends with the pids); exited-but-unreaped (zombie) processes are listed
+  separately and are not counted as alive (Linux, from `/proc`); the watch worker accepts
+  exit 6 as a rendered job. Not changed: which signals are sent, the waits, the release
+  gates and when a profile is deleted. `brewshot verify` does not set exit 6.
 - **A launch now removes OTHER leftover profiles whose Chrome has exited** (plan 3a45f8fe).
   A profile whose release is unproven is still kept, by decision, so on macOS and outside the
   opted-in container every capture used to leave one `brewshot-*` directory behind for good.
