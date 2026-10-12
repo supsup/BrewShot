@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- **A local `.svg` input now sizes its own viewport; `--size auto` asks for that by
+  name** (plan 982dcab9). Shooting an SVG used to mean parsing its `width`/`height` by
+  hand for `--size`, or getting a small drawing in the corner of the 1280x900 default.
+  With no `--size`, the CLI now reads the root `<svg>` start tag before Chrome starts
+  and uses its absolute `width` and `height`, else its `viewBox` size, else one stated
+  dimension plus the viewBox aspect ratio; fractions round up. A 1000x780 SVG renders
+  to a 1000x780 PNG (times `--dpr`). stderr names the choice and `--json` records it as
+  `viewportSource`. When the file states no usable size (no attributes, a font- or
+  viewport-relative unit, a percentage other than 100%, a size over the viewport
+  ceiling, CSS-only sizing is not read) the default 1280x900 is used and stderr says so
+  and why; `--size auto` refuses instead (usage error, exit 2, before Chrome and before
+  any artifact), and is refused for a URL, stdin or a non-`.svg` file. **Behaviour
+  change:** an `.svg` file shot without `--size` no longer gets a 1280x900 canvas when
+  it states a size; pass `--size 1280x900` to keep the old output. An explicit
+  `--size WxH`, every page input, the library API and `brewshot verify` manifests are
+  unchanged. The reader is a bounded hand-written scanner over the first 1 MiB (no XML
+  parser, no entity expansion, no DTD fetch), so the runtime stays zero-dependency and
+  the PNG path native-clean.
 - **A launch now removes OTHER leftover profiles whose Chrome has exited** (plan 3a45f8fe).
   A profile whose release is unproven is still kept, by decision, so on macOS and outside the
   opted-in container every capture used to leave one `brewshot-*` directory behind for good.

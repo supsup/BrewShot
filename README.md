@@ -24,6 +24,7 @@ Or from the shell:
 brewshot https://example.com -o page.png
 brewshot https://example.com -o page.jpg --jpeg-quality 82
 cat report.html | brewshot - -o report.png
+brewshot ./diagram.svg -o diagram.png        # viewport = the SVG's own size
 brewshot ./fx.html --gif 40 --gif-element ".lx-math" -o fx.gif   # film an element (jar path)
 ```
 
@@ -52,6 +53,56 @@ of flattening it through `String.valueOf`.
 Direct stdin HTML is capped at 16 MiB and `--eval-file` at 1 MiB (byte caps,
 UTF-8); inputs at the exact cap are accepted and cap+1 is refused before
 decoding.
+
+### SVG files size their own viewport
+
+`--size WxH` sets the viewport (default `1280x900`). A local `.svg` input with no
+`--size` is the exception: BrewShot reads the root `<svg>` start tag before Chrome
+starts and sizes the viewport to the drawing, so a 1000x780 diagram comes out as a
+1000x780 PNG (times `--dpr`) instead of a small figure in the corner of a 1280x900
+canvas. No hand-parsed sizes, no `--clip-selector svg`.
+
+```bash
+brewshot diagram.svg -o diagram.png                 # the SVG's own size
+brewshot diagram.svg -o diagram.png --size auto     # the same, asked for by name
+brewshot diagram.svg -o wide.png --size 1600x900    # an explicit size always wins
+```
+
+| the root `<svg>` has | viewport | `viewportSource` in `--json` |
+| --- | --- | --- |
+| absolute `width` and `height` | that size | `svg-width-height` |
+| no `width`/`height` (or `auto`, `100%`), a `viewBox` | the viewBox width x height | `svg-viewbox` |
+| one of `width`/`height`, and a `viewBox` | the other from the viewBox aspect ratio | `svg-width-viewbox-aspect` / `svg-height-viewbox-aspect` |
+| none of that, or a length only a browser can resolve | see below | `default-fallback` |
+
+Absolute means unitless, `px`, `in`, `cm`, `mm`, `Q`, `pt` or `pc` (96 CSS px per
+inch); fractions round up to whole pixels so nothing is clipped. `em`, `ex`, `rem`,
+viewport units and percentages other than `100%` are not guessed, and neither is a
+size over the 16384-per-side / 67,108,864-pixel viewport ceiling.
+
+When the size cannot be determined there are two outcomes, and neither is silent:
+
+- **no `--size`**: the default `1280x900` viewport is used and stderr says so and why,
+  e.g. `brewshot: SVG size not determined for logo.svg: the root <svg> has no absolute
+  width or height and it has no viewBox; using the default 1280x900 viewport (pass
+  --size WxH to choose)`;
+- **`--size auto`**: a usage refusal, exit 2, before Chrome starts and before any
+  artifact. `--size auto` is also refused for a URL, stdin, or a file that is not
+  `.svg`: there is nothing local to read a size from.
+
+Every auto-sized run prints the choice on stderr (`brewshot: viewport 1000x780 from the
+root width and height of diagram.svg`) and records it as `viewportSource` in the
+`--json` manifest. Runs with an explicit `--size WxH`, and page inputs, print and record
+nothing new.
+
+Limits, stated: only a local file whose name ends `.svg` (case-insensitive) is read;
+an `http(s)://` or `file://` URL to an SVG is not, and neither is `.svgz`. Only the
+root start tag in the first 1 MiB is inspected, as UTF-8 or BOM-marked UTF-16, with no
+entity expansion and no DTD fetch. A size set purely by CSS (a `style` attribute or a
+stylesheet rule on the root) is not seen: Chrome honours it, so pass `--size WxH` for
+such a file. The library API is unchanged; `BrewShot.launch(width, height)` still takes
+the size you give it, and `brewshot verify` manifests still take explicit
+`width`/`height`.
 
 ### Let the CLI hear the page
 
