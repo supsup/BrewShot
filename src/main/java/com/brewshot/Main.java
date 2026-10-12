@@ -16,6 +16,7 @@ import java.util.Locale;
  *   brewshot ./report.html -o report.png            # local file
  *   cat page.html | brewshot - -o page.png          # direct HTML on stdin
  *   brewshot URL -o page.png --size 1440x1000 --settle 1500 --eval "document.title"
+ *   brewshot ./diagram.svg -o diagram.png           # viewport = the SVG's own size
  *   brewshot ./fx.html --gif 40 --gif-element ".lx-math" -o fx.gif   # film an element
  * </pre>
  *
@@ -31,6 +32,8 @@ public final class Main {
     private static final int CLI_JPEG_QUALITY = 90;
     static final int MAX_STDIN_HTML_BYTES = 16 * 1024 * 1024;
     static final int MAX_EVAL_FILE_BYTES = 1024 * 1024;
+    static final int DEFAULT_VIEWPORT_WIDTH = 1280;
+    static final int DEFAULT_VIEWPORT_HEIGHT = 900;
 
     private Main() { }
 
@@ -69,8 +72,10 @@ public final class Main {
         }
         String input = null;
         Path out = Path.of("brewshot.png");
-        int width = 1280;
-        int height = 900;
+        int width = DEFAULT_VIEWPORT_WIDTH;
+        int height = DEFAULT_VIEWPORT_HEIGHT;
+        boolean sizeSet = false;    // an explicit --size WxH: never second-guessed
+        boolean sizeAuto = false;   // an explicit --size auto: must resolve or refuse
         long settleMs = 800;
         String evalExpr = null;
         int jpegQuality = CLI_JPEG_QUALITY;
@@ -112,10 +117,23 @@ public final class Main {
             switch (args[i]) {
                 case "-o", "--out" -> { out = Path.of(requireValue(args, ++i)); outSet = true; }
                 case "--size" -> {
-                    String[] wh = requireValue(args, ++i).split("x");
-                    if (wh.length != 2) { return err("--size wants WxH, e.g. 1440x1000"); }
-                    width = posInt("--size width", wh[0]);
-                    height = posInt("--size height", wh[1]);
+                    String size = requireValue(args, ++i);
+                    if (size.equals("auto")) {
+                        // Last --size wins, as for every other repeated flag.
+                        sizeAuto = true;
+                        sizeSet = false;
+                        width = DEFAULT_VIEWPORT_WIDTH;
+                        height = DEFAULT_VIEWPORT_HEIGHT;
+                    } else {
+                        String[] wh = size.split("x");
+                        if (wh.length != 2) {
+                            return err("--size wants WxH, e.g. 1440x1000, or auto (a local .svg)");
+                        }
+                        width = posInt("--size width", wh[0]);
+                        height = posInt("--size height", wh[1]);
+                        sizeSet = true;
+                        sizeAuto = false;
+                    }
                 }
                 case "--settle" -> settleMs = posLong("--settle", requireValue(args, ++i));
                 case "--eval" -> evalExpr = requireValue(args, ++i);
@@ -279,6 +297,25 @@ public final class Main {
         else if (Files.exists(Path.of(input))) { mode = "file"; }
         else { return err("not a URL, an existing file, or '-': " + input); }
 
+        // --size auto (plan 982dcab9): a local .svg sizes the viewport to its own drawing,
+        // read from the file BEFORE stdin, Chrome discovery or any artifact. An explicit
+        // --size WxH is passed through untouched.
+        String viewportSource = null;
+        if (!sizeSet) {
+            Viewport viewport;
+            try {
+                viewport = resolveAutoViewport(sizeAuto, mode, input);
+            } catch (IllegalArgumentException refusal) {
+                return err(refusal.getMessage());
+            }
+            if (viewport != null) {
+                width = viewport.width();
+                height = viewport.height();
+                viewportSource = viewport.source();
+                System.err.println("brewshot: " + viewport.notice());
+            }
+        }
+
         String stdinHtml = null;
         if (mode.equals("stdin")) {
             try {
@@ -428,7 +465,8 @@ public final class Main {
                     timezone, shot.appliedTimezone(),
                     devicePixelRatio, shot.appliedDevicePixelRatio(),
                     visionDeficiency == null ? null : visionDeficiency.cdpValue(),
-                    visionDeficiency == null ? null : Boolean.TRUE);
+                    visionDeficiency == null ? null : Boolean.TRUE,
+                    viewportSource);
             }
             System.err.println("brewshot: wrote " + out);
         }
@@ -899,10 +937,33 @@ public final class Main {
             String timezoneApplied, Integer dprRequested, Integer dprApplied,
             String visionDeficiencyRequested, Boolean visionCommandAccepted)
             throws java.io.IOException {
+        writeManifest(manifest, input, mode, width, height, settleMs, waitJs, out,
+            evalResult, failJs, failJsPassed, elapsedMs, requestedGifDelayMs, jpegQuality,
+            diagnostics, timezoneRequested, timezoneApplied, dprRequested, dprApplied,
+            visionDeficiencyRequested, visionCommandAccepted, null);
+    }
+
+    /**
+     * Viewport-source-aware overload. {@code viewportSource} is non-null only when the
+     * viewport was chosen for a local .svg without an explicit {@code --size WxH}; null
+     * preserves the legacy byte shape.
+     */
+    static void writeManifest(Path manifest, String input, String mode,
+            int width, int height, long settleMs, String waitJs, Path out,
+            Object evalResult, String failJs, boolean failJsPassed, long elapsedMs,
+            Integer requestedGifDelayMs, Integer jpegQuality,
+            PageDiagnosticsReceipt diagnostics, String timezoneRequested,
+            String timezoneApplied, Integer dprRequested, Integer dprApplied,
+            String visionDeficiencyRequested, Boolean visionCommandAccepted,
+            String viewportSource)
+            throws java.io.IOException {
         java.util.Map<String, Object> fields = new java.util.LinkedHashMap<>();
         fields.put("input", input);
         fields.put("mode", mode);
         fields.put("viewport", width + "x" + height);
+        if (viewportSource != null) {
+            fields.put("viewportSource", viewportSource);
+        }
         fields.put("settleMs", settleMs);
         fields.put("waitJs", waitJs);
         fields.put("out", out.toString());
@@ -1228,6 +1289,67 @@ public final class Main {
         return args[i];
     }
 
+    /** A viewport chosen for a local .svg, with the stderr line that says where it came from. */
+    record Viewport(int width, int height, String source, String notice) { }
+
+    /** Receipt spelling for "the SVG's size was not determined, the default was used". */
+    static final String VIEWPORT_SOURCE_DEFAULT_FALLBACK = "default-fallback";
+
+    /** Whether an input path names an SVG file: a {@code .svg} extension, case-insensitive. */
+    static boolean isSvgInput(String input) {
+        return input.toLowerCase(Locale.ROOT).endsWith(".svg");
+    }
+
+    /**
+     * The viewport for a run WITHOUT an explicit {@code --size WxH} (plan 982dcab9).
+     * Package-private and Chrome-free so the whole decision is unit-testable.
+     *
+     * <ul>
+     *   <li>Input is not a local {@code .svg} file: {@code null} (keep the default), unless
+     *       {@code --size auto} was asked for, which is refused by name: there is no file to
+     *       read a size from.</li>
+     *   <li>The SVG states a size: that size and the rule that produced it.</li>
+     *   <li>It does not: under {@code --size auto} a named refusal (the caller asked for a
+     *       size that cannot be delivered); with no {@code --size} at all the default
+     *       viewport, with a notice that says so and why. Never a silent default.</li>
+     * </ul>
+     *
+     * @throws IllegalArgumentException a usage refusal (exit 2) under {@code --size auto}
+     */
+    static Viewport resolveAutoViewport(boolean sizeAuto, String mode, String input) {
+        boolean svgFile = mode.equals("file") && isSvgInput(input);
+        if (!svgFile) {
+            if (sizeAuto) {
+                throw new IllegalArgumentException("--size auto reads the size from a local "
+                    + ".svg file, and the input is "
+                    + (mode.equals("stdin") ? "stdin" : mode.equals("url") ? "a URL: " + input
+                        : "not an .svg file: " + input)
+                    + " - pass --size WxH instead");
+            }
+            return null;
+        }
+        String reason;
+        try {
+            SvgIntrinsicSize.Size size = SvgIntrinsicSize.read(Path.of(input));
+            return new Viewport(size.width(), size.height(), size.source().label(),
+                "viewport " + size.width() + "x" + size.height() + " from "
+                    + size.source().description() + " of " + input);
+        } catch (SvgIntrinsicSize.Undetermined undetermined) {
+            reason = undetermined.getMessage();
+        } catch (java.io.IOException | RuntimeException unreadable) {
+            reason = "the file could not be read (" + unreadable + ")";
+        }
+        if (sizeAuto) {
+            throw new IllegalArgumentException("--size auto cannot determine the size of "
+                + input + ": " + reason + " - pass --size WxH instead");
+        }
+        return new Viewport(DEFAULT_VIEWPORT_WIDTH, DEFAULT_VIEWPORT_HEIGHT,
+            VIEWPORT_SOURCE_DEFAULT_FALLBACK,
+            "SVG size not determined for " + input + ": " + reason + "; using the default "
+                + DEFAULT_VIEWPORT_WIDTH + "x" + DEFAULT_VIEWPORT_HEIGHT
+                + " viewport (pass --size WxH to choose)");
+    }
+
     private static int err(String msg) {
         System.err.println("brewshot: " + msg);
         return 2;
@@ -1273,7 +1395,7 @@ public final class Main {
         System.err.println("""
             brewshot — Java brews screenshots (headless Chrome over CDP, zero deps)
 
-            usage: brewshot <url | file.html | -> [-o out.png] [--size WxH]
+            usage: brewshot <url | file.html | file.svg | -> [-o out.png] [--size WxH|auto]
                             [--settle ms] [--eval js] [--version]
 
               <url>        open an address (http/https/file)
@@ -1281,7 +1403,12 @@ public final class Main {
               -            read direct HTML source from stdin
               -o           output .png, .jpg/.jpeg, .pdf, or (with --gif) .gif
                            path; JPEG quality defaults to 90 (default brewshot.png)
-              --size       viewport, e.g. 1440x1000   (default 1280x900)
+              --size       viewport, e.g. 1440x1000   (default 1280x900), or auto.
+                           A local .svg with no --size gets its own size instead:
+                           the root width/height, else the viewBox; when neither
+                           gives a size the default is used and stderr says why.
+                           --size auto asks for that by name and refuses (exit 2)
+                           instead of falling back; it needs a local .svg input
               --settle     ms to wait before shooting (default 800)
               --eval       print a JS expression's value before shooting
               --eval-file  like --eval, JS read from a UTF-8 file (max 1 MiB;

@@ -427,4 +427,165 @@ class MainCliTest {
             System.setIn(original);
         }
     }
+
+    // ---- --size auto (plan 982dcab9): every case here exits before Chrome ----------
+
+    private static final String SVG_NS = "xmlns=\"http://www.w3.org/2000/svg\"";
+
+    /** Run the CLI capturing stderr; returns {exit code, stderr}. */
+    private static Object[] runCapturingStderr(String... args) throws Exception {
+        ByteArrayOutputStream errors = new ByteArrayOutputStream();
+        PrintStream original = System.err;
+        int code;
+        try {
+            System.setErr(new PrintStream(errors));
+            code = Main.run(args);
+        } finally {
+            System.setErr(original);
+        }
+        return new Object[] {code, errors.toString()};
+    }
+
+    @Test
+    void helpDocumentsSizeAuto() throws Exception {
+        Object[] result = runCapturingStderr("--help");
+        String help = (String) result[1];
+        assertEquals(0, result[0]);
+        assertTrue(help.contains("[--size WxH|auto]") && help.contains("--size auto")
+            && help.contains("viewBox") && help.contains("refuses (exit 2)"), help);
+    }
+
+    @Test
+    void svgInputExtensionMatchesCaseInsensitively() {
+        assertTrue(Main.isSvgInput("diagram.svg"));
+        assertTrue(Main.isSvgInput("/tmp/Diagram.SVG"));
+        org.junit.jupiter.api.Assertions.assertFalse(Main.isSvgInput("diagram.svgz"));
+        org.junit.jupiter.api.Assertions.assertFalse(Main.isSvgInput("svg"));
+        org.junit.jupiter.api.Assertions.assertFalse(Main.isSvgInput("page.html"));
+    }
+
+    @Test
+    void autoViewportComesFromTheSvgAndNamesItsSource(@TempDir Path directory)
+            throws Exception {
+        Path sized = directory.resolve("sized.svg");
+        Files.writeString(sized, "<svg " + SVG_NS + " width=\"1000\" height=\"780\"/>");
+        Path boxed = directory.resolve("BOXED.SVG");
+        Files.writeString(boxed, "<svg " + SVG_NS + " viewBox=\"0 0 640 360\"/>");
+
+        // Absent --size and an explicit --size auto resolve a sized SVG identically.
+        for (boolean explicitAuto : new boolean[] {false, true}) {
+            Main.Viewport fromAttributes =
+                Main.resolveAutoViewport(explicitAuto, "file", sized.toString());
+            assertEquals(1000, fromAttributes.width());
+            assertEquals(780, fromAttributes.height());
+            assertEquals("svg-width-height", fromAttributes.source());
+            assertTrue(fromAttributes.notice().contains("viewport 1000x780")
+                && fromAttributes.notice().contains(sized.toString()), fromAttributes.notice());
+
+            Main.Viewport fromViewBox =
+                Main.resolveAutoViewport(explicitAuto, "file", boxed.toString());
+            assertEquals(640, fromViewBox.width());
+            assertEquals(360, fromViewBox.height());
+            assertEquals("svg-viewbox", fromViewBox.source());
+        }
+    }
+
+    @Test
+    void nonSvgInputsKeepTheDefaultViewportUntouched(@TempDir Path directory)
+            throws Exception {
+        Path page = directory.resolve("page.html");
+        // SVG-shaped CONTENT under a non-.svg name is still a page: the extension decides.
+        Files.writeString(page, "<svg " + SVG_NS + " width=\"10\" height=\"10\"/>");
+        org.junit.jupiter.api.Assertions.assertNull(
+            Main.resolveAutoViewport(false, "file", page.toString()));
+        org.junit.jupiter.api.Assertions.assertNull(
+            Main.resolveAutoViewport(false, "url", "https://example.com/logo.svg"));
+        org.junit.jupiter.api.Assertions.assertNull(
+            Main.resolveAutoViewport(false, "stdin", "-"));
+    }
+
+    @Test
+    void undeterminedSvgFallsBackLoudlyWithoutSizeButRefusesUnderSizeAuto(
+            @TempDir Path directory) throws Exception {
+        Path bare = directory.resolve("bare.svg");
+        Files.writeString(bare, "<svg " + SVG_NS + "><rect width=\"5\" height=\"5\"/></svg>");
+        Path relative = directory.resolve("relative.svg");
+        Files.writeString(relative,
+            "<svg " + SVG_NS + " width=\"50em\" height=\"30em\" viewBox=\"0 0 5 3\"/>");
+
+        // No --size at all: the plan's fallback, never silent.
+        Main.Viewport fallback = Main.resolveAutoViewport(false, "file", bare.toString());
+        assertEquals(1280, fallback.width());
+        assertEquals(900, fallback.height());
+        assertEquals("default-fallback", fallback.source());
+        assertTrue(fallback.notice().contains("SVG size not determined")
+            && fallback.notice().contains("no absolute width or height")
+            && fallback.notice().contains("using the default 1280x900 viewport")
+            && fallback.notice().contains("--size WxH"), fallback.notice());
+        assertTrue(Main.resolveAutoViewport(false, "file", relative.toString())
+            .notice().contains("unit \"em\""));
+
+        // --size auto: the caller asked for a size that cannot be delivered. Exit 2, named,
+        // before Chrome and before any artifact.
+        Path output = directory.resolve("never-written.png");
+        Path receipt = directory.resolve("never-written.json");
+        for (String[] args : java.util.List.of(
+                new String[] {bare.toString(), "--size", "auto", "-o", output.toString(),
+                    "--json", receipt.toString()},
+                new String[] {"--size=auto", relative.toString(), "-o", output.toString(),
+                    "--json", receipt.toString()})) {
+            Object[] result = runCapturingStderr(args);
+            String errors = (String) result[1];
+            assertEquals(2, result[0], errors);
+            assertTrue(errors.contains("--size auto cannot determine the size of")
+                && errors.contains("pass --size WxH instead"), errors);
+            org.junit.jupiter.api.Assertions.assertFalse(Files.exists(output));
+            org.junit.jupiter.api.Assertions.assertFalse(Files.exists(receipt));
+        }
+    }
+
+    @Test
+    void sizeAutoRefusesInputsThatAreNotALocalSvgBeforeStdinOrChrome(
+            @TempDir Path directory) throws Exception {
+        Path page = directory.resolve("page.html");
+        Files.writeString(page, "<p>page</p>");
+        Path output = directory.resolve("never-written.png");
+
+        Object[] file = runCapturingStderr(
+            page.toString(), "--size", "auto", "-o", output.toString());
+        assertEquals(2, file[0], (String) file[1]);
+        assertTrue(((String) file[1]).contains("--size auto reads the size from a local .svg file")
+            && ((String) file[1]).contains("not an .svg file"), (String) file[1]);
+
+        Object[] url = runCapturingStderr(
+            "https://example.com/logo.svg", "--size", "auto", "-o", output.toString());
+        assertEquals(2, url[0], (String) url[1]);
+        assertTrue(((String) url[1]).contains("the input is a URL"), (String) url[1]);
+
+        // stdin must be refused WITHOUT being read: a stream that fails on read proves it.
+        InputStream originalIn = System.in;
+        Object[] stdin;
+        try {
+            System.setIn(new InputStream() {
+                @Override
+                public int read() {
+                    throw new AssertionError("--size auto must refuse before reading stdin");
+                }
+            });
+            stdin = runCapturingStderr("-", "--size", "auto", "-o", output.toString());
+        } finally {
+            System.setIn(originalIn);
+        }
+        assertEquals(2, stdin[0], (String) stdin[1]);
+        assertTrue(((String) stdin[1]).contains("the input is stdin"), (String) stdin[1]);
+        org.junit.jupiter.api.Assertions.assertFalse(Files.exists(output));
+    }
+
+    @Test
+    void sizeSpellingsOtherThanWxHOrAutoStillRefuse() throws Exception {
+        for (String bad : new String[] {"AUTO", "Auto", "autox", "auto,auto", "1000"}) {
+            Object[] result = runCapturingStderr("--size", bad, "https://example.com");
+            assertEquals(2, result[0], bad + ": " + result[1]);
+        }
+    }
 }
