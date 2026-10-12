@@ -406,7 +406,12 @@ public final class BrewShotFolderWorker {
             throw new JobFailure("capture-"
                 + captureFailure.getClass().getSimpleName());
         }
-        if (exit != 0) {
+        // Exit 6 is "the PNG was written and a Chrome process of this capture is still observed
+        // alive" (plan f5f02722). Main has already named the pids on stderr. It is not a failed
+        // render, so the job is not failed for it: with the JVM as pid 1 Chrome's unreaped
+        // helpers read as alive after every capture, and failing on 6 would fail every job in
+        // exactly the setup the pid-1 WARNING at start already describes.
+        if (exit != 0 && exit != Main.EXIT_CLEANUP_UNCONFIRMED) {
             throw new JobFailure("capture-exit-" + exit);
         }
         requirePng(renderTemp);

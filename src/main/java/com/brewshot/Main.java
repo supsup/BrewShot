@@ -22,6 +22,8 @@ import java.util.Locale;
  * Exit codes: 0 ok · 2 bad arguments · 3 no Chrome found · 4 an observed
  * assertion/page/diff gate failed after its artifacts were written · 5 requested
  * page diagnostics were incomplete after their artifacts were written · 1 runtime failure.
+ * 6 the capture succeeded but a Chrome process of it is still observed alive after close
+ * (stderr names the pids; {@code --json} carries the same fact as {@code cleanup}).
  * Note: the {@code --gif} lane and `diff` are library/jar-path (ImageIO/AWT is
  * not yet supported by native-image on macOS — the CLI refuses/reports this
  * loudly rather than half-working); the PNG shoot path is native-clean.
@@ -40,8 +42,68 @@ public final class Main {
         System.exit(run(args));
     }
 
+    /**
+     * The capture itself succeeded, and a Chrome process of it is still observed alive after
+     * close (plan f5f02722). Distinct from every other code so a wrapper can tell "the artifact
+     * is good, go and look at these pids" from a failed capture. It only ever REPLACES 0: a run
+     * that already failed keeps its own code, and still gets the stderr line and the JSON field.
+     */
+    static final int EXIT_CLEANUP_UNCONFIRMED = 6;
+
+    /**
+     * Carries the launched session out of the capture body so its cleanup can be read AFTER
+     * try-with-resources has closed it, and read ONCE: the manifest field and the exit code are
+     * derived from the same snapshot, so they cannot disagree about a process that exited in
+     * between.
+     */
+    private static final class CleanupWitness {
+        private BrewShot shot;
+        private CleanupOutcome outcome;
+
+        CleanupOutcome settle() {
+            if (outcome == null && shot != null) { outcome = shot.cleanupOutcome(); }
+            return outcome;
+        }
+    }
+
     /** Testable entry: parse, shoot, return the exit code. Never calls System.exit. */
     static int run(String[] rawArgs) throws Exception {
+        CleanupWitness witness = new CleanupWitness();
+        int code;
+        try {
+            code = runCapture(rawArgs, witness);
+        } catch (Exception | Error failure) {
+            // A capture that threw has still closed its browser on the way out. The failure is
+            // what the caller is told; a surviving Chrome must not go unsaid because of it.
+            try {
+                exitCodeAfterCleanup(1, witness.settle(), System.err);
+            } catch (RuntimeException reportFailure) {
+                failure.addSuppressed(reportFailure);
+            }
+            throw failure;
+        }
+        return exitCodeAfterCleanup(code, witness.settle(), System.err);
+    }
+
+    /**
+     * Turn a typed cleanup outcome into what the CLI owes its caller: nothing at all when the
+     * outcome is not a failure (a kept profile is the documented default and is reported in
+     * {@code --json}, not on every run's stderr), one stderr line when it is, and
+     * {@link #EXIT_CLEANUP_UNCONFIRMED} in place of 0 when a process is still observed alive.
+     * A null outcome means no browser was launched.
+     */
+    static int exitCodeAfterCleanup(int code, CleanupOutcome outcome, java.io.PrintStream err) {
+        if (outcome == null) { return code; }
+        String warning = outcome.warning();
+        if (warning == null) { return code; }
+        boolean promote = code == 0
+            && outcome.state() == CleanupOutcome.State.PROCESS_UNCONFIRMED;
+        err.println("brewshot: " + warning
+            + (promote ? " (exit " + EXIT_CLEANUP_UNCONFIRMED + "; the output was written)" : ""));
+        return promote ? EXIT_CLEANUP_UNCONFIRMED : code;
+    }
+
+    private static int runCapture(String[] rawArgs, CleanupWitness witness) throws Exception {
         // Accept both `--out x.png` AND `--out=x.png` (the near-universal
         // convention; agent-generated wrappers lean on it). Split a leading
         // long-flag `--name=value` into two tokens up front so the loop below
@@ -298,9 +360,13 @@ public final class Main {
         Object evalResult = null;
         boolean failJsPassed = true;
         PageDiagnosticsReceipt diagnosticsReceipt = null;
+        long captureElapsedMs = 0;
+        String timezoneApplied = null;
+        Integer dprApplied = null;
         try (BrewShot shot = devicePixelRatio == null
                 ? BrewShot.launch(width, height)
                 : BrewShot.launch(width, height, devicePixelRatio)) {
+            witness.shot = shot;
             for (String[] h : headers) { shot.header(h[0], h[1]); }
             for (String[] c : cookies) { shot.cookie(c[0], c[1], c[2]); }
             if (colorScheme != null) { shot.colorScheme(colorScheme); }
@@ -420,18 +486,29 @@ public final class Main {
                 diagnosticsReceipt = PageDiagnosticsReceipt.capture(
                     shot, pageDiagnostics, failPageErrors, failConsoleErrors);
             }
-            if (jsonManifest != null) {
-                writeManifest(jsonManifest, input, mode, width, height, settleMs, waitJs,
-                    out, evalResult, failJs, failJsPassed,
-                    System.currentTimeMillis() - t0, gifSet ? gifDelayMs : null,
-                    jpegOut ? jpegQuality : null, diagnosticsReceipt,
-                    timezone, shot.appliedTimezone(),
-                    devicePixelRatio, shot.appliedDevicePixelRatio(),
-                    visionDeficiency == null ? null : visionDeficiency.cdpValue(),
-                    visionDeficiency == null ? null : Boolean.TRUE);
-            }
-            System.err.println("brewshot: wrote " + out);
+            // Read while the session is open; the manifest itself is written after close.
+            // elapsedMs keeps its meaning (launch to capture) and does not absorb teardown.
+            captureElapsedMs = System.currentTimeMillis() - t0;
+            timezoneApplied = shot.appliedTimezone();
+            dprApplied = shot.appliedDevicePixelRatio();
         }
+        // THE MANIFEST IS WRITTEN AFTER CLOSE (plan f5f02722), because the cleanup outcome it
+        // records does not exist until close has run. Only the normal end of the block above
+        // reaches this line -- every early return and every exception leaves before it -- so the
+        // set of runs that publish a manifest, and the order "manifest, then the wrote line",
+        // are what they were.
+        if (jsonManifest != null) {
+            writeManifest(jsonManifest, input, mode, width, height, settleMs, waitJs,
+                out, evalResult, failJs, failJsPassed,
+                captureElapsedMs, gifSet ? gifDelayMs : null,
+                jpegOut ? jpegQuality : null, diagnosticsReceipt,
+                timezone, timezoneApplied,
+                devicePixelRatio, dprApplied,
+                visionDeficiency == null ? null : visionDeficiency.cdpValue(),
+                visionDeficiency == null ? null : Boolean.TRUE,
+                witness.settle());
+        }
+        System.err.println("brewshot: wrote " + out);
         if (!failJsPassed) {
             System.err.println("brewshot: --fail-js assertion FAILED (output artifact still written): "
                 + failJs);
@@ -899,6 +976,26 @@ public final class Main {
             String timezoneApplied, Integer dprRequested, Integer dprApplied,
             String visionDeficiencyRequested, Boolean visionCommandAccepted)
             throws java.io.IOException {
+        writeManifest(manifest, input, mode, width, height, settleMs, waitJs, out,
+            evalResult, failJs, failJsPassed, elapsedMs, requestedGifDelayMs, jpegQuality,
+            diagnostics, timezoneRequested, timezoneApplied, dprRequested, dprApplied,
+            visionDeficiencyRequested, visionCommandAccepted, null);
+    }
+
+    /**
+     * Cleanup-aware overload (plan f5f02722). The CLI always passes the session's outcome, so a
+     * capture manifest always carries {@code cleanup}; a null outcome omits the key and keeps
+     * the earlier byte shape for callers of the overloads above.
+     */
+    static void writeManifest(Path manifest, String input, String mode,
+            int width, int height, long settleMs, String waitJs, Path out,
+            Object evalResult, String failJs, boolean failJsPassed, long elapsedMs,
+            Integer requestedGifDelayMs, Integer jpegQuality,
+            PageDiagnosticsReceipt diagnostics, String timezoneRequested,
+            String timezoneApplied, Integer dprRequested, Integer dprApplied,
+            String visionDeficiencyRequested, Boolean visionCommandAccepted,
+            CleanupOutcome cleanup)
+            throws java.io.IOException {
         java.util.Map<String, Object> fields = new java.util.LinkedHashMap<>();
         fields.put("input", input);
         fields.put("mode", mode);
@@ -940,6 +1037,9 @@ public final class Main {
             preview.put("requested", visionDeficiencyRequested);
             preview.put("commandAccepted", visionCommandAccepted);
             fields.put("visionDeficiency", preview);
+        }
+        if (cleanup != null) {
+            fields.put("cleanup", cleanup.toJson());
         }
         fields.put("brewshot", BrewShot.VERSION);
         ArtifactWriter.writePrivateString(
@@ -1354,6 +1454,12 @@ public final class Main {
             console/error ceilings. A relevant dropped entry makes a requested gate
             inconclusive (exit 5), never clean. The image and private 0600 JSON sidecar
             are published before exit 4/5, so a lost process status still leaves evidence.
+
+            Cleanup is quiet when nothing is left running. If a Chrome process of the
+            capture is still observed alive after close, stderr names the pid(s), a
+            capture that otherwise succeeded exits 6, and --json records it under
+            "cleanup" (state, livePids, profile, reason). A kept profile is recorded
+            there too and is not a warning.
 
             requires a local Chrome/Chromium (or set BREWSHOT_CHROME).""");
     }
