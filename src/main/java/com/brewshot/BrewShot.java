@@ -805,6 +805,19 @@ public final class BrewShot implements AutoCloseable {
          *  happens at most once per launch, and a per-pass sweep would spend a
          *  meaningful slice of the bounded cleanup budget re-proving it. */
         private boolean orphanSweepDone;
+        /// REPORTING STATE ONLY (plan f5f02722): what the one argv sweep found, and why the last
+        /// cleanup pass kept this lease. Neither is read by cleanup itself -- no gate, signal or
+        /// delete depends on them -- so the reap logic is the logic it was. They exist because
+        /// cleanup computed both facts into locals and discarded them, which left the report
+        /// with nothing to say but "still registered", true of a kept profile and of a live
+        /// Chrome alike. Volatile, like the handles above, so cleanupOutcome needs no monitor.
+        private volatile List<ProcessHandle> orphanHandles = List.of();
+        private volatile Retention lastRetention;
+
+        /** Why a cleanup pass ended without releasing the lease. */
+        private enum Retention {
+            TREE_NOT_REAPED, ORPHAN_SURVIVED, RELEASE_UNPROVEN, PROFILE_NOT_REMOVED
+        }
 
         private ResourceLease(Process process, Path profileDir,
                               ProfileDeleter profileDeleter,
@@ -935,8 +948,9 @@ public final class BrewShot implements AutoCloseable {
             boolean orphansReaped = true;
             if (!orphanSweepDone) {
                 orphanSweepDone = true;
-                orphansReaped =
-                    allHandlesDead(sweepOrphansByProfilePath(profileDir, deadline));
+                List<ProcessHandle> swept = sweepOrphansByProfilePath(profileDir, deadline);
+                orphanHandles = List.copyOf(swept);
+                orphansReaped = allHandlesDead(swept);
             }
             boolean releaseProven =
                 processTreeReaped && orphansReaped && processTreeReleaseSafe(deadline);
@@ -954,8 +968,101 @@ public final class BrewShot implements AutoCloseable {
             if (releaseProven && profileAbsenceProven()) {
                 owner = Owner.RELEASED;
                 deregister(this);
+            } else {
+                // Recorded for cleanupOutcome, in the order the gates above were applied.
+                lastRetention = !processTreeReaped ? Retention.TREE_NOT_REAPED
+                    : !orphansReaped ? Retention.ORPHAN_SURVIVED
+                    : !releaseProven ? Retention.RELEASE_UNPROVEN
+                    : Retention.PROFILE_NOT_REMOVED;
             }
             return owner == Owner.RELEASED;
+        }
+
+        /**
+         * What is left of this lease RIGHT NOW, as a typed value (plan f5f02722).
+         *
+         * LIVENESS IS READ HERE, NOT REMEMBERED. forciblySignalled says a SIGKILL was sent at some
+         * point; it does not say the tree survived it, and it is sticky across close() and the
+         * shutdown passes. Reading it as "killed and still alive" is what made every ordinary
+         * capture print "1 killed ... may still be running": close() had sent the kill, the tree
+         * was dead, and the lease was registered only because an unproven release keeps the
+         * profile. So the question asked of each retained handle is the present-tense one.
+         *
+         * NOT synchronized, for the reason signalOnly is not: the shutdown hook calls this for
+         * its report, and a close() stalled inside cleanup holds the lease monitor. A report that
+         * waits on that monitor is a hook that never prints. Every field read is volatile or the
+         * CAS cell, and the result is a snapshot: a process can exit a moment later.
+         *
+         * The handles consulted are the ones cleanup itself acts on -- the launched process, the
+         * parent handle, every descendant ever recorded, and whatever the argv sweep matched.
+         * That is evidence, not a containment proof, which is why no state here is called proven.
+         */
+        CleanupOutcome cleanupOutcome() {
+            if (owner == Owner.RELEASED) { return releasedOutcome(); }
+            java.util.TreeSet<Long> pids = new java.util.TreeSet<>();
+            java.util.TreeSet<Long> exitedUnreaped = new java.util.TreeSet<>();
+            int withoutPid = 0;
+            if (isAlive(process)) {
+                // Process.pid() is optional in the JDK contract; a live member whose pid cannot
+                // be read is COUNTED, never dropped, or "no pid to name" would read as "none".
+                try { classifyLivePid(process.pid(), pids, exitedUnreaped); }
+                catch (RuntimeException noPid) { withoutPid++; }
+            }
+            List<ProcessHandle> handles = new ArrayList<>(descendantHandles.get());
+            ProcessHandle parent = parentHandle;
+            if (parent != null) { handles.add(parent); }
+            handles.addAll(orphanHandles);
+            for (ProcessHandle handle : handles) {
+                if (!handleAlive(handle)) { continue; }
+                try { classifyLivePid(handle.pid(), pids, exitedUnreaped); }
+                catch (RuntimeException noPid) { withoutPid++; }
+            }
+            Retention why = lastRetention;
+            // Re-read AFTER the liveness walk: a cleanup that released the lease meanwhile must
+            // not be reported from the retention note it left a moment before releasing.
+            if (owner == Owner.RELEASED) { return releasedOutcome(); }
+            List<Long> unreaped = List.copyOf(exitedUnreaped);
+            if (!pids.isEmpty() || withoutPid > 0) {
+                return new CleanupOutcome(CleanupOutcome.State.PROCESS_UNCONFIRMED,
+                    List.copyOf(pids), withoutPid, unreaped, profileDir,
+                    why == null
+                        ? "cleanup has not run for this launch and a process of it is alive"
+                        : "a process of this launch is still observed alive after cleanup");
+            }
+            if (why == Retention.PROFILE_NOT_REMOVED) {
+                return new CleanupOutcome(CleanupOutcome.State.PROFILE_NOT_REMOVED,
+                    List.of(), 0, unreaped, profileDir,
+                    "release was proven but the profile directory is still present after the"
+                        + " delete");
+            }
+            String kept;
+            if (why == null) {
+                kept = "cleanup has not run for this launch; no process of it is observed alive";
+            } else if (why == Retention.RELEASE_UNPROVEN) {
+                kept = "release is not proven for this launch (the default launch has no"
+                    + " containment proof), so the profile is kept by decision; no process of"
+                    + " this launch is observed alive";
+            } else if (!unreaped.isEmpty()) {
+                kept = unreaped.size() + " process(es) of this launch have exited but are not"
+                    + " reaped by their parent (zombies), which cleanup cannot tell from live"
+                    + " ones, so the profile was kept; none is running";
+            } else {
+                kept = "a process of this launch was still alive when cleanup last ran, so the"
+                    + " profile was kept; none is observed alive now";
+            }
+            return new CleanupOutcome(CleanupOutcome.State.PROFILE_KEPT,
+                List.of(), 0, unreaped, profileDir, kept);
+        }
+
+        private static void classifyLivePid(long pid, java.util.Set<Long> live,
+                java.util.Set<Long> exitedUnreaped) {
+            if (exitedButUnreaped(pid)) { exitedUnreaped.add(pid); }
+            else { live.add(pid); }
+        }
+
+        private CleanupOutcome releasedOutcome() {
+            return new CleanupOutcome(CleanupOutcome.State.RELEASED, List.of(), 0, List.of(),
+                profileDir, "process tree reaped, release proven, profile removed");
         }
 
         synchronized boolean isOwned() {
@@ -1290,7 +1397,7 @@ public final class BrewShot implements AutoCloseable {
         }
     }
 
-    private static void cleanupOwnedResources(boolean beginJvmShutdown) {
+    private static ShutdownCleanupReport cleanupOwnedResources(boolean beginJvmShutdown) {
         List<ResourceLease> initialSnapshot;
         synchronized (OWNERSHIP_LOCK) {
             if (beginJvmShutdown) { shutdownStarted = true; }
@@ -1368,11 +1475,11 @@ public final class BrewShot implements AutoCloseable {
                     snapshot = List.copyOf(LIVE);
                 }
             }
-            if (snapshot.isEmpty()) { return; }
+            if (snapshot.isEmpty()) { return ShutdownCleanupReport.NONE; }
             for (ResourceLease lease : snapshot) {
                 if (deadline.expired()) {
-                    reportAbandoned(beginJvmShutdown, AbandonCause.BUDGET_EXPIRED, reached);
-                    return;
+                    return reportAbandoned(
+                        beginJvmShutdown, AbandonCause.BUDGET_EXPIRED, reached);
                 }
                 // REACHED, and nothing more. The comment that stood here claimed "a lease this line
                 // reaches is one destroyForcibly was sent to", which is FALSE whenever the tree is
@@ -1392,7 +1499,7 @@ public final class BrewShot implements AutoCloseable {
         // the reviewer measured 5049ms elapsed at n=10. That is the defect this plan exists to fix,
         // reintroduced by the fix, pointing the other way: BEFORE this branch that path said
         // "budget expired", which was TRUE.
-        reportAbandoned(beginJvmShutdown,
+        return reportAbandoned(beginJvmShutdown,
             deadline.expired() ? AbandonCause.BUDGET_EXPIRED : AbandonCause.PASSES_EXHAUSTED,
             reached);
     }
@@ -1415,25 +1522,12 @@ public final class BrewShot implements AutoCloseable {
         }
     }
 
-    /// The sentence must agree with what this method's own caller actually did. Two clauses of the
-    /// previous one did not: it opened "shutdown budget expired" on the passes-exhausted path where
-    /// the budget had time left, and it asserted leases were NOT forcibly killed while the pass it
-    /// reports on reaches terminateProcess with gracefulFirst=false, whose forcible branch is
-    /// gated only by the deadline. The Javadoc defending that wording reasoned about the SIGNAL
-    /// pass; this report is printed after the REAP pass.
-    static String abandonedReport(AbandonCause cause, int remaining, int killed,
-            int reachedButNotSignalled) {
-        int neverReached = Math.max(0, remaining - killed - reachedButNotSignalled);
-        return "brewshot: " + cause.phrase() + " with " + remaining
-            + " lease(s) not confirmed reaped"
-            + " (every live lease was sent SIGTERM before waiting began; of those remaining, "
-            + killed + " were sent SIGKILL by this pass and were still alive after it, "
-            + reachedButNotSignalled + " were reached but needed no kill because their tree was"
-            + " already dead and they are retained for another reason such as an undeleted"
-            + " profile, and " + neverReached + " were never reached. The " + killed + " killed"
-            + " and the " + neverReached + " unreached may still be running; the "
-            + reachedButNotSignalled + " already-dead are not.)";
-    }
+    /// The sentence itself now lives in {@link ShutdownCleanupReport#stderrLines()}, built from a
+    /// typed value rather than from three counters (plan f5f02722). Its history is why it is
+    /// worded as it is: it once opened "shutdown budget expired" on the passes-exhausted path
+    /// where the budget had time left, and once asserted leases were NOT forcibly killed while
+    /// the pass it reports on reaches terminateProcess with gracefulFirst=false. Both corrections
+    /// are kept; what changed is WHICH leases the sentence is about.
 
     /**
      * WHAT THE EXPIRED DEADLINE MEANS FOR THE SECOND PASS, said out loud (plan 07a0b891 step 2).
@@ -1463,27 +1557,38 @@ public final class BrewShot implements AutoCloseable {
      * Silence is what let this defect live: a shutdown that abandons children without saying so
      * looks exactly like a shutdown that had nothing to do.
      */
-    private static void reportAbandoned(boolean beginJvmShutdown, AbandonCause cause,
-            java.util.Set<ResourceLease> reached) {
-        if (!beginJvmShutdown) { return; }
+    ///
+    /// AND IT IS QUIET WHEN NOTHING IS ALIVE (plan f5f02722). A lease is still registered here for
+    /// two unrelated reasons: a process of it survives, or its profile was kept. The second is
+    /// the ordinary end of every launch whose release is unproven, so the old report fired on
+    /// every clean capture -- and, because forciblySignalled is sticky from close(), it called
+    /// that dead tree "sent SIGKILL by this pass and still alive after it". Each remaining lease
+    /// is now asked what is alive NOW. Only those with a live process are counted as not
+    /// confirmed reaped, and their pids are named; a kept profile is in the returned value and
+    /// not on stderr; a profile that should have been removed and was not gets its own line.
+    /// Silence is still never the answer to an abandoned child: that case still prints, with
+    /// the same accounting and the pids added.
+    private static ShutdownCleanupReport reportAbandoned(boolean beginJvmShutdown,
+            AbandonCause cause, java.util.Set<ResourceLease> reached) {
+        if (!beginJvmShutdown) { return ShutdownCleanupReport.NONE; }
         List<ResourceLease> remaining;
         synchronized (OWNERSHIP_LOCK) { remaining = List.copyOf(LIVE); }
-        if (remaining.isEmpty()) { return; }
-        int killed = 0;
-        int reachedButNotSignalled = 0;
+        if (remaining.isEmpty()) { return ShutdownCleanupReport.NONE; }
+        List<ShutdownCleanupReport.Entry> entries = new ArrayList<>();
         for (ResourceLease lease : remaining) {
-            if (lease.forciblySignalled()) {
-                killed++;
-            } else if (reached.contains(lease)) {
-                // REACHED AND NOT SIGNALLED is its own category, not a rounding error. Reporting it
-                // as never-reached would be the same species of false clause as calling it killed:
-                // the pass DID get to it, found the tree already dead, and skipped the forcible
-                // branch. Retention is then about the profile, not about a surviving process.
-                reachedButNotSignalled++;
-            }
+            CleanupOutcome outcome = lease.cleanupOutcome();
+            // Released between the snapshot and this read: nothing of it remains to report.
+            if (outcome.state() == CleanupOutcome.State.RELEASED) { continue; }
+            // REACHED is still its own fact, not a rounding error (needs-fix 605 regression 2):
+            // the pass can get to a lease and correctly send it nothing.
+            entries.add(new ShutdownCleanupReport.Entry(
+                outcome, lease.forciblySignalled(), reached.contains(lease)));
         }
-        System.err.println(
-            abandonedReport(cause, remaining.size(), killed, reachedButNotSignalled));
+        ShutdownCleanupReport report = new ShutdownCleanupReport(cause.phrase(), entries);
+        for (String line : report.stderrLines()) {
+            System.err.println(line);
+        }
+        return report;
     }
 
     /** Test seam: this session's generated Chrome profile directory. */
@@ -1495,9 +1600,9 @@ public final class BrewShot implements AutoCloseable {
         cleanupOwnedResources(false);
     }
 
-    static void runJvmShutdownCleanupForTests() {
+    static ShutdownCleanupReport runJvmShutdownCleanupForTests() {
         try {
-            cleanupOwnedResources(true);
+            return cleanupOwnedResources(true);
         } finally {
             synchronized (OWNERSHIP_LOCK) {
                 shutdownStarted = false;
@@ -3885,6 +3990,26 @@ public final class BrewShot implements AutoCloseable {
         GifWriter.write(pngFrames, frameDelayMs, out);
     }
 
+    /**
+     * What this session's cleanup left behind, as a typed value: nothing, a kept profile and
+     * why, a profile that could not be removed, or the pids of processes still alive.
+     *
+     * <p>Call it after {@link #close()} has returned; before that it answers
+     * {@link CleanupOutcome.State#NOT_CLOSED}. It is a snapshot of what is observed alive at the
+     * moment of the call, read from the same process handles cleanup acts on, so a later call
+     * can differ (a process can exit, and a later close() or the JVM shutdown hook retries).
+     * The default launch has no containment proof and therefore ends in
+     * {@link CleanupOutcome.State#PROFILE_KEPT}, not {@code RELEASED}: the Chrome is gone and
+     * its profile directory is still on disk.
+     */
+    public CleanupOutcome cleanupOutcome() {
+        if (!closed.get()) {
+            return new CleanupOutcome(CleanupOutcome.State.NOT_CLOSED, List.of(), 0, List.of(),
+                profileDir, "close() has not been called on this session");
+        }
+        return lease.cleanupOutcome();
+    }
+
     @Override
     public void close() {
         boolean closeTransport = closed.compareAndSet(false, true);
@@ -4122,6 +4247,39 @@ public final class BrewShot implements AutoCloseable {
             if (handleAlive(handle)) { return false; }
         }
         return true;
+    }
+
+    /// TEST-ONLY seam (plan f5f02722): replaces the /proc read below so the zombie arm of
+    /// cleanupOutcome can be driven on any host. Null by default and written only by tests,
+    /// the same shape as casCollisionHookForTests.
+    static volatile java.util.function.LongPredicate exitedButUnreapedProbeForTests;
+
+    /**
+     * Whether a pid the JDK reports alive has in fact exited and is only waiting for its parent
+     * to reap it. REPORTING ONLY: cleanup's own gates still use the JDK's answer, so a zombie
+     * keeps its profile exactly as before. Linux answers through /proc; everywhere else, and on
+     * any read failure, the answer is "no", which leaves the process reported as alive.
+     */
+    static boolean exitedButUnreaped(long pid) {
+        java.util.function.LongPredicate probe = exitedButUnreapedProbeForTests;
+        if (probe != null) { return probe.test(pid); }
+        try {
+            return procStatSaysZombie(Files.readString(
+                Path.of("/proc", Long.toString(pid), "stat"), StandardCharsets.ISO_8859_1));
+        } catch (IOException | RuntimeException unreadable) {
+            return false;
+        }
+    }
+
+    /**
+     * The state field of a Linux {@code /proc/<pid>/stat} line is the first field after the
+     * command name, and the command name is parenthesised and may itself contain spaces and
+     * parentheses, so the state is located from the LAST closing parenthesis.
+     */
+    static boolean procStatSaysZombie(String stat) {
+        int close = stat.lastIndexOf(')');
+        if (close < 0 || close + 2 >= stat.length()) { return false; }
+        return stat.charAt(close + 1) == ' ' && stat.charAt(close + 2) == 'Z';
     }
 
     private static boolean profileAbsent(Path profileDir) {

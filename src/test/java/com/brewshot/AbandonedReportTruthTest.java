@@ -16,6 +16,8 @@ import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -29,7 +31,25 @@ import org.junit.jupiter.api.io.TempDir;
 /// not notice both call sites passing the same cause -- the sentence would stay well-formed and
 /// stay wrong. And the counts are read POSITIONALLY, because the phrases around them are satisfied
 /// by any number: an earlier version of this test asserted the phrases and let two mutants through.
+///
+/// Plan f5f02722 changed WHICH leases the sentence is about, not the accounting: a lease is now
+/// counted as not confirmed reaped only when a process of it is observed alive when the report is
+/// made, and the report is also returned as a typed value. The counts below are therefore read
+/// twice, from the printed sentence and from that value, and must agree.
 final class AbandonedReportTruthTest {
+
+    /// The fake pids used here (9100, 9101, 9201) are not this test's processes. The report asks
+    /// /proc whether a live pid is really a zombie, and on a Linux host one of those numbers may
+    /// belong to somebody: pin the answer so the fixtures mean what they say on every host.
+    @BeforeEach
+    void pinTheZombieProbe() {
+        BrewShot.exitedButUnreapedProbeForTests = pid -> false;
+    }
+
+    @AfterEach
+    void unpinTheZombieProbe() {
+        BrewShot.exitedButUnreapedProbeForTests = null;
+    }
 
     /// SHUTDOWN_CLEANUP_TIMEOUT_MS, mirrored so the clock assertions name the budget they test.
     private static final long BUDGET_MILLIS = 5_000L;
@@ -78,23 +98,27 @@ final class AbandonedReportTruthTest {
 
     /// The three counts the sentence commits to, read by POSITION rather than by phrase.
     private record Report(String text, int remaining, int killed, int reachedNotSignalled,
-            int neverReached, long elapsedMillis) { }
+            int neverReached, long elapsedMillis, ShutdownCleanupReport typed) { }
+
+    /// What one run of the real hook printed and returned, before any parsing.
+    private record Captured(String text, ShutdownCleanupReport typed, long elapsedMillis) { }
 
     private static final Pattern COUNTS = Pattern.compile(
         "with (\\d+) lease\\(s\\) not confirmed reaped.*?of those remaining, (\\d+) were sent"
-        + " SIGKILL by this pass and were still alive after it, (\\d+) were reached but needed no"
-        + " kill.*?and (\\d+) were never reached",
+        + " SIGKILL and were still alive afterwards, (\\d+) were reached without a SIGKILL"
+        + ".*?and (\\d+) were never reached",
         Pattern.DOTALL);
 
-    private static Report runShutdownAndParse(List<UndyingProcess> live) {
+    private static Captured runShutdown(List<UndyingProcess> live) {
         PrintStream original = System.err;
         ByteArrayOutputStream buffer = new ByteArrayOutputStream();
         String text;
         long elapsed;
+        ShutdownCleanupReport typed = null;
         long began = System.nanoTime();
         try {
             System.setErr(new PrintStream(buffer, true, StandardCharsets.UTF_8));
-            BrewShot.runJvmShutdownCleanupForTests();
+            typed = BrewShot.runJvmShutdownCleanupForTests();
         } finally {
             elapsed = (System.nanoTime() - began) / 1_000_000L;
             System.setErr(original);
@@ -102,13 +126,27 @@ final class AbandonedReportTruthTest {
             for (UndyingProcess p : live) { p.die(); }
             BrewShot.runJvmShutdownCleanupForTests();
         }
+        return new Captured(text, typed, elapsed);
+    }
+
+    private static Report runShutdownAndParse(List<UndyingProcess> live) {
+        Captured c = runShutdown(live);
+        String text = c.text();
         Matcher m = COUNTS.matcher(text);
         assertTrue(m.find(), "the abandoned report did not fire, or its shape changed: " + text);
         Report r = new Report(text,
             Integer.parseInt(m.group(1)), Integer.parseInt(m.group(2)),
-            Integer.parseInt(m.group(3)), Integer.parseInt(m.group(4)), elapsed);
+            Integer.parseInt(m.group(3)), Integer.parseInt(m.group(4)), c.elapsedMillis(),
+            c.typed());
         assertEquals(r.remaining(), r.killed() + r.reachedNotSignalled() + r.neverReached(),
             "the three-way split must account for every remaining lease: " + text);
+        // THE PRINTED COUNTS AND THE TYPED VALUE ARE ONE FACT (plan f5f02722). The sentence is
+        // built from the value, so a disagreement here means the value this run returned is not
+        // the one it printed.
+        assertEquals(r.remaining(), r.typed().unconfirmed().size(), text);
+        assertEquals(r.killed(), r.typed().killedStillAlive(), text);
+        assertEquals(r.reachedNotSignalled(), r.typed().reachedWithoutKill(), text);
+        assertEquals(r.neverReached(), r.typed().neverReached(), text);
         return r;
     }
 
@@ -159,10 +197,13 @@ final class AbandonedReportTruthTest {
         assertTrue(live.get(0).destroyForciblyCalls.get() > 0,
             "the report claims a SIGKILL, so destroyForcibly must actually have been invoked");
 
-        // The running clause repeats the counts; pin them there too.
-        assertTrue(r.text().contains("The 1 killed and the 0 unreached may still be running; "
-                + "the 0 already-dead are not."),
-            "the running claim must carry the same counts as the split: " + r.text());
+        // The running clause repeats the count; pin it there too.
+        assertTrue(r.text().contains("All 1 may still be running.)"),
+            "the running claim must carry the same count as the split: " + r.text());
+        // This fake has no readable pid (Process.pid() is optional). The report must say so
+        // rather than print an empty pid list that reads as "nothing is alive".
+        assertTrue(r.text().contains("Still alive: 1 process(es) with no readable pid"),
+            "a live process whose pid cannot be read must be counted, not dropped: " + r.text());
     }
 
     @Test
@@ -232,39 +273,49 @@ final class AbandonedReportTruthTest {
         // deadline, so the pass REACHES this lease and correctly sends it nothing. Reporting that
         // as never-reached would be just as false as reporting it killed, which is why the split
         // has a third category rather than two.
+        //
+        // PLAN f5f02722 TOOK THE NEXT STEP THIS TEST WAS POINTING AT. The lease is not "reached
+        // but needed no kill", it is not a process problem at all: nothing of it is alive, and
+        // what is left is a profile. So it is no longer counted among the leases not confirmed
+        // reaped, and "may still be running" is not said of it in any category. Its own failure
+        // -- release was proven and the profile is still there -- is reported on its own line.
         UndyingProcess dead = new UndyingProcess(false);
         Path profile = Files.createDirectories(dir.resolve("undeletable"));
         BrewShot.registerContainedLaunchLeaseForTests(dead, profile, d -> { });
 
-        Report r = runShutdownAndParse(List.of(dead));
+        Captured c = runShutdown(List.of(dead));
 
-        assertEquals(1, r.remaining(), r.text());
-        assertEquals(0, r.killed(),
-            "nothing was sent to an already-dead tree, so the report must not claim a SIGKILL: "
-                + r.text());
-        assertEquals(1, r.reachedNotSignalled(),
-            "the pass DID reach it and correctly sent nothing; that is its own category, not "
-                + "never-reached: " + r.text());
-        assertEquals(0, r.neverReached(), r.text());
+        assertFalse(c.text().contains("not confirmed reaped"),
+            "a lease with no live process must not be counted as not confirmed reaped: "
+                + c.text());
+        assertFalse(c.text().contains("may still be running"),
+            "nothing of this lease is alive, so nothing may still be running: " + c.text());
+        assertFalse(c.text().contains("SIGKILL"),
+            "nothing was sent to an already-dead tree, so the report must not mention a "
+                + "SIGKILL: " + c.text());
+        assertEquals(0, c.typed().unconfirmed().size(), c.text());
+
+        ShutdownCleanupReport.Entry mine = null;
+        for (ShutdownCleanupReport.Entry entry : c.typed().profilesNotRemoved()) {
+            if (profile.equals(entry.outcome().profileDir())) { mine = entry; }
+        }
+        assertTrue(mine != null,
+            "the lease must be reported as a profile that could not be removed: " + c.typed());
+        assertFalse(mine.forciblySignalled(),
+            "nothing was sent to an already-dead tree: " + c.typed());
+        assertTrue(mine.reached(),
+            "the pass DID reach it and correctly sent nothing; reached stays its own fact: "
+                + c.typed());
+        assertEquals(List.of(), mine.outcome().livePids(), c.typed().toString());
 
         assertEquals(0, dead.destroyForciblyCalls.get(),
             "fixture guard: an already-dead process must not have been signalled at all");
 
-        // BOUND POSITIONALLY, not by the presence of the phrase (needs-fix 608, minor). This used
-        // to assert contains("already-dead are not."), which is UNCONDITIONAL template text: it
-        // passes on any report the builder produces, including one whose counting is entirely
-        // broken. It was the only spelling-keyed assertion left in a file that is otherwise
-        // behaviour-keyed.
-        //
-        // Deleting it was the offered fix. Binding it is better, because the running-claim clause
-        // is a SECOND use of all three counts and nothing else in this test reaches it -- the
-        // regex above parses only the first three positions. A mutant hard-coding the numbers in
-        // this clause alone would have survived, which is exactly the two-uses-one-assertion shape
-        // I closed in the sirentide banner and left open here.
-        assertTrue(r.text().contains("The 0 killed and the 0 unreached may still be running; "
-                + "the 1 already-dead are not."),
-            "the running claim must carry the SAME counts as the split, at every position it "
-                + "repeats them: " + r.text());
+        // NOT SILENT EITHER. Release was proven and the delete left the directory behind, which
+        // is a failure and not a decision, so it gets a line that names the path.
+        assertTrue(c.text().contains("profile(s) could not be removed"), c.text());
+        assertTrue(c.text().contains(profile.toString()),
+            "the line must name the profile that was left behind: " + c.text());
     }
 
     /// A handle that is ALIVE and whose destroyForcibly REFUSES, which is the JDK's own way of
@@ -372,6 +423,11 @@ final class AbandonedReportTruthTest {
                 + "a SIGKILL: " + r.text());
         assertEquals(1, r.reachedNotSignalled(),
             "the pass reached it and sent nothing, which is the middle category: " + r.text());
+        // AND IT IS ALIVE, so it is named (plan f5f02722). The earlier sentence filed this lease
+        // under "already dead ... are not running" while its descendant lived.
+        assertEquals(List.of(9101L), r.typed().livePids(), r.text());
+        assertTrue(r.text().contains("Still alive: pid 9101 (check with: ps -p 9101)"),
+            "the live descendant must be named so the caller can check it: " + r.text());
     }
 
     @Test
@@ -413,5 +469,8 @@ final class AbandonedReportTruthTest {
                 + "must not claim a SIGKILL: " + r.text());
         assertEquals(1, r.reachedNotSignalled(),
             "reached and correctly sent nothing, which is the middle category: " + r.text());
+        assertEquals(List.of(9201L), r.typed().livePids(), r.text());
+        assertTrue(r.text().contains("Still alive: pid 9201 (check with: ps -p 9201)"),
+            "the live parent handle must be named so the caller can check it: " + r.text());
     }
 }
