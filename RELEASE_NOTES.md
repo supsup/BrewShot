@@ -9,7 +9,11 @@
   override is now sent on every launch (with `deviceScaleFactor: 0` on a default launch, so DPR
   stays with the browser-level force-1 flag as before), and the loaded page's
   `innerWidth x innerHeight` is witnessed after every `open`/`html`: `appliedViewport()` returns
-  it, and a mismatch fails before any capture. `--window-size` is still passed.
+  it, and a mismatch fails before any capture. `--window-size` is still passed. Narrow launches
+  were wrong by more than the toolbar band: before the fix a `launch(200, 100)` painted a
+  500x13 page (Chrome's minimum outer window); it is exact now too. A page that redefines its
+  own `innerWidth`/`innerHeight` is refused the same way, which is the page refusing its
+  capture, not a BrewShot defect.
 - **A launch now removes OTHER leftover profiles whose Chrome has exited** (plan 3a45f8fe).
   A profile whose release is unproven is still kept, by decision, so on macOS and outside the
   opted-in container every capture used to leave one `brewshot-*` directory behind for good.
