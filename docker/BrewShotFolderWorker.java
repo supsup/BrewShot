@@ -25,6 +25,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Container-only folder worker for self-contained local HTML files. Every
@@ -57,6 +58,14 @@ public final class BrewShotFolderWorker {
     private static final byte[] PNG_SIGNATURE = {
         (byte) 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a
     };
+
+    /**
+     * Jobs finished with exit 6 since this worker started: the image was written and at least
+     * one Chrome process of the capture was still observed alive after close (review
+     * brewshot/740 R3). Static because there is one worker per JVM and the render path is
+     * static-shaped; package-private so a test or a debugger can read it. Nothing resets it.
+     */
+    static final AtomicLong JOBS_WITH_SURVIVING_CHROME = new AtomicLong();
 
     private final Path input;
     private final Path output;
@@ -397,24 +406,50 @@ public final class BrewShotFolderWorker {
         if (size > Main.MAX_STDIN_HTML_BYTES) {
             throw new JobFailure("input-too-large");
         }
+        CleanupOutcome[] cleanup = new CleanupOutcome[1];
         int exit;
         try {
             exit = Main.run(new String[] {
                 claim.path().toString(), "-o", renderTemp.toString()
-            });
+            }, outcome -> cleanup[0] = outcome);
         } catch (Exception | LinkageError captureFailure) {
             throw new JobFailure("capture-"
                 + captureFailure.getClass().getSimpleName());
         }
-        // Exit 6 is "the PNG was written and a Chrome process of this capture is still observed
-        // alive" (plan f5f02722). Main has already named the pids on stderr. It is not a failed
-        // render, so the job is not failed for it: with the JVM as pid 1 Chrome's unreaped
-        // helpers read as alive after every capture, and failing on 6 would fail every job in
-        // exactly the setup the pid-1 WARNING at start already describes.
-        if (exit != 0 && exit != Main.EXIT_CLEANUP_UNCONFIRMED) {
+        // Exit 6 means the PNG was written and a Chrome process of this capture MAY STILL BE
+        // RUNNING in the container after close (plan f5f02722). It does not mean a zombie: an
+        // exited-but-unreaped process is read from /proc and classified separately (2298837),
+        // and only a live pid makes the state process-unconfirmed; with tini as pid 1 the
+        // helpers are reaped anyway. Lead decision (review brewshot/740 R3): the job is finished,
+        // the image is good and is published, but a survivor is never filed silently. Main has
+        // named the pids on stderr already; this adds the job id and the count, and keeps a
+        // counter, so a worker whose every capture leaves a Chrome behind can be seen in its
+        // log and read from a debugger.
+        if (exit == Main.EXIT_CLEANUP_UNCONFIRMED) {
+            noteSurvivingChrome(claim.jobId(), cleanup[0]);
+        } else if (exit != 0) {
             throw new JobFailure("capture-exit-" + exit);
         }
         requirePng(renderTemp);
+    }
+
+    /**
+     * The one line a surviving Chrome owes the operator: the job, how many processes, and the
+     * running count. Increments {@link #JOBS_WITH_SURVIVING_CHROME}. Kept apart from render()
+     * so it can be unit-tested the day this file gets a Gradle test lane; today it is compiled
+     * by the image build only (see the Dockerfile) and is untested.
+     */
+    static String noteSurvivingChrome(String jobId, CleanupOutcome cleanup) {
+        long jobs = JOBS_WITH_SURVIVING_CHROME.incrementAndGet();
+        String survivors = cleanup == null
+            ? "an unknown number of"
+            : Long.toString((long) cleanup.livePids().size() + cleanup.liveWithoutPid());
+        String line = "brewshot-watch: job " + jobId + " finished with " + survivors
+            + " Chrome process(es) of its capture still alive after close (exit "
+            + Main.EXIT_CLEANUP_UNCONFIRMED + "; the image was written; "
+            + jobs + " such job(s) since start)";
+        System.err.println(line);
+        return line;
     }
 
     private static void requirePng(Path rendered) throws IOException, JobFailure {

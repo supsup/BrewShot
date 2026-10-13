@@ -152,8 +152,13 @@ if (left.liveProcessObserved()) { log.warn("still alive: {}", left.livePids()); 
 
 `brewshot verify` and the watch worker do not set exit 6. `verify` keeps its
 own receipt codes and reports a surviving process only through the shutdown
-line at exit. The worker prints the per-capture line and treats a rendered job
-as rendered.
+line at exit. The worker treats a rendered job as rendered: the image is
+published and the job is filed as finished, but not silently. After the
+per-capture line it logs one more, `brewshot-watch: job <id> finished with N
+Chrome process(es) of its capture still alive after close (...)`, and keeps a
+count of such jobs since start. In the image, tini (pid 1) reaps exited helpers
+and the report classifies zombies separately, so a 6 there means a Chrome that
+may really still be running, not an unreaped one.
 
 In the container image, BrewShot runs as fixed UID 10001. A `0600` sidecar may
 therefore be unreadable to a different host UID by design; inspect it through a

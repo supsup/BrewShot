@@ -12,7 +12,8 @@
   process alive prints nothing about cleanup. One that does gets a stderr line naming the
   pid(s) with a `ps -p` command, **exit 6** in place of 0 (the output is written; a run that
   already failed keeps its own code), and a `cleanup` object in `--json` (`state`,
-  `livePids`, `liveWithoutPid`, `exitedUnreapedPids`, `profile`, `profileRemoved`, `reason`).
+  `liveProcessObserved`, `livePids`, `liveWithoutPid`, `exitedUnreapedPids`, `profile`,
+  `profileRemoved`, `reason`).
   The four states are `released`, `profile-kept`, `profile-not-removed` and
   `process-unconfirmed`; a kept profile is quiet and is never reported as `released`, and a
   profile that should have been removed and was not gets its own line. Library callers read
@@ -22,7 +23,8 @@
   and were still alive afterwards", "reached without a SIGKILL being sent to their launched
   tree", and ends with the pids); exited-but-unreaped (zombie) processes are listed
   separately and are not counted as alive (Linux, from `/proc`); the watch worker accepts
-  exit 6 as a rendered job. Not changed: which signals are sent, the waits, the release
+  exit 6 as a rendered job, logs one line per such job with the job id and the number of
+  processes still alive, and counts them. Not changed: which signals are sent, the waits, the release
   gates and when a profile is deleted. `brewshot verify` does not set exit 6.
 - **Every launch now gets the exact CSS viewport it asked for** (plan 3f4bc3c7). Chrome's new
   headless mode treats `--window-size` as the outer window, so on Chrome 155 a default
