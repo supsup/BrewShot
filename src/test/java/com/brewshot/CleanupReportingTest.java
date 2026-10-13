@@ -50,6 +50,7 @@ final class CleanupReportingTest {
     @AfterEach
     void unpinTheZombieProbe() {
         BrewShot.exitedButUnreapedProbeForTests = null;
+        BrewShot.orphanSweepForTests = null;
     }
 
     /// A process with a READABLE pid, which the fakes in AbandonedReportTruthTest do not have.
@@ -373,6 +374,131 @@ final class CleanupReportingTest {
         assertEquals(CleanupOutcome.State.PROCESS_UNCONFIRMED, asLive.state());
         assertEquals(List.of(424205L), asLive.livePids());
         assertEquals(List.of(), asLive.exitedUnreapedPids());
+    }
+
+    // -- the orphan arm: a dead tree with an argv-matched survivor ----------------------------
+
+    /// A process the argv sweep matched and signalled, as the handle the sweep returns: alive
+    /// until told otherwise, with a readable pid, no tree of its own. Nothing in the report
+    /// signals it; the sweep already did, and this one survived that.
+    private static final class LiveHandle implements ProcessHandle {
+        private final long pid;
+        private volatile boolean alive = true;
+
+        LiveHandle(long pid) { this.pid = pid; }
+
+        void die() { alive = false; }
+
+        @Override public long pid() { return pid; }
+        @Override public java.util.Optional<ProcessHandle> parent() {
+            return java.util.Optional.empty();
+        }
+        @Override public java.util.stream.Stream<ProcessHandle> children() {
+            return java.util.stream.Stream.empty();
+        }
+        @Override public java.util.stream.Stream<ProcessHandle> descendants() {
+            return java.util.stream.Stream.empty();
+        }
+        @Override public ProcessHandle.Info info() {
+            return new ProcessHandle.Info() {
+                @Override public java.util.Optional<String> command() {
+                    return java.util.Optional.empty();
+                }
+                @Override public java.util.Optional<String> commandLine() {
+                    return java.util.Optional.empty();
+                }
+                @Override public java.util.Optional<String[]> arguments() {
+                    return java.util.Optional.empty();
+                }
+                @Override public java.util.Optional<java.time.Instant> startInstant() {
+                    return java.util.Optional.empty();
+                }
+                @Override public java.util.Optional<java.time.Duration> totalCpuDuration() {
+                    return java.util.Optional.empty();
+                }
+                @Override public java.util.Optional<String> user() {
+                    return java.util.Optional.empty();
+                }
+            };
+        }
+        @Override public java.util.concurrent.CompletableFuture<ProcessHandle> onExit() {
+            return new java.util.concurrent.CompletableFuture<>();
+        }
+        @Override public boolean supportsNormalTermination() { return true; }
+        @Override public boolean destroy() { return false; }
+        @Override public boolean destroyForcibly() { return false; }
+        @Override public boolean isAlive() { return alive; }
+        @Override public int compareTo(ProcessHandle other) {
+            return Long.compare(pid, other.pid());
+        }
+    }
+
+    @Test
+    void aDeadTreeWithAnArgvMatchedSurvivorIsUnconfirmedAndNamesIt(@TempDir Path dir)
+            throws Exception {
+        // THE ORPHAN ARM (review brewshot/740 R2). Chrome's launcher re-execs and spawns helpers;
+        // one reparented before the first tree snapshot is in no handle the lease holds, and only
+        // the argv sweep (keyed on --user-data-dir=<profile>) finds it. With that arm removed from
+        // cleanupOutcome, a dead tree plus a live orphan read as a quiet profile-kept and exit 0,
+        // which is the dangerous direction; the whole suite stayed green over that mutant.
+        // The sweep itself SIGKILLs what it matches, so a real survivor of it cannot be arranged:
+        // the seam stands in for the sweep and answers with one handle that is still alive.
+        Path profile = Files.createDirectories(dir.resolve("brewshot-orphaned"));
+        PidProcess chrome = new PidProcess(424206, false, false);   // exited before cleanup ran
+        LiveHandle orphan = new LiveHandle(424207);
+        List<Path> swept = new ArrayList<>();
+        BrewShot.orphanSweepForTests = profileDir -> {
+            swept.add(profileDir);
+            return List.of(orphan);
+        };
+        BrewShot.ResourceLease lease = BrewShot.registerContainedLaunchLeaseForTests(
+            chrome, profile, CleanupReportingTest::deleteTree);
+        CleanupOutcome outcome;
+        CleanupOutcome afterTheOrphanExits;
+        try {
+            lease.cleanup(false);
+            assertEquals(List.of(profile), swept,
+                "fixture guard: the sweep must have run once, for this profile");
+            assertFalse(chrome.isAlive(), "fixture guard: the launched tree must be dead");
+            assertTrue(lease.isOwned(), "fixture guard: a surviving orphan must keep the lease");
+            assertTrue(Files.exists(profile), "fixture guard: ... and keep its profile");
+
+            outcome = lease.cleanupOutcome();
+            // Liveness is read NOW, not remembered from the pass: once the orphan is gone the same
+            // lease is a kept profile whose reason says what was alive when cleanup last ran.
+            orphan.die();
+            afterTheOrphanExits = lease.cleanupOutcome();
+        } finally {
+            BrewShot.orphanSweepForTests = null;
+            orphan.die();
+            // Drain: the sweep runs once per lease, so this pass sees a dead tree and no orphan
+            // gate, proves release (test proof) and removes the profile.
+            lease.cleanup(false);
+        }
+        assertFalse(lease.isOwned(), "fixture guard: the drain must have released the lease");
+        assertFalse(Files.exists(profile), "fixture guard: the drain must have removed the profile");
+
+        assertEquals(CleanupOutcome.State.PROCESS_UNCONFIRMED, outcome.state(), outcome.toString());
+        assertEquals(List.of(424207L), outcome.livePids(),
+            "the ORPHAN's pid, not the dead launch's: " + outcome);
+        assertEquals(0, outcome.liveWithoutPid(), outcome.toString());
+        assertEquals(List.of(), outcome.exitedUnreapedPids(), outcome.toString());
+        assertTrue(outcome.liveProcessObserved());
+        assertTrue(outcome.failed());
+        assertTrue(outcome.warning().contains("pid 424207"), outcome.warning());
+        assertTrue(outcome.warning().contains("(check with: ps -p 424207)"), outcome.warning());
+        assertFalse(outcome.warning().contains("424206"),
+            "a dead process must not be named as alive: " + outcome.warning());
+        assertTrue(outcome.reason().contains("still observed alive after cleanup"), outcome.reason());
+        assertEquals(Main.EXIT_CLEANUP_UNCONFIRMED, Main.exitCodeAfterCleanup(
+            0, outcome, new PrintStream(OutputStream.nullOutputStream())));
+
+        assertEquals(CleanupOutcome.State.PROFILE_KEPT, afterTheOrphanExits.state(),
+            afterTheOrphanExits.toString());
+        assertEquals(List.of(), afterTheOrphanExits.livePids());
+        assertNull(afterTheOrphanExits.warning());
+        assertTrue(afterTheOrphanExits.reason().contains("still alive when cleanup last ran"),
+            afterTheOrphanExits.reason());
     }
 
     @Test

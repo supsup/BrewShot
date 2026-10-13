@@ -4262,6 +4262,8 @@ public final class BrewShot implements AutoCloseable {
      */
     private static List<ProcessHandle> sweepOrphansByProfilePath(
             Path profileDir, Deadline deadline) {
+        java.util.function.Function<Path, List<ProcessHandle>> sweep = orphanSweepForTests;
+        if (sweep != null) { return sweep.apply(profileDir); }
         String needle;
         try { needle = profileDir.toAbsolutePath().toString(); }
         catch (RuntimeException ignored) { return List.of(); }
@@ -4288,6 +4290,15 @@ public final class BrewShot implements AutoCloseable {
         }
         return orphans;
     }
+
+    /// TEST-ONLY seam (review brewshot/740 R2): stands in for the argv sweep above so the orphan
+    /// arm of cleanupOutcome can be driven with no reparented process on the host. The real sweep
+    /// enumerates every process and SIGKILLs what it matches, so a SURVIVOR of it cannot be
+    /// arranged from a test. The function is given the profile path and returns what the sweep
+    /// "found and signalled"; the result is recorded as orphanHandles exactly as a real one is,
+    /// and the reap, the gates and the delete are untouched. Null by default and written only by
+    /// tests; the same shape as exitedButUnreapedProbeForTests.
+    static volatile java.util.function.Function<Path, List<ProcessHandle>> orphanSweepForTests;
 
     private static boolean commandLineContains(ProcessHandle handle, String needle) {
         try {

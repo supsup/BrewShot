@@ -66,8 +66,35 @@ public final class Main {
         }
     }
 
+    /**
+     * TEST-ONLY seam (review brewshot/740 R1): stands in for the two {@code BrewShot.launch}
+     * calls in {@link #runCapture}, so the CLI can be driven from {@link #run} to its exit code
+     * over a scripted session with no Chrome on the host. While it is set the "no Chrome found"
+     * check is skipped as well: the seam IS the browser. Null by default and written only by
+     * tests, the same shape as {@code BrewShot.exitedButUnreapedProbeForTests}.
+     */
+    @FunctionalInterface
+    interface SessionLauncher {
+        BrewShot launch(int width, int height, Integer devicePixelRatio) throws java.io.IOException;
+    }
+
+    static volatile SessionLauncher sessionLauncherForTests;
+
     /** Testable entry: parse, shoot, return the exit code. Never calls System.exit. */
     static int run(String[] rawArgs) throws Exception {
+        return run(rawArgs, null);
+    }
+
+    /**
+     * {@link #run(String[])} for a caller that embeds the CLI in-process and wants the typed
+     * cleanup outcome as well as the exit code: the watch worker counts survivors from it rather
+     * than re-parsing stderr. The observer is handed the SAME snapshot the manifest and the exit
+     * code are derived from, just before the exit code is decided; null when no browser was
+     * launched. It is not called when the capture threw: that caller gets the failure, and the
+     * stderr line still names any survivor.
+     */
+    static int run(String[] rawArgs, java.util.function.Consumer<CleanupOutcome> cleanupObserver)
+            throws Exception {
         CleanupWitness witness = new CleanupWitness();
         int code;
         try {
@@ -82,6 +109,7 @@ public final class Main {
             }
             throw failure;
         }
+        if (cleanupObserver != null) { cleanupObserver.accept(witness.settle()); }
         return exitCodeAfterCleanup(code, witness.settle(), System.err);
     }
 
@@ -351,7 +379,8 @@ public final class Main {
             }
         }
 
-        if (!BrewShot.available()) {
+        SessionLauncher launcher = sessionLauncherForTests;
+        if (launcher == null && !BrewShot.available()) {
             System.err.println("brewshot: no Chrome/Chromium found (set BREWSHOT_CHROME)");
             return 3;
         }
@@ -363,9 +392,11 @@ public final class Main {
         long captureElapsedMs = 0;
         String timezoneApplied = null;
         Integer dprApplied = null;
-        try (BrewShot shot = devicePixelRatio == null
-                ? BrewShot.launch(width, height)
-                : BrewShot.launch(width, height, devicePixelRatio)) {
+        try (BrewShot shot = launcher != null
+                ? launcher.launch(width, height, devicePixelRatio)
+                : devicePixelRatio == null
+                    ? BrewShot.launch(width, height)
+                    : BrewShot.launch(width, height, devicePixelRatio)) {
             witness.shot = shot;
             for (String[] h : headers) { shot.header(h[0], h[1]); }
             for (String[] c : cookies) { shot.cookie(c[0], c[1], c[2]); }
