@@ -345,12 +345,55 @@ class SvgIntrinsicSizeTest {
     }
 
     @Test
-    void aQuoteInsideAnInternalSubsetProcessingInstructionIsAKnownLimit() {
-        // F5 (review brewshot 729, NIT, behaviour deliberately NOT changed on this branch):
-        // the DOCTYPE skipper treats the apostrophe in <?pi it's ?> as the start of a
-        // quoted literal. Characterises today's answer, a named refusal; a fix flips this.
-        String message = refusal(
+    void aQuoteInsideAnInternalSubsetProcessingInstructionDoesNotOpenALiteral()
+            throws Exception {
+        // F5 (review brewshot 729): the apostrophe in <?pi it's ?> used to open a "quoted
+        // literal" that ran to the end of the prefix, so this was refused.
+        SvgIntrinsicSize.Size parsed = size(
             "<!DOCTYPE svg [ <?pi it's ?> ]><svg width=\"100\" height=\"50\"/>");
-        assertTrue(message.contains("DOCTYPE"), message);
+        assertEquals(100, parsed.width());
+        assertEquals(50, parsed.height());
+    }
+
+    @Test
+    void aCraftedInternalSubsetCannotLetALaterSvgStandInForTheRoot() throws Exception {
+        // F5, the wrong-answer case: the PI's apostrophe paired with one in the root's
+        // content, the "]>" after it closed the DOCTYPE, and the 9x9 svg was read as the
+        // root. The PI is now opaque, so the REAL root is found: 100x50, never 9x9.
+        SvgIntrinsicSize.Size parsed = size("<!DOCTYPE svg [ <?pi a'b ?> ]>"
+            + "<svg width=\"100\" height=\"50\"><desc>'</desc> ]>"
+            + "<svg width=\"9\" height=\"9\"/></svg>");
+        assertEquals(100, parsed.width());
+        assertEquals(50, parsed.height());
+        // The same with a comment holding the apostrophe (already opaque; kept as the twin).
+        SvgIntrinsicSize.Size commented = size("<!DOCTYPE svg [ <!-- a'b --> ]>"
+            + "<svg width=\"100\" height=\"50\"><desc>'</desc> ]>"
+            + "<svg width=\"9\" height=\"9\"/></svg>");
+        assertEquals(100, commented.width());
+    }
+
+    @Test
+    void aPlainInternalSubsetWithQuotedLiteralsStillParses() throws Exception {
+        // Control: no PI. Quote tracking still matters here: the entity values hold a ']'
+        // and a '>' that must not end the subset or the DOCTYPE.
+        SvgIntrinsicSize.Size parsed = size("<!DOCTYPE svg SYSTEM \"x.dtd\" [\n"
+            + "  <!ENTITY a \"]>\">\n  <!ENTITY b 'it''s'>\n  <!ATTLIST svg w CDATA \"1\">\n"
+            + "]>\n<svg width=\"320\" height=\"200\"/>");
+        assertEquals(320, parsed.width());
+        assertEquals(200, parsed.height());
+    }
+
+    @Test
+    void anInternalSubsetThatNeverClosesIsANamedRefusal() {
+        // No size is ever produced from an undelimited subset: each opaque span or literal
+        // that does not close within the prefix is refused by name.
+        assertTrue(refusal("<!DOCTYPE svg [ <!ENTITY a \"x\"> <svg width=\"1\" height=\"1\"/>")
+            .contains("a DOCTYPE before the root element does not end"));
+        assertTrue(refusal("<!DOCTYPE svg [ <?pi never closed ]><svg width=\"1\" height=\"1\"/>")
+            .contains("a processing instruction before the root element does not end"));
+        assertTrue(refusal("<!DOCTYPE svg [ <!-- never closed ]><svg width=\"1\" height=\"1\"/>")
+            .contains("a comment before the root element does not end"));
+        assertTrue(refusal("<!DOCTYPE svg [ <!ENTITY a \"open ]><svg width=\"1\" height=\"1\"/>")
+            .contains("a DOCTYPE before the root element does not end"));
     }
 }

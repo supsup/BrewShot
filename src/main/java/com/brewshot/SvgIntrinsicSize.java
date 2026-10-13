@@ -507,7 +507,17 @@ final class SvgIntrinsicSize {
         return end + terminator.length();
     }
 
-    /** Skip to the '>' that closes a DOCTYPE, across quoted literals and an internal subset. */
+    /**
+     * Skip to the '>' that closes a DOCTYPE, across quoted literals and an internal subset.
+     *
+     * <p>Comments and processing instructions are opaque spans, skipped whole BEFORE any
+     * quote or bracket is looked at: their text is not markup, so an apostrophe in
+     * {@code <?pi it's ?>} must not open a "literal" that swallows the real root and lets a
+     * later {@code <svg>} stand in for it (review brewshot 729 F5: a 100x50 root was read
+     * as 9x9). Quote tracking still applies to the remaining text, where a quoted entity
+     * value may hold a {@code ]} or {@code >}. A span or literal that does not close within
+     * the prefix is a named refusal, never a size.
+     */
     private static int afterDoctype(String text, int from) throws Undetermined {
         int depth = 0;
         int cursor = from;
@@ -516,6 +526,10 @@ final class SvgIntrinsicSize {
             char current = text.charAt(cursor);
             if (text.startsWith("<!--", cursor)) {
                 cursor = after(text, "-->", cursor + 4, "comment");
+                continue;
+            }
+            if (text.startsWith("<?", cursor)) {
+                cursor = after(text, "?>", cursor + 2, "processing instruction");
                 continue;
             }
             if (current == '"' || current == '\'') {
