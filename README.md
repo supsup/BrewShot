@@ -98,9 +98,15 @@ nothing new.
 Limits, stated: only a local file whose name ends `.svg` (case-insensitive) is read;
 an `http(s)://` or `file://` URL to an SVG is not, and neither is `.svgz`. Only the
 root start tag in the first 1 MiB is inspected, as UTF-8 or BOM-marked UTF-16, with no
-entity expansion and no DTD fetch. A size set purely by CSS (a `style` attribute or a
+entity expansion and no DTD fetch. A `width`, `height` or `viewBox` number longer
+than 64 characters (a whole `viewBox` longer than 272) is refused by name before it is
+parsed, so a hostile attribute costs a length check, not a hang. A value quoted back in
+a stderr reason is cut to its first 32 characters plus its total length, with control
+characters shown as escapes such as `\x1b`, so a file cannot write terminal escape
+sequences through the notice. A size set purely by CSS (a `style` attribute or a
 stylesheet rule on the root) is not seen: Chrome honours it, so pass `--size WxH` for
-such a file. The library API is unchanged; `BrewShot.launch(width, height)` still takes
+such a file; a root `style` attribute is at least named, as "a style attribute is
+present and was not read" at the end of the notice. The library API is unchanged; `BrewShot.launch(width, height)` still takes
 the size you give it, and `brewshot verify` manifests still take explicit
 `width`/`height`.
 

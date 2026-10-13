@@ -19,7 +19,12 @@
   `--size WxH`, every page input, the library API and `brewshot verify` manifests are
   unchanged. The reader is a bounded hand-written scanner over the first 1 MiB (no XML
   parser, no entity expansion, no DTD fetch), so the runtime stays zero-dependency and
-  the PNG path native-clean.
+  the PNG path native-clean. A `width`, `height` or `viewBox` number over 64 characters
+  is refused by name before parsing, and the length pattern is linear, so one hostile
+  attribute cannot stall the CLI before Chrome starts. Any file value echoed in a
+  stderr reason is bounded to 32 characters plus its total length, with control
+  characters shown as visible escapes. A root `style` attribute, which is not read, is
+  named in the notice.
 
 - **Every launch now gets the exact CSS viewport it asked for** (plan 3f4bc3c7). Chrome's new
   headless mode treats `--window-size` as the outer window, so on Chrome 155 a default
