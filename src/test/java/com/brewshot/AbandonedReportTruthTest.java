@@ -51,6 +51,32 @@ final class AbandonedReportTruthTest {
         BrewShot.reattachLeasesForTests(inherited);
     }
 
+    /// The control for the two hooks above: a lease registered BEFORE this class took the
+    /// registry (as sixteen classes of real launches had, in the land gate) must not be counted
+    /// against a test here, and must still be there for the real shutdown hook afterwards.
+    @Test
+    void anInheritedLeaseIsNeitherCountedHereNorLost(@TempDir Path dir) throws Exception {
+        // Give the registry back first, so the polluter is registered the way an earlier class
+        // would have left it, then take it again the way @BeforeEach does.
+        BrewShot.reattachLeasesForTests(inherited);
+        UndyingProcess polluter = new UndyingProcess();
+        BrewShot.registerContainedLaunchLeaseForTests(polluter, dir.resolve("inherited"), d -> { });
+        List<BrewShot.ResourceLease> taken = BrewShot.detachLiveLeasesForTests();
+        assertTrue(taken.size() >= 1, "the polluter was registered and must be detached");
+        inherited = List.of();
+        try {
+            List<UndyingProcess> live = registerUndying(1, dir);
+            Report r = runShutdownAndParse(live);
+            assertEquals(1, r.remaining(),
+                "only this test's lease may be counted; the inherited one was detached: " + r.text());
+        } finally {
+            // Hand the polluter back and let the ordinary cleanup reap it once it can die.
+            BrewShot.reattachLeasesForTests(taken);
+            polluter.die();
+            BrewShot.runJvmShutdownCleanupForTests();
+        }
+    }
+
     /// SHUTDOWN_CLEANUP_TIMEOUT_MS, mirrored so the clock assertions name the budget they test.
     private static final long BUDGET_MILLIS = 5_000L;
 
