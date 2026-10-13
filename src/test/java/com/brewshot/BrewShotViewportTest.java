@@ -2,6 +2,7 @@ package com.brewshot;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.file.Files;
@@ -65,6 +66,37 @@ class BrewShotViewportTest {
             assertEquals(Integer.valueOf(2), shot.appliedDevicePixelRatio());
             assertEquals(1, shot.deviceMetricsApplicationCountForTests(),
                 "DPR and viewport ride one override, applied once");
+        }
+    }
+
+    @Test
+    void aPageThatRedefinesItsInnerSizeIsRefusedBeforeCapture(@TempDir Path directory)
+            throws Exception {
+        TestChrome.requireChromeOrLoudSkip("BrewShotViewportTest");
+        Path honest = directory.resolve("honest.html");
+        Files.writeString(honest, PAGE.replace("viewport", "honest"));
+        // Review 696 (Confluence): a mutant whose witness never refuses survived the first
+        // suite. The refusal needs no fake: a page can redefine window.innerWidth itself, and
+        // then it is the page, not the override, that is refused. That also documents the
+        // limit: a page can refuse its own capture.
+        String lying = "<!doctype html><script>"
+            + "Object.defineProperty(window,'innerWidth',{get:function(){return 1;}});"
+            + "</script><body>lying</body>";
+        try (BrewShot shot = BrewShot.launch(640, 360)) {
+            IllegalStateException refusal =
+                assertThrows(IllegalStateException.class, () -> shot.html(lying));
+            assertTrue(refusal.getMessage().contains("viewport override mismatch"),
+                refusal.getMessage());
+            assertTrue(refusal.getMessage().contains("requested 640x360, page reported 1x360"),
+                refusal.getMessage());
+            assertNull(shot.appliedViewport(),
+                "null-before-throw: no stale success is observable after a refusal");
+
+            // The override is intact: a real navigation (a new window object, so the lie is
+            // gone) to an honest page is witnessed again. html() would NOT do: it replaces the
+            // document but keeps the window, lie included, so the refusal stands there too.
+            shot.open(honest.toUri().toString());
+            assertEquals("640x360", shot.appliedViewport());
         }
     }
 
