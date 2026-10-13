@@ -173,4 +173,30 @@ class MainManifestTest {
                 null, out, new Object(), null, true, 12, null, null));
         assertEquals("known-good-old-manifest", Files.readString(manifest));
     }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void viewportSourceIsRecordedOnlyWhenTheViewportWasChosenForAnSvg(@TempDir Path directory)
+            throws Exception {
+        Path out = directory.resolve("shot.png");
+        Files.write(out, new byte[] {1, 2, 3});
+
+        Path chosen = directory.resolve("chosen.json");
+        Main.writeManifest(chosen, "diagram.svg", "file", 1000, 780, 25,
+            null, out, null, null, true, 12, null, null,
+            null, null, null, null, null, null, null, "svg-width-height");
+        Map<String, Object> chosenRoot =
+            (Map<String, Object>) MiniJson.parse(Files.readString(chosen));
+        assertEquals("1000x780", chosenRoot.get("viewport"));
+        assertEquals("svg-width-height", chosenRoot.get("viewportSource"));
+
+        Path legacy = directory.resolve("legacy.json");
+        Main.writeManifest(legacy, "page.html", "file", 640, 480, 25,
+            null, out, null, null, true, 12, null, null,
+            null, null, null, null, null, null, null, null);
+        Map<String, Object> legacyRoot =
+            (Map<String, Object>) MiniJson.parse(Files.readString(legacy));
+        assertFalse(legacyRoot.containsKey("viewportSource"),
+            "an explicit --size or a page input must keep the legacy receipt shape");
+    }
 }

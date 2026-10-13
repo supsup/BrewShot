@@ -129,6 +129,21 @@ Or straight from a bake step that has the HTML in hand:
 render-docs | build/brewshot - -o preview.png
 ```
 
+Sam's diagrams are SVG files, and he used to read `width` and `height` out of each
+one to pass `--size` (or get a small figure in the corner of a 1280x900 canvas). A
+local `.svg` now sizes its own viewport from the root `width`/`height`, else the
+`viewBox`:
+
+```
+build/brewshot docs/arch.svg -o arch.png                # PNG is the SVG's own size
+build/brewshot docs/arch.svg -o arch.png --size auto    # same, but exit 2 if the file states no size
+```
+
+Without `--size`, an SVG that states no usable size falls back to 1280x900 and stderr
+says why; in a pipeline prefer `--size auto`, which refuses instead. An explicit
+`--size WxH` is honoured unchanged. Details and limits: README, "SVG files size their
+own viewport".
+
 Since 0.9.0 the recording lane is on the CLI too — Sam's bake can film an
 animation without writing a line of Java:
 

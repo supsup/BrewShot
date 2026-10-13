@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+- **A local `.svg` input now sizes its own viewport; `--size auto` asks for that by
+  name** (plan 982dcab9). Shooting an SVG used to mean parsing its `width`/`height` by
+  hand for `--size`, or getting a small drawing in the corner of the 1280x900 default.
+  With no `--size`, the CLI now reads the root `<svg>` start tag before Chrome starts
+  and uses its absolute `width` and `height`, else its `viewBox` size, else one stated
+  dimension plus the viewBox aspect ratio; fractions round up. A 1000x780 SVG renders
+  to a 1000x780 PNG (times `--dpr`). stderr names the choice and `--json` records it as
+  `viewportSource`. When the file states no usable size (no attributes, a font- or
+  viewport-relative unit, a percentage other than 100%, a size over the viewport
+  ceiling, CSS-only sizing is not read) the default 1280x900 is used and stderr says so
+  and why; `--size auto` refuses instead (usage error, exit 2, before Chrome and before
+  any artifact), and is refused for a URL, stdin or a non-`.svg` file. **Behaviour
+  change:** an `.svg` file shot without `--size` no longer gets a 1280x900 canvas when
+  it states a size; pass `--size 1280x900` to keep the old output. An explicit
+  `--size WxH`, every page input, the library API and `brewshot verify` manifests are
+  unchanged. The reader is a bounded hand-written scanner over the first 1 MiB (no XML
+  parser, no entity expansion, no DTD fetch), so the runtime stays zero-dependency and
+  the PNG path native-clean. A `width`, `height` or `viewBox` number over 64 characters
+  is refused by name before parsing, and the length pattern is linear, so one hostile
+  attribute cannot stall the CLI before Chrome starts. Any file value echoed in a
+  stderr reason is bounded to 32 characters plus its total length, with control
+  characters shown as visible escapes. A root `style` attribute, which is not read, is
+  named in the notice.
+
 - **Every launch now gets the exact CSS viewport it asked for** (plan 3f4bc3c7). Chrome's new
   headless mode treats `--window-size` as the outer window, so on Chrome 155 a default
   `launch(640, 360)` (and `--size 640x360` on the CLI) painted a 640x273 page, 87 px short; only
