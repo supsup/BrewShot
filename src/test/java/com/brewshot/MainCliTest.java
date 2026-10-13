@@ -491,6 +491,21 @@ class MainCliTest {
     }
 
     @Test
+    void aStyleAttributeOnTheSvgRootIsNamedInTheViewportNotice(@TempDir Path directory)
+            throws Exception {
+        // Review brewshot 729 F3: the reported size may not be the drawn size when the root
+        // carries a style attribute, so the notice says it was not read.
+        Path styled = directory.resolve("styled.svg");
+        Files.writeString(styled, "<svg " + SVG_NS
+            + " width=\"100\" height=\"100\" style=\"width:800px;height:600px\"/>");
+        Main.Viewport viewport = Main.resolveAutoViewport(false, "file", styled.toString());
+        assertEquals(100, viewport.width());
+        assertTrue(viewport.notice().contains("viewport 100x100")
+            && viewport.notice().endsWith("; a style attribute is present and was not read"),
+            viewport.notice());
+    }
+
+    @Test
     void nonSvgInputsKeepTheDefaultViewportUntouched(@TempDir Path directory)
             throws Exception {
         Path page = directory.resolve("page.html");

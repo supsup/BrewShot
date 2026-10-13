@@ -1333,7 +1333,8 @@ public final class Main {
             SvgIntrinsicSize.Size size = SvgIntrinsicSize.read(Path.of(input));
             return new Viewport(size.width(), size.height(), size.source().label(),
                 "viewport " + size.width() + "x" + size.height() + " from "
-                    + size.source().description() + " of " + input);
+                    + size.source().description() + " of " + input
+                    + (size.styleNotRead() ? "; " + SvgIntrinsicSize.STYLE_NOT_READ : ""));
         } catch (SvgIntrinsicSize.Undetermined undetermined) {
             reason = undetermined.getMessage();
         } catch (java.io.IOException | RuntimeException unreadable) {

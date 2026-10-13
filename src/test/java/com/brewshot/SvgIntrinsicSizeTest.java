@@ -1,10 +1,13 @@
 package com.brewshot;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTimeout;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import org.junit.jupiter.api.Test;
@@ -223,5 +226,128 @@ class SvgIntrinsicSizeTest {
         Files.writeString(bigBody, "<svg width=\"300\" height=\"120\"><!--"
             + "x".repeat(SvgIntrinsicSize.MAX_PREFIX_BYTES) + "--></svg>");
         assertEquals(300, SvgIntrinsicSize.read(bigBody).width());
+    }
+
+    // ---- review brewshot 729: attribute bounds, sanitised echo, style notice ----------
+
+    /** 200 ms: the bound the earlier pattern cannot meet (13 s for this input, measured). */
+    private static final Duration LINEAR_BOUND = Duration.ofMillis(200);
+
+    private static boolean hasControlCharacter(String text) {
+        return text.chars().anyMatch(c -> c < 0x20 || (c >= 0x7f && c <= 0x9f));
+    }
+
+    @Test
+    void aHugeDigitRunWithOneBadCharacterIsRefusedByTheLengthBoundQuickly(
+            @TempDir Path directory) throws Exception {
+        // F1: 40000 digits then '!'. The earlier pattern backtracked quadratically here
+        // (13030 ms through read(Path), measured with a javac probe); it must now be a
+        // named refusal well inside the bound, through the real file reader.
+        Path file = directory.resolve("digits.svg");
+        Files.writeString(file, "<svg width=\"" + "1".repeat(40_000) + "!\" height=\"10\"/>");
+        String message = assertTimeout(LINEAR_BOUND, () -> assertThrows(
+            SvgIntrinsicSize.Undetermined.class, () -> SvgIntrinsicSize.read(file))
+            .getMessage());
+        assertTrue(message.contains("longer than the "
+            + SvgIntrinsicSize.MAX_ATTRIBUTE_CHARS + "-character limit"), message);
+        assertTrue(message.contains("(40001 characters)") && message.length() < 200, message);
+
+        // The same attack on a viewBox number, and on the whole viewBox.
+        String number = refusal("<svg viewBox=\"0 0 " + "1".repeat(40_000) + "! 5\"/>");
+        assertTrue(number.contains("longer than the "), number);
+        String whole = refusal("<svg viewBox=\"" + "1 ".repeat(20_000) + "\"/>");
+        assertTrue(whole.contains("viewBox is longer than the "
+            + SvgIntrinsicSize.MAX_VIEWBOX_CHARS + "-character limit"), whole);
+    }
+
+    @Test
+    void theLengthPatternItselfIsLinearOnAHugeDigitRun() {
+        // F1, second half: the bound is not the only guard. The pattern alone, on input
+        // far past the bound, must fail fast (possessive, unambiguous digit runs).
+        String hostile = "1".repeat(1_000_000) + "!";
+        assertFalse(assertTimeout(LINEAR_BOUND,
+            () -> SvgIntrinsicSize.LENGTH.matcher(hostile).matches()));
+        assertFalse(assertTimeout(LINEAR_BOUND,
+            () -> SvgIntrinsicSize.LENGTH.matcher("1." + hostile).matches()));
+        assertFalse(assertTimeout(LINEAR_BOUND,
+            () -> SvgIntrinsicSize.LENGTH.matcher("1e" + hostile).matches()));
+    }
+
+    @Test
+    void aValidNumberParsesUpToTheBoundAndIsRefusedPastIt() throws Exception {
+        // 64 characters exactly: still a length (leading zeros make it 100).
+        String atBound = "0".repeat(SvgIntrinsicSize.MAX_ATTRIBUTE_CHARS - 3) + "100";
+        assertEquals(100, size("<svg width=\"" + atBound + "\" height=\"10\"/>").width());
+        assertEquals(100, size("<svg viewBox=\"0 0 " + atBound + " 10\"/>").width());
+        // One past the bound, and a valid 200-digit number: refused BY THE BOUND, by name.
+        String pastBound = "0" + atBound;
+        assertTrue(refusal("<svg width=\"" + pastBound + "\" height=\"10\"/>")
+            .contains("-character limit"));
+        String twoHundred = refusal("<svg width=\"" + "1".repeat(200) + "\" height=\"10\"/>");
+        assertTrue(twoHundred.contains("longer than the 64-character limit")
+            && twoHundred.contains("(200 characters)"), twoHundred);
+        // Surrounding whitespace does not count against the bound.
+        assertEquals(100, size("<svg width=\"   " + atBound + "   \" height=\"10\"/>").width());
+    }
+
+    @Test
+    void echoedValuesAreBoundedAndCarryNoControlCharacters() {
+        // F2: an OSC title sequence (ESC ] 0 ; x BEL) in the width.
+        String osc = refusal("<svg width=\"\033]0;x\007\" height=\"10\"/>");
+        assertFalse(hasControlCharacter(osc), osc);
+        assertTrue(osc.contains("\\x1b]0;x\\x07"), osc);
+        // C1 controls and a bidi override are made visible too.
+        String c1 = refusal("<svg width=\"1\u009b\u202e2\" height=\"10\"/>");
+        assertFalse(hasControlCharacter(c1), c1);
+        assertTrue(c1.contains("\\x9b") && c1.contains("\\u202e"), c1);
+        // Long and control-laden: bounded and clean on the length-bound path too.
+        String flood = refusal("<svg width=\"" + "\033[2J".repeat(10_000) + "\" height=\"1\"/>");
+        assertFalse(hasControlCharacter(flood), flood);
+        assertTrue(flood.length() < 300 && flood.contains("(40000 characters)"), flood);
+        // Every other echo site: unit, percentage, non-positive (each reached with a leading
+        // control character that trim() removes before matching, so the RAW value still
+        // carries it), viewBox, root name, attribute name.
+        for (String svg : new String[] {
+            "<svg width=\"\0335em\" height=\"1\"/>",
+            "<svg width=\"\03350%\" height=\"1\"/>",
+            "<svg width=\"\033-5\" height=\"1\"/>",
+            "<svg viewBox=\"" + "\033".repeat(300) + "\"/>",
+            "<svg viewBox=\"0 0 1 " + "\0331".repeat(40) + "\"/>",
+            "<" + "a".repeat(5_000) + "/>",
+            "<svg " + "w".repeat(5_000) + "/>",
+            "<svg " + "w".repeat(5_000) + "=1/>"}) {
+            String message = refusal(svg);
+            assertFalse(hasControlCharacter(message), message);
+            assertTrue(message.length() < 300, message);
+        }
+        // The echo itself: a short value is quoted whole; a cut never splits a surrogate.
+        assertEquals("\"50em\"", SvgIntrinsicSize.echo("50em"));
+        String emoji = "1".repeat(SvgIntrinsicSize.MAX_ECHO_CHARS - 1) + "\uD83D\uDE00tail";
+        assertEquals("\"" + "1".repeat(SvgIntrinsicSize.MAX_ECHO_CHARS - 1) + "\"... ("
+            + emoji.length() + " characters)", SvgIntrinsicSize.echo(emoji));
+    }
+
+    @Test
+    void aStyleAttributeOnTheRootIsNamedNotSilentlyIgnored() throws Exception {
+        // F3: Chrome would draw this at 800x600; the reader reports 100x100 and says why it
+        // may be wrong.
+        SvgIntrinsicSize.Size styled = size(
+            "<svg width=\"100\" height=\"100\" style=\"width:800px;height:600px\"/>");
+        assertEquals(100, styled.width());
+        assertTrue(styled.styleNotRead());
+        assertFalse(size("<svg width=\"100\" height=\"100\"/>").styleNotRead());
+        String refused = refusal("<svg style=\"width:800px\"/>");
+        assertTrue(refused.contains("no absolute width or height")
+            && refused.endsWith("; " + SvgIntrinsicSize.STYLE_NOT_READ), refused);
+    }
+
+    @Test
+    void aQuoteInsideAnInternalSubsetProcessingInstructionIsAKnownLimit() {
+        // F5 (review brewshot 729, NIT, behaviour deliberately NOT changed on this branch):
+        // the DOCTYPE skipper treats the apostrophe in <?pi it's ?> as the start of a
+        // quoted literal. Characterises today's answer, a named refusal; a fix flips this.
+        String message = refusal(
+            "<!DOCTYPE svg [ <?pi it's ?> ]><svg width=\"100\" height=\"50\"/>");
+        assertTrue(message.contains("DOCTYPE"), message);
     }
 }

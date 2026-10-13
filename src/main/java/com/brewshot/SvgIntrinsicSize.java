@@ -40,7 +40,13 @@ import java.util.regex.Pattern;
  *
  * <p>Known limit, stated rather than hidden: a size set only by CSS (a {@code style}
  * attribute or a stylesheet rule on the root) is not seen here. Chrome honours it, so
- * such a file can still render at a size other than the one reported.
+ * such a file can still render at a size other than the one reported. A {@code style}
+ * attribute on the root is at least named: the answer says {@link #STYLE_NOT_READ}.
+ *
+ * <p>Bounds on file-supplied text: a width, height or viewBox number longer than
+ * {@link #MAX_ATTRIBUTE_CHARS} characters is refused before any pattern runs, and every
+ * value echoed into a reason goes through {@link #echo}, bounded and with control
+ * characters made visible.
  */
 final class SvgIntrinsicSize {
 
@@ -49,8 +55,32 @@ final class SvgIntrinsicSize {
 
     private static final double CSS_PX_PER_INCH = 96.0;
 
-    private static final Pattern LENGTH = Pattern.compile(
-        "([+-]?(?:[0-9]+\\.?[0-9]*|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?)([A-Za-z%]*)");
+    /**
+     * Longest width, height or viewBox number (after trimming) that is matched at all.
+     * 64 characters is far beyond any length a drawing states; a longer value is refused
+     * by name BEFORE any pattern runs, so an attacker-sized attribute (the reader accepts
+     * up to {@link #MAX_PREFIX_BYTES} of root tag) costs a length check, nothing more.
+     */
+    static final int MAX_ATTRIBUTE_CHARS = 64;
+
+    /** Longest whole viewBox value: four numbers at the bound plus their separators. */
+    static final int MAX_VIEWBOX_CHARS = 4 * MAX_ATTRIBUTE_CHARS + 16;
+
+    /** Characters of an attribute value echoed into a refusal reason. */
+    static final int MAX_ECHO_CHARS = 32;
+
+    /** Appended to the receipt when the root's {@code style} attribute was ignored. */
+    static final String STYLE_NOT_READ = "a style attribute is present and was not read";
+
+    /**
+     * A CSS/SVG length: number, optional exponent, optional unit. Every quantifier is
+     * possessive and the integer/fraction split is unambiguous, so a match attempt is
+     * linear in the input: the earlier {@code [0-9]+\.?[0-9]*} let two digit runs back
+     * off against each other, quadratic on a long digit run with one bad character
+     * (review brewshot 729 F1). Accepts exactly the same strings as that pattern.
+     */
+    static final Pattern LENGTH = Pattern.compile(
+        "([+-]?+(?:[0-9]++(?:\\.[0-9]*+)?+|\\.[0-9]++)(?:[eE][+-]?+[0-9]++)?+)([A-Za-z%]*+)");
 
     private SvgIntrinsicSize() { }
 
@@ -76,8 +106,15 @@ final class SvgIntrinsicSize {
         String description() { return description; }
     }
 
-    /** A determined size in whole CSS pixels. */
-    record Size(int width, int height, Source source) {
+    /**
+     * A determined size in whole CSS pixels. {@code styleNotRead}: the root carries a
+     * {@code style} attribute, which this reader does not interpret and Chrome does.
+     */
+    record Size(int width, int height, Source source, boolean styleNotRead) {
+
+        Size(int width, int height, Source source) {
+            this(width, height, source, false);
+        }
 
         /** The same ceilings verify manifests put on an authored viewport. */
         Size checkedAgainstViewportLimits() throws Undetermined {
@@ -130,12 +167,32 @@ final class SvgIntrinsicSize {
     /** Parse the (prefix of the) document text. Package-private: the unit-test seam. */
     static Size parse(String text) throws Undetermined {
         Map<String, String> attributes = rootSvgAttributes(text);
+        if (!attributes.containsKey("style")) {
+            return resolve(attributes);
+        }
+        // A style attribute can set the size Chrome draws at (review brewshot 729 F3);
+        // it is not read here, so every answer says so rather than stay silent.
+        Size size;
+        try {
+            size = resolve(attributes);
+        } catch (Undetermined undetermined) {
+            throw new Undetermined(undetermined.getMessage() + "; " + STYLE_NOT_READ);
+        }
+        return new Size(size.width(), size.height(), size.source(), true);
+    }
+
+    private static Size resolve(Map<String, String> attributes) throws Undetermined {
         Dimension width = dimension("width", attributes.get("width"));
         Dimension height = dimension("height", attributes.get("height"));
-        double[] viewBox = viewBox(attributes.get("viewBox"));
-        String viewBoxState = attributes.containsKey("viewBox") && viewBox == null
-            ? "its viewBox is not four numbers with a positive width and height"
-            : "it has no viewBox";
+        double[] viewBox = null;
+        String viewBoxState = "it has no viewBox";
+        if (attributes.containsKey("viewBox")) {
+            try {
+                viewBox = viewBox(attributes.get("viewBox"));
+            } catch (Undetermined unusable) {
+                viewBoxState = unusable.getMessage();
+            }
+        }
 
         double resolvedWidth;
         double resolvedHeight;
@@ -180,18 +237,22 @@ final class SvgIntrinsicSize {
             return Dimension.FILLS_VIEWPORT;
         }
         String value = raw.trim();
+        if (value.length() > MAX_ATTRIBUTE_CHARS) {
+            throw new Undetermined("the root <svg> " + name + " is longer than the "
+                + MAX_ATTRIBUTE_CHARS + "-character limit for a length: " + echo(raw));
+        }
         if (value.equalsIgnoreCase("auto")) {
             return Dimension.FILLS_VIEWPORT;
         }
         Matcher matcher = LENGTH.matcher(value);
         if (!matcher.matches()) {
-            throw new Undetermined("the root <svg> " + name + " is not a length: \"" + raw + "\"");
+            throw new Undetermined("the root <svg> " + name + " is not a length: " + echo(raw));
         }
         double number;
         try {
             number = Double.parseDouble(matcher.group(1));
         } catch (NumberFormatException notANumber) {
-            throw new Undetermined("the root <svg> " + name + " is not a length: \"" + raw + "\"");
+            throw new Undetermined("the root <svg> " + name + " is not a length: " + echo(raw));
         }
         String unit = matcher.group(2).toLowerCase(Locale.ROOT);
         if (unit.equals("%")) {
@@ -199,7 +260,7 @@ final class SvgIntrinsicSize {
                 return Dimension.FILLS_VIEWPORT;
             }
             throw new Undetermined("the root <svg> " + name + " is a percentage of the "
-                + "viewport (\"" + raw + "\"), which has no size of its own");
+                + "viewport (" + echo(raw) + "), which has no size of its own");
         }
         double pxPerUnit = switch (unit) {
             case "", "px" -> 1.0;
@@ -209,45 +270,112 @@ final class SvgIntrinsicSize {
             case "q" -> CSS_PX_PER_INCH / 101.6;
             case "pt" -> CSS_PX_PER_INCH / 72.0;
             case "pc" -> CSS_PX_PER_INCH / 6.0;
-            default -> throw new Undetermined("the root <svg> " + name + " uses the unit \""
-                + matcher.group(2) + "\" (\"" + raw + "\"), which only a browser can resolve");
+            default -> throw new Undetermined("the root <svg> " + name + " uses the unit "
+                + echo(matcher.group(2)) + " (" + echo(raw) + "), which only a browser can "
+                + "resolve");
         };
         double px = number * pxPerUnit;
         if (!Double.isFinite(px) || px <= 0) {
-            throw new Undetermined("the root <svg> " + name + " is not a positive length: \""
-                + raw + "\"");
+            throw new Undetermined("the root <svg> " + name + " is not a positive length: "
+                + echo(raw));
         }
         return new Dimension(false, px);
     }
 
-    /** {@code {width, height}} of a usable viewBox, or null when absent or unusable. */
-    private static double[] viewBox(String raw) {
-        if (raw == null) {
-            return null;
+    /**
+     * {@code {width, height}} of a present viewBox; an unusable one throws, and the message
+     * is the clause the caller puts after "and" when it needed the viewBox.
+     */
+    private static double[] viewBox(String raw) throws Undetermined {
+        String unusable = "its viewBox is not four numbers with a positive width and height";
+        String value = raw.trim();
+        if (value.length() > MAX_VIEWBOX_CHARS) {
+            throw new Undetermined("its viewBox is longer than the " + MAX_VIEWBOX_CHARS
+                + "-character limit (" + echo(raw) + ")");
         }
-        String[] parts = raw.trim().split("[\\s,]+");
+        String[] parts = value.split("[\\s,]+");
         if (parts.length != 4) {
-            return null;
+            throw new Undetermined(unusable);
         }
         double[] numbers = new double[4];
         for (int index = 0; index < 4; index++) {
+            if (parts[index].length() > MAX_ATTRIBUTE_CHARS) {
+                throw new Undetermined("its viewBox has a number longer than the "
+                    + MAX_ATTRIBUTE_CHARS + "-character limit (" + echo(parts[index]) + ")");
+            }
             Matcher matcher = LENGTH.matcher(parts[index]);
             if (!matcher.matches() || !matcher.group(2).isEmpty()) {
-                return null;   // not a bare number (a unit suffix such as "100px" included)
+                // not a bare number (a unit suffix such as "100px" included)
+                throw new Undetermined(unusable);
             }
             try {
                 numbers[index] = Double.parseDouble(matcher.group(1));
             } catch (NumberFormatException notANumber) {
-                return null;
+                throw new Undetermined(unusable);
             }
             if (!Double.isFinite(numbers[index])) {
-                return null;
+                throw new Undetermined(unusable);
             }
         }
         if (numbers[2] <= 0 || numbers[3] <= 0) {
-            return null;
+            throw new Undetermined(unusable);
         }
         return new double[] {numbers[2], numbers[3]};
+    }
+
+    /**
+     * A file-supplied value made safe to put in a message that reaches stderr (review
+     * brewshot 729 F2): quoted, at most {@link #MAX_ECHO_CHARS} characters followed by an
+     * ellipsis and the total length, and every control character (below 0x20, 0x7f-0x9f)
+     * and invisible format/separator character (bidi overrides, zero-width, U+2028/9)
+     * replaced by a visible {@code \xNN} (or backslash-u four-hex-digit) escape, so a
+     * file cannot write terminal escape sequences or a multi-megabyte line through a
+     * refusal reason.
+     */
+    static String echo(String raw) {
+        return visible(raw, "\"");
+    }
+
+    /**
+     * {@link #echo} without the quotes, for a name the reason already brackets (the root
+     * element's {@code <name>}, an attribute name). Same bound, same escapes.
+     */
+    static String echoName(String raw) {
+        return visible(raw, "");
+    }
+
+    private static String visible(String raw, String quote) {
+        int keep = raw.length();
+        boolean truncated = keep > MAX_ECHO_CHARS;
+        if (truncated) {
+            keep = MAX_ECHO_CHARS;
+            if (Character.isHighSurrogate(raw.charAt(keep - 1))) {
+                keep--;   // never cut a surrogate pair in half
+            }
+        }
+        StringBuilder out = new StringBuilder(keep + 32).append(quote);
+        for (int index = 0; index < keep; index++) {
+            char character = raw.charAt(index);
+            int type = Character.getType(character);
+            if (character < 0x20 || (character >= 0x7f && character <= 0x9f)) {
+                out.append(String.format(Locale.ROOT, "\\x%02x", (int) character));
+            } else if (type == Character.FORMAT || type == Character.LINE_SEPARATOR
+                    || type == Character.PARAGRAPH_SEPARATOR
+                    || (Character.isSurrogate(character)
+                        && !(Character.isHighSurrogate(character) && index + 1 < keep
+                            && Character.isLowSurrogate(raw.charAt(index + 1)))
+                        && !(Character.isLowSurrogate(character) && index > 0
+                            && Character.isHighSurrogate(raw.charAt(index - 1))))) {
+                out.append(String.format(Locale.ROOT, "\\u%04x", (int) character));
+            } else {
+                out.append(character);
+            }
+        }
+        out.append(quote);
+        if (truncated) {
+            out.append("... (").append(raw.length()).append(" characters)");
+        }
+        return out.toString();
     }
 
     private static int wholePixels(String name, double px) throws Undetermined {
@@ -300,7 +428,8 @@ final class SvgIntrinsicSize {
         String qualifiedName = text.substring(nameStart, cursor);
         String localName = qualifiedName.substring(qualifiedName.lastIndexOf(':') + 1);
         if (!localName.equals("svg")) {
-            throw new Undetermined("the root element is <" + qualifiedName + ">, not <svg>");
+            throw new Undetermined("the root element is <" + echoName(qualifiedName)
+                + ">, not <svg>");
         }
 
         Map<String, String> attributes = new LinkedHashMap<>();
@@ -339,7 +468,7 @@ final class SvgIntrinsicSize {
                 throw unclosedRoot();
             }
             if (text.charAt(cursor) != '=') {
-                throw new Undetermined("the root <svg> attribute " + attributeName
+                throw new Undetermined("the root <svg> attribute " + echoName(attributeName)
                     + " has no value");
             }
             cursor++;
@@ -351,7 +480,7 @@ final class SvgIntrinsicSize {
             }
             char quote = text.charAt(cursor);
             if (quote != '"' && quote != '\'') {
-                throw new Undetermined("the root <svg> attribute " + attributeName
+                throw new Undetermined("the root <svg> attribute " + echoName(attributeName)
                     + " is not quoted");
             }
             int valueEnd = text.indexOf(quote, cursor + 1);
