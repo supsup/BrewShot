@@ -16,6 +16,8 @@ import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -30,6 +32,24 @@ import org.junit.jupiter.api.io.TempDir;
 /// stay wrong. And the counts are read POSITIONALLY, because the phrases around them are satisfied
 /// by any number: an earlier version of this test asserted the phrases and let two mutants through.
 final class AbandonedReportTruthTest {
+
+    // THE REPORT IS OVER A JVM-GLOBAL SET, so this class must own that set while it runs. In the
+    // land gate at d5dc78b707bd (brewshot 700) it ran seventeenth, after sixteen classes of real
+    // launches had left 73 leases retained (dead trees kept for an undeleted profile, the macOS
+    // unproven-release rule), and every "1 remaining" here read 74. In the worktrees it ran first
+    // and was green, which is an order it does not get to assume. Detach what is there, give it
+    // back afterwards so the real shutdown hook still reaps it.
+    private List<BrewShot.ResourceLease> inherited;
+
+    @BeforeEach
+    void ownTheRegistry() {
+        inherited = BrewShot.detachLiveLeasesForTests();
+    }
+
+    @AfterEach
+    void giveTheRegistryBack() {
+        BrewShot.reattachLeasesForTests(inherited);
+    }
 
     /// SHUTDOWN_CLEANUP_TIMEOUT_MS, mirrored so the clock assertions name the budget they test.
     private static final long BUDGET_MILLIS = 5_000L;

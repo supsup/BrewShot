@@ -1290,6 +1290,31 @@ public final class BrewShot implements AutoCloseable {
         }
     }
 
+    /**
+     * Package test seam: move every lease currently in {@link #LIVE} out to the caller and
+     * return them, so a test that asserts on the shutdown report sees ONLY the leases it
+     * registers itself. {@link #LIVE} is JVM-global: on macOS a closed BrewShot whose release
+     * is unproven stays registered (its profile is kept), so after sixteen classes of real
+     * launches the set held 73 such leases and a test expecting "1 remaining" read 74 (brewshot
+     * room 700, the land gate at d5dc78b707bd; the same suite was green when that class ran
+     * first). Pair with {@link #reattachLeasesForTests} in a finally, so the real shutdown hook
+     * still reaps them at JVM exit; nothing is signalled or deleted here.
+     */
+    static List<ResourceLease> detachLiveLeasesForTests() {
+        synchronized (OWNERSHIP_LOCK) {
+            List<ResourceLease> detached = List.copyOf(LIVE);
+            LIVE.clear();
+            return detached;
+        }
+    }
+
+    /** The other half of {@link #detachLiveLeasesForTests}; re-registers what it returned. */
+    static void reattachLeasesForTests(List<ResourceLease> detached) {
+        synchronized (OWNERSHIP_LOCK) {
+            LIVE.addAll(detached);
+        }
+    }
+
     private static void cleanupOwnedResources(boolean beginJvmShutdown) {
         List<ResourceLease> initialSnapshot;
         synchronized (OWNERSHIP_LOCK) {
