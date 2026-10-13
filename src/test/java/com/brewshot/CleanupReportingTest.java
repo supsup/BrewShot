@@ -275,7 +275,7 @@ final class CleanupReportingTest {
         Path manifest = dir.resolve("shot.json");
         Main.writeManifest(manifest, "page.html", "file", 640, 480, 25,
             null, out, null, null, true, 12, null, null,
-            null, null, null, null, null, null, null, outcome);
+            null, null, null, null, null, null, null, null, outcome);
         @SuppressWarnings("unchecked")
         Map<String, Object> root =
             (Map<String, Object>) MiniJson.parse(Files.readString(manifest));

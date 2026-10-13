@@ -128,6 +128,7 @@ No Java in hand? The same lane exists on the CLI — `--gif N`, below.
 brewshot https://example.com -o page.png
 brewshot https://example.com -o page.jpeg --jpeg-quality 82
 brewshot ./report.html -o report.png --size 1440x1000 --settle 1500
+brewshot ./diagram.svg -o diagram.png     # a local .svg sizes its own viewport
 cat page.html | brewshot - -o page.png --eval "document.title"
 
 # one element, crisp: selector clip + 3x re-raster (no hand-rolled rect JS)
@@ -144,6 +145,14 @@ brewshot http://localhost:8080/route -o shot.png \
 # stdin HTML is capped at 16 MiB; --eval-file UTF-8 source is capped at 1 MiB
 # unknown -o extensions are rejected (only png, jpg/jpeg, pdf, guarded gif)
 # (--clip-js still exists for computed rects; --clip-selector covers the common case)
+
+# SVG in, exactly-sized PNG out: with no --size a local .svg gets a viewport of its
+# root width/height, else its viewBox. stderr names the choice. If the file states no
+# usable size the default 1280x900 is used and stderr says why; --size auto asks for
+# the SVG's size by name and refuses (exit 2) instead of falling back.
+brewshot diagram.svg -o diagram.png
+brewshot diagram.svg -o diagram@2x.png --size auto --dpr 2
+brewshot diagram.svg -o wide.png --size 1600x900    # an explicit size always wins
 
 # opt-in page voice: raw bounded text + drop/completeness evidence
 brewshot page.html -o shot.png --json shot.json --page-diagnostics
