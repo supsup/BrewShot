@@ -3,7 +3,7 @@ package com.brewshot;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertTimeout;
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.charset.StandardCharsets;
@@ -230,7 +230,10 @@ class SvgIntrinsicSizeTest {
 
     // ---- review brewshot 729: attribute bounds, sanitised echo, style notice ----------
 
-    /** 200 ms: the bound the earlier pattern cannot meet (13 s for this input, measured). */
+    /**
+     * 200 ms: the bound the earlier pattern cannot meet (13 s for 40000 digits, measured).
+     * Preemptive, so a regression fails in 200 ms instead of hanging the suite for hours.
+     */
     private static final Duration LINEAR_BOUND = Duration.ofMillis(200);
 
     private static boolean hasControlCharacter(String text) {
@@ -245,7 +248,7 @@ class SvgIntrinsicSizeTest {
         // named refusal well inside the bound, through the real file reader.
         Path file = directory.resolve("digits.svg");
         Files.writeString(file, "<svg width=\"" + "1".repeat(40_000) + "!\" height=\"10\"/>");
-        String message = assertTimeout(LINEAR_BOUND, () -> assertThrows(
+        String message = assertTimeoutPreemptively(LINEAR_BOUND, () -> assertThrows(
             SvgIntrinsicSize.Undetermined.class, () -> SvgIntrinsicSize.read(file))
             .getMessage());
         assertTrue(message.contains("longer than the "
@@ -265,11 +268,11 @@ class SvgIntrinsicSizeTest {
         // F1, second half: the bound is not the only guard. The pattern alone, on input
         // far past the bound, must fail fast (possessive, unambiguous digit runs).
         String hostile = "1".repeat(1_000_000) + "!";
-        assertFalse(assertTimeout(LINEAR_BOUND,
+        assertFalse(assertTimeoutPreemptively(LINEAR_BOUND,
             () -> SvgIntrinsicSize.LENGTH.matcher(hostile).matches()));
-        assertFalse(assertTimeout(LINEAR_BOUND,
+        assertFalse(assertTimeoutPreemptively(LINEAR_BOUND,
             () -> SvgIntrinsicSize.LENGTH.matcher("1." + hostile).matches()));
-        assertFalse(assertTimeout(LINEAR_BOUND,
+        assertFalse(assertTimeoutPreemptively(LINEAR_BOUND,
             () -> SvgIntrinsicSize.LENGTH.matcher("1e" + hostile).matches()));
     }
 
