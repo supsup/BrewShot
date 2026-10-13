@@ -182,6 +182,13 @@ public final class BrewShot implements AutoCloseable {
     private Integer emulatedDevicePixelRatio;
     private Integer appliedDevicePixelRatio;
     private int deviceMetricsApplicationCount;
+    // The CSS viewport every launch asked for. Set once at launch with the device-metrics
+    // override (new headless treats --window-size as the OUTER window: on Chrome 155 a
+    // 640x360 request painted a 640x273 page, plan 3f4bc3c7) and witnessed after every
+    // navigation, null-before-throw like the DPR witness above.
+    private int requestedViewportWidth;
+    private int requestedViewportHeight;
+    private String appliedViewport;
     private String sessionId; // null during browser-scope bootstrap, then the tab session
     private int nextId = 1;
     // Network in-flight tracking for waitForNetworkIdle. A SET of live CDP
@@ -1290,6 +1297,31 @@ public final class BrewShot implements AutoCloseable {
         }
     }
 
+    /**
+     * Package test seam: move every lease currently in {@link #LIVE} out to the caller and
+     * return them, so a test that asserts on the shutdown report sees ONLY the leases it
+     * registers itself. {@link #LIVE} is JVM-global: on macOS a closed BrewShot whose release
+     * is unproven stays registered (its profile is kept), so after sixteen classes of real
+     * launches the set held 73 such leases and a test expecting "1 remaining" read 74 (brewshot
+     * room 700, the land gate at d5dc78b707bd; the same suite was green when that class ran
+     * first). Pair with {@link #reattachLeasesForTests} in a finally, so the real shutdown hook
+     * still reaps them at JVM exit; nothing is signalled or deleted here.
+     */
+    static List<ResourceLease> detachLiveLeasesForTests() {
+        synchronized (OWNERSHIP_LOCK) {
+            List<ResourceLease> detached = List.copyOf(LIVE);
+            LIVE.clear();
+            return detached;
+        }
+    }
+
+    /** The other half of {@link #detachLiveLeasesForTests}; re-registers what it returned. */
+    static void reattachLeasesForTests(List<ResourceLease> detached) {
+        synchronized (OWNERSHIP_LOCK) {
+            LIVE.addAll(detached);
+        }
+    }
+
     private static void cleanupOwnedResources(boolean beginJvmShutdown) {
         List<ResourceLease> initialSnapshot;
         synchronized (OWNERSHIP_LOCK) {
@@ -1521,7 +1553,13 @@ public final class BrewShot implements AutoCloseable {
         return launch(1280, 900);
     }
 
-    /** Launch headless Chrome with the given viewport and attach to a fresh tab. */
+    /**
+     * Launch headless Chrome with the given CSS viewport and attach to a fresh tab. The viewport
+     * is set with CDP {@code Emulation.setDeviceMetricsOverride} on the tab before the first
+     * navigation and witnessed ({@code window.innerWidth x innerHeight}) after every one;
+     * {@code --window-size} is still passed, but it sizes the outer window, which Chrome's new
+     * headless mode (the only mode since 132) shrinks by its toolbar band.
+     */
     public static BrewShot launch(int width, int height) throws IOException {
         return launch(width, height, null, Map.of());
     }
@@ -1596,13 +1634,11 @@ public final class BrewShot implements AutoCloseable {
         // release proof, and it cannot fail this launch.
         StaleProfileReaper.reapBeside(profile);
         BrewShot shot = finishLaunch(lease, wsUrl, HTTP_CONNECTOR, envTimeoutMs());
-        if (devicePixelRatio != null) {
-            try {
-                shot.applyDeviceMetricsOverride(width, height, devicePixelRatio);
-            } catch (RuntimeException | Error rejected) {
-                shot.close();
-                throw rejected;
-            }
+        try {
+            shot.applyDeviceMetricsOverride(width, height, devicePixelRatio);
+        } catch (RuntimeException | Error rejected) {
+            shot.close();
+            throw rejected;
         }
         return shot;
     }
@@ -2589,6 +2625,7 @@ public final class BrewShot implements AutoCloseable {
         waitEvent("Page.loadEventFired", navTimeoutMs);
         verifyAppliedTimezone();
         verifyAppliedDevicePixelRatio();
+        verifyAppliedViewport();
     }
 
     /**
@@ -2606,6 +2643,7 @@ public final class BrewShot implements AutoCloseable {
         waitEvent("Page.loadEventFired", navTimeoutMs);
         verifyAppliedTimezone();
         verifyAppliedDevicePixelRatio();
+        verifyAppliedViewport();
     }
 
     /**
@@ -2623,6 +2661,7 @@ public final class BrewShot implements AutoCloseable {
         lastNetChangeNanos = System.nanoTime();
         appliedTimezone = null;
         appliedDevicePixelRatio = null;
+        appliedViewport = null;
         // Re-send any active colorScheme/media/reducedMotion override BEFORE the navigation
         // command below, so the new document paints under it from the first frame — a no-op
         // when none was ever set (plan 02af3a3d: emulation must survive "any new page/navigation
@@ -2817,24 +2856,54 @@ public final class BrewShot implements AutoCloseable {
     }
 
     /**
-     * Apply the launch-time target metrics exactly once, before the first content navigation.
-     * Subsequent navigations only verify persistence; they never reapply and make a lost override
-     * look healthy. The browser-level force-1 flag is absent for this launch by construction.
+     * Apply the launch-time target metrics exactly once, before the first content navigation:
+     * the CSS viewport for every launch, plus the page-visible DPR when one was asked for. A
+     * default launch sends {@code deviceScaleFactor: 0} (CDP: "0 disables the override"), so DPR
+     * stays owned by the browser-level force-1 flag that launch keeps for it, and only the
+     * viewport is pinned. Subsequent navigations only verify persistence; they never reapply and
+     * make a lost override look healthy. When a DPR is given, the force flag is absent for this
+     * launch by construction.
      */
-    private void applyDeviceMetricsOverride(int width, int height, int devicePixelRatio) {
+    private void applyDeviceMetricsOverride(int width, int height, Integer devicePixelRatio) {
         this.emulatedDevicePixelRatio = devicePixelRatio;
         this.appliedDevicePixelRatio = null;
+        this.requestedViewportWidth = width;
+        this.requestedViewportHeight = height;
+        this.appliedViewport = null;
+        int scale = devicePixelRatio == null ? 0 : devicePixelRatio;
         try {
             command("Emulation.setDeviceMetricsOverride",
                 "{\"width\":" + width + ",\"height\":" + height
-                    + ",\"deviceScaleFactor\":" + devicePixelRatio
+                    + ",\"deviceScaleFactor\":" + scale
                     + ",\"mobile\":false}");
             deviceMetricsApplicationCount++;
         } catch (IllegalStateException rejected) {
             throw new IllegalStateException(
-                "device pixel ratio override rejected for " + devicePixelRatio + ": "
-                    + rejected.getMessage(), rejected);
+                "viewport override rejected for " + width + "x" + height
+                    + (devicePixelRatio == null ? "" : " at device pixel ratio " + devicePixelRatio)
+                    + ": " + rejected.getMessage(), rejected);
         }
+    }
+
+    /**
+     * Post-load witness for the CSS viewport: the page must report exactly the launch's
+     * {@code width x height}. Null-before-throw, same as the DPR witness, so a stale success from
+     * the previous page is never observable after a failed one.
+     */
+    private void verifyAppliedViewport() {
+        appliedViewport = null;
+        String expected = requestedViewportWidth + "x" + requestedViewportHeight;
+        Object visible = eval("window.innerWidth+'x'+window.innerHeight");
+        if (!expected.equals(visible)) {
+            throw new IllegalStateException("viewport override mismatch: requested " + expected
+                + ", page reported " + visible);
+        }
+        appliedViewport = expected;
+    }
+
+    /** The {@code WxH} the loaded page reported, or null before the first navigation witnesses it. */
+    public String appliedViewport() {
+        return appliedViewport;
     }
 
     /** Post-load witness: null-before-throw so a stale prior success is never observable. */

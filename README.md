@@ -408,6 +408,14 @@ state, the post-load witness fails before capture instead of hiding the drift. A
 omits the otherwise-retained `--force-device-scale-factor=1` browser flag, so two mechanisms never
 compete for one property.
 
+The same override pins the **CSS viewport** on every launch, with or without `--dpr`, and the
+loaded page's `window.innerWidth x innerHeight` is witnessed after every `open`/`html`
+(`appliedViewport()` returns it; a mismatch fails before capture). This matters because Chrome's
+new headless mode, the only headless mode since Chrome 132, reads `--window-size` as the
+**outer** window: on Chrome 155 a plain `launch(640, 360)` painted a 640x273 page, 87 px short,
+while the `--dpr` path, which already sent the override, was exact. `--window-size` is still
+passed, for the outer window only.
+
 The CLI form is `--dpr N`. With `--json`, the sidecar adds requested and page-verified `dpr` values;
 omitting the flag preserves the legacy JSON shape. Fractional DPR is deferred until its composition
 with `--scale` has a documented pixel-rounding policy. Verify-manifest DPR is likewise intentionally
