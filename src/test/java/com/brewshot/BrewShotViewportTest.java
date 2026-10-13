@@ -83,14 +83,23 @@ class BrewShotViewportTest {
             + "Object.defineProperty(window,'innerWidth',{get:function(){return 1;}});"
             + "</script><body>lying</body>";
         try (BrewShot shot = BrewShot.launch(640, 360)) {
+            // Witness an honest page FIRST, so a success exists that could go stale (review 717).
+            shot.open(honest.toUri().toString());
+            assertEquals("640x360", shot.appliedViewport());
+
             IllegalStateException refusal =
                 assertThrows(IllegalStateException.class, () -> shot.html(lying));
             assertTrue(refusal.getMessage().contains("viewport override mismatch"),
                 refusal.getMessage());
             assertTrue(refusal.getMessage().contains("requested 640x360, page reported 1x360"),
                 refusal.getMessage());
+            // Two resets guard this: freshNavigation() clears the witness before every navigation,
+            // and verifyAppliedViewport() clears it again before it can throw. Either one alone
+            // keeps the earlier 640x360 from showing through; deleting BOTH is what this catches.
+            // The second reset is not observable through the public API on its own, because no
+            // public path reaches the witness without passing freshNavigation() first.
             assertNull(shot.appliedViewport(),
-                "null-before-throw: no stale success is observable after a refusal");
+                "the earlier success must not be observable after a refusal: " + shot.appliedViewport());
 
             // The override is intact: a real navigation (a new window object, so the lie is
             // gone) to an honest page is witnessed again. html() would NOT do: it replaces the
