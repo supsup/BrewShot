@@ -137,6 +137,86 @@ own arrival order; V1 claims no total order across those independent CDP
 streams. Raw strings receive the library's existing entry/UTF-8 byte bounds,
 not general secret redaction.
 
+### What cleanup left behind
+
+A capture that leaves no Chrome running prints nothing about cleanup and exits
+0. Earlier versions printed "N lease(s) not confirmed reaped ... may still be
+running" at exit on almost every run, including runs where every process had
+gone, because a kept profile was counted as an unreaped process.
+
+When a Chrome process of the capture IS still observed alive after close, three
+things say so:
+
+```text
+$ brewshot page.html -o shot.png --json shot.json
+brewshot: wrote shot.png
+brewshot: cleanup UNCONFIRMED: pid 48213, 48219 of this launch may still be running (check with: ps -p 48213,48219); profile kept: /tmp/brewshot-7350911 (exit 6; the output was written)
+$ echo $?
+6
+```
+
+- **stderr names the pid(s)**, with the `ps -p` command to check them.
+- **Exit 6** replaces exit 0. The output file was written and is good. A run
+  that already failed for another reason keeps its own code (1, 4, 5) and still
+  gets the line.
+- **`--json` records it** under `cleanup`, on every capture:
+
+```json
+"cleanup": {
+  "state": "process-unconfirmed",
+  "liveProcessObserved": true,
+  "livePids": [48213, 48219],
+  "liveWithoutPid": 0,
+  "exitedUnreapedPids": [],
+  "profile": "/tmp/brewshot-7350911",
+  "profileRemoved": false,
+  "reason": "a process of this launch is still observed alive after cleanup"
+}
+```
+
+| `state` | meaning | stderr | exit |
+| --- | --- | --- | --- |
+| `released` | every process gone, release proven, profile removed | nothing | unchanged |
+| `profile-kept` | no live process observed; the profile was kept and `reason` says why | nothing | unchanged |
+| `profile-not-removed` | no live process, release proven, but the profile is still on disk | one line naming the path | unchanged |
+| `process-unconfirmed` | at least one process still observed alive | one line naming the pids | 6 instead of 0 |
+
+`profile-kept` is the ordinary result outside the opted-in container (see
+"When the temporary Chrome profile is deleted" below): it is quiet, and it is
+not `released`, because a directory is still on disk. `liveWithoutPid` counts
+live processes whose pid could not be read, so an empty `livePids` never hides
+one. `exitedUnreapedPids` lists zombies: processes that have exited and whose
+parent has not reaped them (several per capture when the container's pid 1
+reaps nothing). They run nothing and are not counted as alive; Linux only,
+read from `/proc`.
+
+"Observed" means the processes BrewShot holds a handle to: the launched tree
+and anything whose command line names the profile. It is evidence, not a
+containment proof, which is why a quiet run still keeps its profile unless
+release is proven. The JVM shutdown hook still retries cleanup at exit and
+prints its own line, with the same pids, if something is alive after that; the
+exit code is decided before the hook runs.
+
+Library callers read the same value after `close()`:
+
+```java
+BrewShot shot = BrewShot.launch();
+try { shot.open(url); shot.screenshot(out); }
+finally { shot.close(); }
+CleanupOutcome left = shot.cleanupOutcome();
+if (left.liveProcessObserved()) { log.warn("still alive: {}", left.livePids()); }
+```
+
+`brewshot verify` and the watch worker do not set exit 6. `verify` keeps its
+own receipt codes and reports a surviving process only through the shutdown
+line at exit. The worker treats a rendered job as rendered: the image is
+published and the job is filed as finished, but not silently. After the
+per-capture line it logs one more, `brewshot-watch: job <id> finished with N
+Chrome process(es) of its capture still alive after close (...)`, and keeps a
+count of such jobs since start. In the image, tini (pid 1) reaps exited helpers
+and the report classifies zombies separately, so a 6 there means a Chrome that
+may really still be running, not an unreaped one.
+
 In the container image, BrewShot runs as fixed UID 10001. A `0600` sidecar may
 therefore be unreadable to a different host UID by design; inspect it through a
 deliberate container-side reader (or explicitly copy/change ownership outside
@@ -726,7 +806,8 @@ one WARNING at start, and every profile is kept.
 
 Outside such a container (the plain CLI on macOS, Windows or a Linux host, and
 the container CLI without the opt-in) release stays UNPROVEN by decision: the
-profile is kept rather than deleted on an unproven claim.
+profile is kept rather than deleted on an unproven claim. That is reported as
+`profile-kept` in `--json` and prints nothing; see "What cleanup left behind".
 
 **Leftover profiles are cleaned up later, and that is not a proof.** Each launch
 deletes OTHER `brewshot-<digits>` directories beside its own profile, but only
