@@ -46,7 +46,9 @@ ARG CHROMIUM_VERSION
 ARG FONT_LIBERATION_VERSION
 ARG FONT_DEJAVU_VERSION
 ARG FONT_NOTO_EMOJI_VERSION
+ARG TINI_VERSION
 RUN apk add --no-cache \
+        tini="${TINI_VERSION}" \
         chromium="${CHROMIUM_VERSION}" \
         font-liberation="${FONT_LIBERATION_VERSION}" \
         font-dejavu="${FONT_DEJAVU_VERSION}" \
@@ -56,7 +58,10 @@ ENV BREWSHOT_CHROME=/usr/bin/chromium-browser \
     BREWSHOT_REQUIRE_CHROME=1
 WORKDIR /src
 COPY . .
-RUN ./gradlew --no-daemon chromeTest --stacktrace
+# Reap Chrome's helpers the way the runtime image does (7ffaf07, plan 558d8abe): a build step
+# has no init, so orphaned helpers stay as zombies the real-Chrome cleanup tests then see.
+# Subreaper mode (-s) needs no pid 1. Plan a7074a87.
+RUN tini -s -- ./gradlew --no-daemon chromeTest --stacktrace
 
 # ---- runtime: JRE + chromium + fonts ------------------------------------
 # Alpine, deliberately: Ubuntu/Debian-slim images ship a snap-stub `chromium`
