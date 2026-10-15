@@ -248,6 +248,8 @@ def main():
                "--entrypoint", "/bin/sh", image, "-ec",
                f"mkdir -p /brewshot/input/processing/{published_id} "
                f"/brewshot/output/.brewshot-state/{published_id}; "
+               f"chown 10001:10001 /brewshot/input/processing/{published_id} "
+               f"/brewshot/output/.brewshot-state/{published_id}; "
                f"cp /brewshot/input/.recovered.upload /brewshot/input/processing/{published_id}/published.brewshot.zip; "
                f"cp /brewshot/output/bundle.brewshot.zip.gif /brewshot/output/.brewshot-state/{published_id}/{source_hash}.decision; "
                f"chown 10001:10001 /brewshot/output/.brewshot-state/{published_id}/{source_hash}.decision; "
