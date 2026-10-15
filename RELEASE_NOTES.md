@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **Watched GIF jobs from website URLs or local ZIP bundles** (plan a15a0d3b).
+  Drop a versioned `*.brewshot.json` URL job or a `*.brewshot.zip` containing
+  `job.json`, HTML and relative assets. Typed options delegate to the existing
+  Main CLI; PNG/GIF selection, element crop, scale and preparation scripts are
+  supported. Existing HTML drops retain their PNG behavior. JSON/ZIP jobs run
+  with a whole-job deadline, bounded ZIP extraction and the existing atomic
+  no-replacement publication/recovery rules. Local bundles use `file://` with
+  its local fetch/XHR limitations. See `docs/watch-jobs.md`. The real worker
+  smoke now also requires Python 3 (stdlib only).
 - **Cleanup reporting is quiet on a clean run and typed when it is not** (plan f5f02722).
   Almost every successful capture used to end with "N lease(s) not confirmed reaped ... may
   still be running" on stderr, although no Chrome was left: a launch whose release is

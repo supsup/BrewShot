@@ -47,7 +47,7 @@ final class BrewShotWatchJob {
             try (var children = Files.list(scratch)) {
                 if (children.findAny().isPresent()) { throw failure("JOB_SCRATCH"); }
             }
-            String name = source.getFileName().toString();
+            String name = source.getFileName().toString().toLowerCase(Locale.ROOT);
             Path assets = null;
             String text;
             if (name.endsWith(".brewshot.zip")) {
@@ -95,6 +95,9 @@ final class BrewShotWatchJob {
                     || uri.getHost() == null || uri.getRawUserInfo() != null) {
                 throw failure("JOB_URL");
             }
+            // Main's URL-mode recognizer expects a lower-case scheme. Preserve
+            // the rest verbatim, including escaped path and query bytes.
+            input = uri.getScheme().toLowerCase(Locale.ROOT) + input.substring(input.indexOf(':'));
         } else {
             Path file = bundleFile(assets, string(source.get("file")));
             String lower = file.getFileName().toString().toLowerCase(Locale.ROOT);

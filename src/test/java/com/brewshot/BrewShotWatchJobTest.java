@@ -125,7 +125,7 @@ class BrewShotWatchJobTest {
             String content = urlJob("png", "").replace("http://localhost:8080/", url);
             assertCode("JOB_URL", () -> json(content));
         }
-        assertEquals("HTTP://example.test/path", json(urlJob("png", "")
+        assertEquals("http://example.test/path", json(urlJob("png", "")
             .replace("http://localhost:8080/", "HTTP://example.test/path")).arguments().get(0));
     }
 
