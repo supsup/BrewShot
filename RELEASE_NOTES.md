@@ -11,6 +11,14 @@
   no-replacement publication/recovery rules. Local bundles use `file://` with
   its local fetch/XHR limitations. See `docs/watch-jobs.md`. The real worker
   smoke now also requires Python 3 (stdlib only).
+
+- **The pinned Chrome CI job reaps Chrome's helpers like the runtime image does** (plan a7074a87).
+  The chrome-test build stage ran the real-Chrome suite with no init, so helpers orphaned during a
+  test stayed as zombies, and the two real cleanup tests (CleanupReportingTest, which pin the
+  zombie probe off on purpose) saw them as live and failed on main itself. The stage now installs
+  the same pinned tini and runs the suite under `tini -s`, as 7ffaf07 did for the runtime image.
+  No test assertion changed.
+
 - **Cleanup reporting is quiet on a clean run and typed when it is not** (plan f5f02722).
   Almost every successful capture used to end with "N lease(s) not confirmed reaped ... may
   still be running" on stderr, although no Chrome was left: a launch whose release is
