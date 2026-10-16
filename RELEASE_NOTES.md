@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **Watched GIF jobs from website URLs or local ZIP bundles** (plan a15a0d3b).
+  Drop a versioned `*.brewshot.json` URL job or a `*.brewshot.zip` containing
+  `job.json`, HTML and relative assets. Typed options delegate to the existing
+  Main CLI; PNG/GIF selection, element crop, scale and preparation scripts are
+  supported. Existing HTML drops retain their PNG behavior. JSON/ZIP jobs run
+  with a whole-job deadline, bounded ZIP extraction and the existing atomic
+  no-replacement publication/recovery rules. Local bundles use `file://` with
+  its local fetch/XHR limitations. See `docs/watch-jobs.md`. The real worker
+  smoke now also requires Python 3 (stdlib only).
+
 - **The pinned Chrome CI job reaps Chrome's helpers like the runtime image does** (plan a7074a87).
   The chrome-test build stage ran the real-Chrome suite with no init, so helpers orphaned during a
   test stayed as zombies, and the two real cleanup tests (CleanupReportingTest, which pin the

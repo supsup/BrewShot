@@ -730,10 +730,15 @@ docker run -d --name brewshot-worker --restart unless-stopped \
 ```
 
 Watch mode accepts complete, visible, regular, direct-child `.html` and `.htm`
-files only. They should be self-contained: claiming moves the file into a
-job-specific processing directory, so sibling asset paths are not a worker
-contract. URL manifests and arbitrary option manifests are intentionally not
-accepted; use the unchanged CLI for URLs and advanced capture options.
+files for the existing PNG path. They should be self-contained: claiming moves
+an individual file into a job-specific processing directory.
+
+For GIFs or configurable stills, drop a versioned `*.brewshot.json` website job,
+or a `*.brewshot.zip` containing root `job.json`, local HTML and relative assets.
+A website job contains a URL and typed capture settings; a local ZIP is claimed
+as one atomic package. No per-capture Docker command is needed. See the
+[watch job schema, examples and limits](docs/watch-jobs.md). Plain HTML drops
+continue producing PNGs with the existing defaults.
 
 Publish a complete job with a hidden sibling plus atomic rename so the worker
 never observes a partial upload:

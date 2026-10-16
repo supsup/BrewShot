@@ -647,4 +647,7 @@ step "no complete-looking hidden artifacts survive a terminal path"
 # of a race against it.
 wait_for_no_worker_temps "$output" "$race_output" "$unreadable_output"
 
+step "versioned URL and ZIP watch jobs"
+python3 docker/watch-job-smoke.py "$image"
+
 echo 'brewshot Docker smoke: PASS'

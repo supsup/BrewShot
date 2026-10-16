@@ -25,14 +25,14 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.UUID;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Container-only folder worker for self-contained local HTML files. Every
- * capture calls the shipped {@link Main} entry point with fixed defaults, so
- * this class owns mounted-file orchestration rather than a second browser or
- * argument parser. URL and advanced-option jobs remain available through the
- * ordinary one-shot CLI.
+ * Container-only folder worker for local HTML stills and versioned URL/ZIP jobs.
+ * Manifest jobs map to the shipped {@link Main} entry point in a bounded subprocess;
+ * this class owns mounted-file orchestration rather than a second recorder or CLI grammar.
  *
  * <p>Claims are atomic renames to the original filename below a UUID-named
  * directory in {@code input/processing}. Keeping the UUID and source name in
@@ -55,6 +55,8 @@ public final class BrewShotFolderWorker {
     private static final int CLAIM_ID_LENGTH = 32;
     private static final int MAX_DERIVED_NAME_BYTES = 255;
     private static final int DIAGNOSTIC_LIMIT = 512;
+    private static final long MAX_JOB_BYTES = 16L * 1024 * 1024;
+    private static final long JOB_TIMEOUT_MILLIS = jobTimeoutMillis();
     private static final byte[] PNG_SIGNATURE = {
         (byte) 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a
     };
@@ -332,50 +334,39 @@ public final class BrewShotFolderWorker {
             + "-" + attemptId + ".png");
         Files.deleteIfExists(renderTemp);
 
+        BrewShotWatchCommit commit = null;
         try {
-            render(claim, source, renderTemp);
-            publishComplete(renderTemp, output.resolve(
-                derivedName(claim, ".png")));
-        } catch (JobFailure failure) {
-            Files.deleteIfExists(renderTemp);
-            if (completedByAnotherWorker(claim, source)) {
-                logAlreadyCompleted(claim);
-                return;
-            }
-            if (fail(claim, source, attemptId, failure.code())) {
-                System.err.println("brewshot-watch: job " + claim.jobId()
-                    + " failed (" + failure.code() + ")");
+            if (isManifestName(claim.originalName())) {
+                commit = new BrewShotWatchCommit(output, claim.jobId(),
+                    sourceHash(source));
+                Path chosen = commit.recover();
+                String suffix;
+                if (chosen == null) {
+                    suffix = render(claim, source, renderTemp);
+                    chosen = commit.record(renderTemp, suffix);
+                } else {
+                    suffix = BrewShotWatchCommit.suffix(chosen);
+                }
+                if (suffix.equals(".gif")) { requireGif(chosen); }
+                else { requirePng(chosen); }
+                try { BrewShotWatchCommit.publish(chosen, output.resolve(derivedName(claim, suffix))); }
+                catch (BrewShotWatchCommit.Collision collision) { throw new JobFailure("output-collision"); }
+                Files.deleteIfExists(renderTemp);
             } else {
-                logAlreadyCompleted(claim);
+                String suffix = render(claim, source, renderTemp);
+                publishComplete(renderTemp, output.resolve(derivedName(claim, suffix)));
             }
+        } catch (JobFailure failure) {
+            failedAttempt(claim, source, attemptId, renderTemp, commit, failure.code());
             return;
         } catch (IOException failure) {
-            Files.deleteIfExists(renderTemp);
-            if (completedByAnotherWorker(claim, source)) {
-                logAlreadyCompleted(claim);
-                return;
-            }
-            String code = "io-" + failure.getClass().getSimpleName();
-            if (fail(claim, source, attemptId, code)) {
-                System.err.println("brewshot-watch: job " + claim.jobId()
-                    + " failed (" + code + ")");
-            } else {
-                logAlreadyCompleted(claim);
-            }
+            failedAttempt(claim, source, attemptId, renderTemp, commit,
+                failure instanceof BrewShotWatchCommit.Failed ? failure.getMessage()
+                    : "io-" + failure.getClass().getSimpleName());
             return;
         } catch (RuntimeException failure) {
-            Files.deleteIfExists(renderTemp);
-            if (completedByAnotherWorker(claim, source)) {
-                logAlreadyCompleted(claim);
-                return;
-            }
-            String code = "runtime-" + failure.getClass().getSimpleName();
-            if (fail(claim, source, attemptId, code)) {
-                System.err.println("brewshot-watch: job " + claim.jobId()
-                    + " failed (" + code + ")");
-            } else {
-                logAlreadyCompleted(claim);
-            }
+            failedAttempt(claim, source, attemptId, renderTemp, commit,
+                "runtime-" + failure.getClass().getSimpleName());
             return;
         }
 
@@ -384,6 +375,37 @@ public final class BrewShotFolderWorker {
         } else {
             logAlreadyCompleted(claim);
         }
+    }
+
+    private void failedAttempt(Claim claim, FileChannel source, String attemptId,
+            Path renderTemp, BrewShotWatchCommit commit, String code) throws IOException {
+        Files.deleteIfExists(renderTemp);
+        if (completedByAnotherWorker(claim, source)) {
+            logAlreadyCompleted(claim);
+            return;
+        }
+        if (commit != null) {
+            try {
+                // A late failing attempt must honor a selected success; a failure
+                // selected first must prevent a late renderer publishing success.
+                Path chosen = commit.fail(code);
+                String suffix = BrewShotWatchCommit.suffix(chosen);
+                if (suffix.equals(".gif")) { requireGif(chosen); } else { requirePng(chosen); }
+                BrewShotWatchCommit.publish(chosen, output.resolve(derivedName(claim, suffix)));
+                archive(claim, source, finished);
+                logAlreadyCompleted(claim);
+                return;
+            } catch (BrewShotWatchCommit.Failed selectedFailure) {
+                code = selectedFailure.getMessage();
+            } catch (BrewShotWatchCommit.Collision unrelatedOutput) {
+                code = "output-collision";
+            } catch (JobFailure invalidImage) {
+                code = invalidImage.code();
+            }
+        }
+        if (fail(claim, source, attemptId, code)) {
+            System.err.println("brewshot-watch: job " + claim.jobId() + " failed (" + code + ")");
+        } else { logAlreadyCompleted(claim); }
     }
 
     private static void logAlreadyCompleted(Claim claim) {
@@ -397,8 +419,11 @@ public final class BrewShotFolderWorker {
             && archivedAnywhere(claim, source);
     }
 
-    private void render(Claim claim, FileChannel source, Path renderTemp)
+    private String render(Claim claim, FileChannel source, Path renderTemp)
             throws IOException, JobFailure {
+        if (isManifestName(claim.originalName())) {
+            return renderManifest(claim, source, renderTemp);
+        }
         long size = source.size();
         if (size == 0) {
             throw new JobFailure("empty-input");
@@ -431,6 +456,190 @@ public final class BrewShotFolderWorker {
             throw new JobFailure("capture-exit-" + exit);
         }
         requirePng(renderTemp);
+        return ".png";
+    }
+
+    private static String sourceHash(FileChannel source) throws IOException {
+        if (source.size() == 0 || source.size() > MAX_JOB_BYTES) {
+            throw new IOException("job input size");
+        }
+        try {
+            var digest = java.security.MessageDigest.getInstance("SHA-256");
+            ByteBuffer buffer = ByteBuffer.allocate(8192);
+            long position = 0;
+            while (position < source.size()) {
+                buffer.clear();
+                int read = source.read(buffer, position);
+                if (read < 0) { throw new IOException("source truncated"); }
+                buffer.flip();
+                digest.update(buffer);
+                position += read;
+            }
+            return java.util.HexFormat.of().formatHex(digest.digest());
+        } catch (java.security.NoSuchAlgorithmException impossible) {
+            throw new IOException("SHA-256 unavailable", impossible);
+        }
+    }
+
+    private static boolean isManifestName(String name) {
+        String lower = name.toLowerCase(Locale.ROOT);
+        return lower.endsWith(".brewshot.json") || lower.endsWith(".brewshot.zip");
+    }
+
+    private String renderManifest(Claim claim, FileChannel source, Path renderTemp)
+            throws IOException, JobFailure {
+        long started = System.nanoTime();
+        if (source.size() == 0 || source.size() > MAX_JOB_BYTES) {
+            throw new JobFailure("job-input-size");
+        }
+        Path scratch = Files.createTempDirectory("brewshot-watch-job-");
+        Path captureImagePng = renderTemp.resolveSibling(renderTemp.getFileName() + ".png");
+        Path captureImageGif = renderTemp.resolveSibling(renderTemp.getFileName() + ".gif");
+        try {
+            // Copy from the OPEN CLAIM, not a producer-controlled pathname. The
+            // claimed input remains intact for archival and restart recovery.
+            Path snapshot = scratch.resolve(claim.originalName());
+            try (var destination = FileChannel.open(snapshot, StandardOpenOption.CREATE_NEW,
+                    StandardOpenOption.WRITE)) {
+                ByteBuffer buffer = ByteBuffer.allocate(8192);
+                long position = 0;
+                while (position < source.size()) {
+                    if (TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)
+                            >= JOB_TIMEOUT_MILLIS) { throw new JobFailure("job-deadline"); }
+                    buffer.clear();
+                    int read = source.read(buffer, position);
+                    if (read < 0) { throw new JobFailure("job-input-truncated"); }
+                    buffer.flip();
+                    while (buffer.hasRemaining()) { destination.write(buffer); }
+                    position += read;
+                    if (position > MAX_JOB_BYTES) { throw new JobFailure("job-input-size"); }
+                }
+            }
+            Path bundleScratch = Files.createDirectory(scratch.resolve("bundle"));
+            Path resultPath = scratch.resolve("result.json");
+            String java = Path.of(System.getProperty("java.home"), "bin", "java").toString();
+            long remaining = JOB_TIMEOUT_MILLIS
+                - TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+            if (remaining <= 0) { throw new JobFailure("job-deadline"); }
+            int exit = runJobProcess(List.of(java, "-Djava.awt.headless=true", "-cp",
+                System.getProperty("java.class.path"), BrewShotWatchCapture.class.getName(),
+                snapshot.toString(), renderTemp.toString(), resultPath.toString(),
+                bundleScratch.toString()), remaining);
+            Map<?, ?> result = readJobResult(resultPath);
+            if (exit == Main.EXIT_CLEANUP_UNCONFIRMED) {
+                CleanupOutcome cleanup = cleanupFromJobResult(result);
+                noteSurvivingChrome(claim.jobId(), cleanup);
+                if (cleanup != null) { System.err.println("brewshot-watch: " + cleanup.warning()); }
+            } else if (exit != 0) {
+                Object code = result.get("code");
+                throw new JobFailure(code instanceof String text
+                    && text.matches("[A-Za-z0-9._-]{1,80}") ? text : "job-exit-" + exit);
+            }
+            String format = String.valueOf(result.get("format"));
+            if (format.equals("png")) { requirePng(renderTemp); return ".png"; }
+            if (format.equals("gif")) { requireGif(renderTemp); return ".gif"; }
+            throw new JobFailure("job-result-format");
+        } finally {
+            Files.deleteIfExists(captureImagePng);
+            Files.deleteIfExists(captureImageGif);
+            // Only this attempt's freshly created private scratch is removed.
+            // The claimed original is never beneath this directory.
+            try (var paths = Files.walk(scratch)) {
+                for (Path path : paths.sorted(Comparator.reverseOrder()).toList()) {
+                    Files.deleteIfExists(path);
+                }
+            }
+        }
+    }
+
+    static int runJobProcess(List<String> command, long timeoutMillis)
+            throws IOException, JobFailure {
+        Process process = new ProcessBuilder(command)
+            .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+            .redirectError(ProcessBuilder.Redirect.DISCARD).start();
+        try {
+            if (process.waitFor(timeoutMillis, TimeUnit.MILLISECONDS)) {
+                return process.exitValue();
+            }
+            throw new JobFailure("job-deadline");
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new JobFailure("job-interrupted");
+        } finally {
+            if (process.isAlive()) {
+                // Give Main's existing bounded shutdown hook a chance first. This
+                // is scoped to the child created above, never a shared browser.
+                List<ProcessHandle> descendants;
+                try {
+                    descendants = process.descendants().toList();
+                } catch (RuntimeException unavailable) {
+                    // Some restricted hosts deny process enumeration. Still stop
+                    // the exact child we launched; never let a diagnostic failure
+                    // prevent the primary shutdown signal or imply tree release.
+                    descendants = List.of();
+                    System.err.println("brewshot-watch: child tree unavailable; "
+                        + "release remains unconfirmed");
+                }
+                process.destroy();
+                try {
+                    if (!process.waitFor(10, TimeUnit.SECONDS)) {
+                        descendants.forEach(ProcessHandle::destroyForcibly);
+                        process.destroyForcibly();
+                        process.waitFor(5, TimeUnit.SECONDS);
+                    }
+                } catch (InterruptedException interrupted) {
+                    descendants.forEach(ProcessHandle::destroyForcibly);
+                    process.destroyForcibly();
+                    Thread.currentThread().interrupt();
+                }
+                if (process.isAlive()) {
+                    // Do not accept more jobs beside a child we could not stop.
+                    Thread.currentThread().interrupt();
+                }
+                System.err.println("brewshot-watch: bounded job interrupted; child shutdown "
+                    + "requested; Chrome release is not proven by timeout");
+            }
+        }
+    }
+
+    private static Map<?, ?> readJobResult(Path path) throws IOException, JobFailure {
+        if (!Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS) || Files.size(path) > 65536) {
+            throw new JobFailure("job-result-missing");
+        }
+        Object parsed = MiniJson.parseStrict(BoundedUtf8.read(path, 65536, "job result"));
+        if (!(parsed instanceof Map<?, ?> map)) { throw new JobFailure("job-result-invalid"); }
+        return map;
+    }
+
+    private static CleanupOutcome cleanupFromJobResult(Map<?, ?> result) {
+        if (!(result.get("cleanup") instanceof Map<?, ?> cleanup)) { return null; }
+        if (!(cleanup.get("livePids") instanceof List<?> pids)
+                || !(cleanup.get("liveWithoutPid") instanceof Number unnamed)) { return null; }
+        var live = pids.stream().map(value -> ((Number) value).longValue()).toList();
+        return new CleanupOutcome(CleanupOutcome.State.PROCESS_UNCONFIRMED, live,
+            unnamed.intValue(), List.of(), null, "job capture cleanup");
+    }
+
+    static void requireGif(Path rendered) throws IOException, JobFailure {
+        if (!Files.isRegularFile(rendered, LinkOption.NOFOLLOW_LINKS) || Files.size(rendered) < 14) {
+            throw new JobFailure("empty-gif-output");
+        }
+        byte[] header;
+        try (InputStream in = Files.newInputStream(rendered)) { header = in.readNBytes(6); }
+        String version = new String(header, StandardCharsets.US_ASCII);
+        if (!version.equals("GIF87a") && !version.equals("GIF89a")) {
+            throw new JobFailure("invalid-gif-output");
+        }
+    }
+
+    private static long jobTimeoutMillis() {
+        String value = System.getenv("BREWSHOT_WATCH_JOB_TIMEOUT_MS");
+        if (value == null || value.isBlank()) { return 120_000; }
+        try {
+            long parsed = Long.parseLong(value);
+            if (parsed >= 1_000 && parsed <= 600_000) { return parsed; }
+        } catch (NumberFormatException ignored) { }
+        throw new IllegalArgumentException("BREWSHOT_WATCH_JOB_TIMEOUT_MS must be 1000..600000");
     }
 
     /**
@@ -788,7 +997,7 @@ public final class BrewShotFolderWorker {
             return false;
         }
         String lower = name.toLowerCase(Locale.ROOT);
-        return lower.endsWith(".html") || lower.endsWith(".htm");
+        return eligibleName(lower);
     }
 
     private static Claim parseClaim(Path path) throws IOException {
@@ -848,7 +1057,8 @@ public final class BrewShotFolderWorker {
     private static boolean eligibleName(String name) {
         String lower = name.toLowerCase(Locale.ROOT);
         return !name.startsWith(".")
-            && (lower.endsWith(".html") || lower.endsWith(".htm"));
+            && (lower.endsWith(".html") || lower.endsWith(".htm")
+                || isManifestName(lower));
     }
 
     private static void ensureDirectory(Path dir) throws IOException {
@@ -921,7 +1131,7 @@ public final class BrewShotFolderWorker {
         }
     }
 
-    private static final class JobFailure extends Exception {
+    static final class JobFailure extends Exception {
         private final String code;
 
         JobFailure(String code) {

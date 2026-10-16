@@ -39,6 +39,10 @@ application {
     mainClass = "com.brewshot.Main"
 }
 
+// The container worker is a separate runtime jar, but its orchestration tests
+// must compile and execute in the browser-free lane too.
+sourceSets.test { java.srcDir("docker") }
+
 tasks.jar {
     manifest {
         attributes("Main-Class" to "com.brewshot.Main")

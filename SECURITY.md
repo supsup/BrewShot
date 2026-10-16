@@ -121,6 +121,28 @@ harness for TRUSTED pages driven by a trusted operator** — calibrate to that.
    host-scoped credentials prefer `cookie()`, which the browser applies under
    its own same-domain rules.
 
+## Watched job trust and networking
+
+Anyone who can write a `*.brewshot.json` or `*.brewshot.zip` into the watched
+input folder can run trusted page JavaScript and make the container access its
+reachable network, including host services. Website sources must explicitly
+use HTTP(S); `file:`, `data:` and browser-internal URL schemes are refused as
+manifest URL sources. This is a source-scheme check, not an SSRF allowlist:
+HTTP redirects and page subresources retain ordinary browser network reach.
+Do not expose the drop folder to untrusted producers. Do not put credentials
+in URL references. The worker suppresses raw child output and logs bounded
+job codes rather than page text or URL queries.
+
+ZIP extraction has finite compressed/expanded-byte and entry-count limits and
+rejects traversal, links/special entries and duplicates. Extracted local HTML
+is opened with `file://`; local fetch/XHR and ES modules have Chrome's file-origin
+limitations. These checks protect the job packaging contract; they do not
+sandbox page code or prevent it from fetching network resources. Preparation
+scripts run in the page through the existing eval path, with no shell argument
+interpolation. The job subprocess has an outer deadline (120 seconds by
+default, plus bounded shutdown); an expired job is failed, never described as
+successful or as proof that all browser resources are gone.
+
 ## Reporting
 
 This is a small, single-maintainer utility provided under Apache-2.0 on an
