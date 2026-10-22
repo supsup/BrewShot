@@ -67,12 +67,16 @@ RUN apk add --no-cache --upgrade ca-certificates openssl \
     && sh /opt/trust/distrust-os-sources.sh /usr/share/ca-certificates /usr/local/share/ca-certificates \
     && update-ca-certificates \
     && sh /opt/trust/distrust-java-roots.sh "${JAVA_HOME}/lib/security/cacerts"
+# chromium pulls python3 in (via at-spi2-core) and with it ensurepip's bundled pip wheel,
+# whose vendored certifi carries emSign G3 and AAA. BrewShot never runs pip: drop the wheel.
 RUN apk add --no-cache \
         tini="${TINI_VERSION}" \
         chromium="${CHROMIUM_VERSION}" \
         font-liberation="${FONT_LIBERATION_VERSION}" \
         font-dejavu="${FONT_DEJAVU_VERSION}" \
-        font-noto-emoji="${FONT_NOTO_EMOJI_VERSION}"
+        font-noto-emoji="${FONT_NOTO_EMOJI_VERSION}" \
+    && rm -f /usr/lib/python3*/ensurepip/_bundled/*.whl \
+    && ! ls /usr/lib/python3*/ensurepip/_bundled/*.whl 2>/dev/null
 ENV BREWSHOT_CHROME=/usr/bin/chromium-browser \
     BREWSHOT_CHROME_ARGS="--no-sandbox --disable-dev-shm-usage" \
     BREWSHOT_REQUIRE_CHROME=1
@@ -102,12 +106,16 @@ RUN apk add --no-cache --upgrade ca-certificates openssl \
     && sh /opt/trust/distrust-os-sources.sh /usr/share/ca-certificates /usr/local/share/ca-certificates \
     && update-ca-certificates \
     && sh /opt/trust/distrust-java-roots.sh "${JAVA_HOME}/lib/security/cacerts"
+# chromium pulls python3 in (via at-spi2-core) and with it ensurepip's bundled pip wheel,
+# whose vendored certifi carries emSign G3 and AAA. BrewShot never runs pip: drop the wheel.
 RUN apk add --no-cache \
         tini="${TINI_VERSION}" \
         chromium="${CHROMIUM_VERSION}" \
         font-liberation="${FONT_LIBERATION_VERSION}" \
         font-dejavu="${FONT_DEJAVU_VERSION}" \
-        font-noto-emoji="${FONT_NOTO_EMOJI_VERSION}"
+        font-noto-emoji="${FONT_NOTO_EMOJI_VERSION}" \
+    && rm -f /usr/lib/python3*/ensurepip/_bundled/*.whl \
+    && ! ls /usr/lib/python3*/ensurepip/_bundled/*.whl 2>/dev/null
 
 # Chrome's sandbox needs privileges containers don't grant by default;
 # BrewShot appends these flags to the launch.
