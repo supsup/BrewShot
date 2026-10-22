@@ -22,6 +22,15 @@ ARG TINI_VERSION=0.19.0-r3
 
 # ---- build the jar -------------------------------------------------------
 FROM ${TEMURIN_JDK_IMAGE} AS build
+# Remove the eMudhra-affected roots before Gradle fetches anything (trust/README.md).
+COPY trust/ /opt/trust/
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates openssl \
+    && mkdir -p /usr/local/share/ca-certificates \
+    && sh /opt/trust/distrust-os-sources.sh /usr/share/ca-certificates /usr/local/share/ca-certificates \
+    && update-ca-certificates \
+    && sh /opt/trust/distrust-java-roots.sh "${JAVA_HOME}/lib/security/cacerts" \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
 RUN ./gradlew --no-daemon clean jar \
@@ -38,6 +47,8 @@ RUN mkdir -p /worker-classes \
         --main-class com.brewshot.BrewShotFolderWorker \
         -C /worker-classes .
 
+RUN sh /opt/trust/guard-no-forbidden.sh /etc/ssl/certs/ca-certificates.crt "${JAVA_HOME}/lib/security/cacerts"
+
 # ---- reproducible real-browser CI lane ----------------------------------
 # `docker build --target chrome-test .` runs only the source-derived Chrome
 # test catalog against the same pinned Chromium/font set the runtime ships.
@@ -47,6 +58,15 @@ ARG FONT_LIBERATION_VERSION
 ARG FONT_DEJAVU_VERSION
 ARG FONT_NOTO_EMOJI_VERSION
 ARG TINI_VERSION
+# Same removal on Alpine (trust/README.md). An upgrade over a locally modified bundle
+# writes ca-certificates.crt.apk-new; drop it and regenerate from the filtered sources.
+COPY trust/ /opt/trust/
+RUN apk add --no-cache --upgrade ca-certificates openssl \
+    && rm -f /etc/ssl/certs/ca-certificates.crt.apk-new \
+    && mkdir -p /usr/local/share/ca-certificates \
+    && sh /opt/trust/distrust-os-sources.sh /usr/share/ca-certificates /usr/local/share/ca-certificates \
+    && update-ca-certificates \
+    && sh /opt/trust/distrust-java-roots.sh "${JAVA_HOME}/lib/security/cacerts"
 RUN apk add --no-cache \
         tini="${TINI_VERSION}" \
         chromium="${CHROMIUM_VERSION}" \
@@ -62,6 +82,7 @@ COPY . .
 # has no init, so orphaned helpers stay as zombies the real-Chrome cleanup tests then see.
 # Subreaper mode (-s) needs no pid 1. Plan a7074a87.
 RUN tini -s -- ./gradlew --no-daemon chromeTest --stacktrace
+RUN sh /opt/trust/guard-no-forbidden.sh /etc/ssl/certs/ca-certificates.crt "${JAVA_HOME}/lib/security/cacerts"
 
 # ---- runtime: JRE + chromium + fonts ------------------------------------
 # Alpine, deliberately: Ubuntu/Debian-slim images ship a snap-stub `chromium`
@@ -72,6 +93,15 @@ ARG FONT_LIBERATION_VERSION
 ARG FONT_DEJAVU_VERSION
 ARG FONT_NOTO_EMOJI_VERSION
 ARG TINI_VERSION
+# Same removal on Alpine (trust/README.md). An upgrade over a locally modified bundle
+# writes ca-certificates.crt.apk-new; drop it and regenerate from the filtered sources.
+COPY trust/ /opt/trust/
+RUN apk add --no-cache --upgrade ca-certificates openssl \
+    && rm -f /etc/ssl/certs/ca-certificates.crt.apk-new \
+    && mkdir -p /usr/local/share/ca-certificates \
+    && sh /opt/trust/distrust-os-sources.sh /usr/share/ca-certificates /usr/local/share/ca-certificates \
+    && update-ca-certificates \
+    && sh /opt/trust/distrust-java-roots.sh "${JAVA_HOME}/lib/security/cacerts"
 RUN apk add --no-cache \
         tini="${TINI_VERSION}" \
         chromium="${CHROMIUM_VERSION}" \
@@ -101,6 +131,8 @@ COPY --from=build /out/brewshot-worker.jar /opt/brewshot/brewshot-worker.jar
 COPY docker/entrypoint.sh /opt/brewshot/entrypoint.sh
 RUN chmod 0555 /opt/brewshot/entrypoint.sh \
     && chmod 0444 /opt/brewshot/brewshot.jar /opt/brewshot/brewshot-worker.jar
+
+RUN sh /opt/trust/guard-no-forbidden.sh /etc/ssl/certs/ca-certificates.crt "${JAVA_HOME}/lib/security/cacerts"
 
 USER 10001:10001
 ENV HOME=/home/brewshot
