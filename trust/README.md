@@ -19,6 +19,16 @@ G3 in the JDK/JRE `cacerts`, and a `--pull` rebuild does not remove it.
 
 Each stage upgrades the distro CA package, filters the OS CA sources, regenerates
 the bundle, cleans `$JAVA_HOME/lib/security/cacerts`, and ends with the guard.
+
+`TRUST_REFRESH` (an `ARG` holding a date, declared immediately before each stage's
+CA-package RUN and written to `/etc/<repo>-trust-refresh`) is a cache-buster: an
+unchanged RUN is reused from the build cache (and a digest-pinned base never
+moves), so without it the OS bundle stays frozen at that layer's first build. The
+lead bumps its default (or passes `--build-arg TRUST_REFRESH=<date>`) when an
+upstream ca-certificates update lands; that re-runs the package upgrade and every
+later layer. It only fetches upstream's fix. The distrust scripts and the guard
+still run after it, unchanged, and remain the enforcement.
+
 The files above are identical in LatteX and Sirentide; the Chromium files below
 are BrewShot-only.
 
