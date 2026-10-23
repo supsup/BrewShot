@@ -22,6 +22,15 @@ ARG TINI_VERSION=0.19.0-r3
 
 # ---- build the jar -------------------------------------------------------
 FROM ${TEMURIN_JDK_IMAGE} AS build
+# Remove the eMudhra-affected roots before Gradle fetches anything (trust/README.md).
+COPY trust/ /opt/trust/
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates openssl \
+    && mkdir -p /usr/local/share/ca-certificates \
+    && sh /opt/trust/distrust-os-sources.sh /usr/share/ca-certificates /usr/local/share/ca-certificates \
+    && update-ca-certificates \
+    && sh /opt/trust/distrust-java-roots.sh "${JAVA_HOME}/lib/security/cacerts" \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
 RUN ./gradlew --no-daemon clean jar \
@@ -38,6 +47,8 @@ RUN mkdir -p /worker-classes \
         --main-class com.brewshot.BrewShotFolderWorker \
         -C /worker-classes .
 
+RUN sh /opt/trust/guard-no-forbidden.sh /etc/ssl/certs/ca-certificates.crt "${JAVA_HOME}/lib/security/cacerts"
+
 # ---- reproducible real-browser CI lane ----------------------------------
 # `docker build --target chrome-test .` runs only the source-derived Chrome
 # test catalog against the same pinned Chromium/font set the runtime ships.
@@ -47,12 +58,33 @@ ARG FONT_LIBERATION_VERSION
 ARG FONT_DEJAVU_VERSION
 ARG FONT_NOTO_EMOJI_VERSION
 ARG TINI_VERSION
+# Same removal on Alpine (trust/README.md). An upgrade over a locally modified bundle
+# writes ca-certificates.crt.apk-new; drop it and regenerate from the filtered sources.
+COPY trust/ /opt/trust/
+RUN apk add --no-cache --upgrade ca-certificates openssl \
+    && rm -f /etc/ssl/certs/ca-certificates.crt.apk-new \
+    && mkdir -p /usr/local/share/ca-certificates \
+    && sh /opt/trust/distrust-os-sources.sh /usr/share/ca-certificates /usr/local/share/ca-certificates \
+    && update-ca-certificates \
+    && sh /opt/trust/distrust-java-roots.sh "${JAVA_HOME}/lib/security/cacerts"
+# chromium pulls python3 in (via at-spi2-core) and with it ensurepip's bundled pip wheel,
+# whose vendored certifi carries emSign G3 and AAA. BrewShot never runs pip: drop the wheel.
 RUN apk add --no-cache \
         tini="${TINI_VERSION}" \
         chromium="${CHROMIUM_VERSION}" \
         font-liberation="${FONT_LIBERATION_VERSION}" \
         font-dejavu="${FONT_DEJAVU_VERSION}" \
-        font-noto-emoji="${FONT_NOTO_EMOJI_VERSION}"
+        font-noto-emoji="${FONT_NOTO_EMOJI_VERSION}" \
+    && rm -f /usr/lib/python3*/ensurepip/_bundled/*.whl \
+    && ! ls /usr/lib/python3*/ensurepip/_bundled/*.whl 2>/dev/null
+# Chromium 149 trusts its compiled-in Chrome Root Store (which still holds emSign ECC
+# Root CA - G3), not the OS bundle filtered above. Distrust both roots by mandatory
+# CADistrustedCertificates policy, written from trust/blocked-roots/ (trust/README.md).
+RUN install -d -o root -g root -m 0755 /etc/chromium/policies /etc/chromium/policies/managed \
+    && sh /opt/trust/write-chromium-policy.sh /opt/trust/blocked-roots \
+        /etc/chromium/policies/managed/stafficy-emudhra-distrust.json \
+    && chown root:root /etc/chromium/policies/managed/stafficy-emudhra-distrust.json \
+    && sh /opt/trust/guard-chromium-policy.sh /etc/chromium/policies/managed/stafficy-emudhra-distrust.json
 ENV BREWSHOT_CHROME=/usr/bin/chromium-browser \
     BREWSHOT_CHROME_ARGS="--no-sandbox --disable-dev-shm-usage" \
     BREWSHOT_REQUIRE_CHROME=1
@@ -62,6 +94,9 @@ COPY . .
 # has no init, so orphaned helpers stay as zombies the real-Chrome cleanup tests then see.
 # Subreaper mode (-s) needs no pid 1. Plan a7074a87.
 RUN tini -s -- ./gradlew --no-daemon chromeTest --stacktrace
+# Prove Chromium LOADED the policy: BrewShot reads chrome://policy's loaded state.
+RUN tini -s -- sh /opt/trust/check-chromium-policy-loaded.sh /src/build/classes/java/main "${CHROMIUM_VERSION%-r*}"
+RUN sh /opt/trust/guard-no-forbidden.sh /etc/ssl/certs/ca-certificates.crt "${JAVA_HOME}/lib/security/cacerts"
 
 # ---- runtime: JRE + chromium + fonts ------------------------------------
 # Alpine, deliberately: Ubuntu/Debian-slim images ship a snap-stub `chromium`
@@ -72,12 +107,33 @@ ARG FONT_LIBERATION_VERSION
 ARG FONT_DEJAVU_VERSION
 ARG FONT_NOTO_EMOJI_VERSION
 ARG TINI_VERSION
+# Same removal on Alpine (trust/README.md). An upgrade over a locally modified bundle
+# writes ca-certificates.crt.apk-new; drop it and regenerate from the filtered sources.
+COPY trust/ /opt/trust/
+RUN apk add --no-cache --upgrade ca-certificates openssl \
+    && rm -f /etc/ssl/certs/ca-certificates.crt.apk-new \
+    && mkdir -p /usr/local/share/ca-certificates \
+    && sh /opt/trust/distrust-os-sources.sh /usr/share/ca-certificates /usr/local/share/ca-certificates \
+    && update-ca-certificates \
+    && sh /opt/trust/distrust-java-roots.sh "${JAVA_HOME}/lib/security/cacerts"
+# chromium pulls python3 in (via at-spi2-core) and with it ensurepip's bundled pip wheel,
+# whose vendored certifi carries emSign G3 and AAA. BrewShot never runs pip: drop the wheel.
 RUN apk add --no-cache \
         tini="${TINI_VERSION}" \
         chromium="${CHROMIUM_VERSION}" \
         font-liberation="${FONT_LIBERATION_VERSION}" \
         font-dejavu="${FONT_DEJAVU_VERSION}" \
-        font-noto-emoji="${FONT_NOTO_EMOJI_VERSION}"
+        font-noto-emoji="${FONT_NOTO_EMOJI_VERSION}" \
+    && rm -f /usr/lib/python3*/ensurepip/_bundled/*.whl \
+    && ! ls /usr/lib/python3*/ensurepip/_bundled/*.whl 2>/dev/null
+# Chromium 149 trusts its compiled-in Chrome Root Store (which still holds emSign ECC
+# Root CA - G3), not the OS bundle filtered above. Distrust both roots by mandatory
+# CADistrustedCertificates policy, written from trust/blocked-roots/ (trust/README.md).
+RUN install -d -o root -g root -m 0755 /etc/chromium/policies /etc/chromium/policies/managed \
+    && sh /opt/trust/write-chromium-policy.sh /opt/trust/blocked-roots \
+        /etc/chromium/policies/managed/stafficy-emudhra-distrust.json \
+    && chown root:root /etc/chromium/policies/managed/stafficy-emudhra-distrust.json \
+    && sh /opt/trust/guard-chromium-policy.sh /etc/chromium/policies/managed/stafficy-emudhra-distrust.json
 
 # Chrome's sandbox needs privileges containers don't grant by default;
 # BrewShot appends these flags to the launch.
@@ -101,6 +157,11 @@ COPY --from=build /out/brewshot-worker.jar /opt/brewshot/brewshot-worker.jar
 COPY docker/entrypoint.sh /opt/brewshot/entrypoint.sh
 RUN chmod 0555 /opt/brewshot/entrypoint.sh \
     && chmod 0444 /opt/brewshot/brewshot.jar /opt/brewshot/brewshot-worker.jar
+
+# The shipped jar and Chromium must report the distrust policy loaded (trust/README.md).
+RUN tini -s -- sh /opt/trust/check-chromium-policy-loaded.sh /opt/brewshot/brewshot.jar "${CHROMIUM_VERSION%-r*}"
+
+RUN sh /opt/trust/guard-no-forbidden.sh /etc/ssl/certs/ca-certificates.crt "${JAVA_HOME}/lib/security/cacerts"
 
 USER 10001:10001
 ENV HOME=/home/brewshot
