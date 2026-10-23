@@ -12,7 +12,10 @@
 # scope, an error or warning, ignored=true, or a forbidden root missing from
 # its loaded value), 2 VOID (BrewShot or the reader did not complete, its
 # report is not the exact v2 grammar, a producer failed, or scratch cleanup
-# failed after a passing evaluation). IGNORED is absent|false|true|invalid:
+# failed after a passing evaluation). HUP/INT/TERM before the verdict is VOID
+# (2). A signal DURING the exit cleanup is recorded, never ignored: cleanup
+# finishes, then PASS becomes VOID (2), FAIL stays 1 and VOID stays 2, each
+# with a diagnostic. IGNORED is absent|false|true|invalid:
 # absent and false are not ignored (Chromium omits the key unless true), true
 # is FAIL, invalid (any non-boolean) is VOID.
 # CLASSPATH is the BrewShot jar or classes directory. EXPECTED_VERSION, when
@@ -24,13 +27,16 @@ export LC_ALL=C
 cp=$1; expected=${2:-}
 g3=86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b
 aaa=d7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4
-work=""
+work=""; interrupted=""
 void() { echo "CHECK chromium-policy-loaded VOID (exit 2): $*" >&2; exit 2; }
 fail() { echo "CHECK chromium-policy-loaded FAIL (exit 1): $*" >&2; exit 1; }
 # Removes the trap-owned scratch and checks it is gone. Safe to call twice.
 cleanup() {
     [ -n "$work" ] || return 0
     rm -rf "$work"; c=$?
+    # Once a trap has run, dash reports the EXIT status in $?, not rm's, so
+    # after a signal only the existence check counts.
+    [ -z "$interrupted" ] || c=0
     if [ "$c" -ne 0 ] || [ -e "$work" ] || [ -L "$work" ]; then
         echo "CHECK chromium-policy-loaded CLEANUP FAILED: scratch $work not removed (rm: $c)" >&2
         work=""; return 1
@@ -38,11 +44,21 @@ cleanup() {
     work=""; return 0
 }
 # A cleanup failure raises PASS to VOID; FAIL stays 1 (diagnostic printed).
+# A signal during this cleanup is recorded, never ignored (first one wins).
 on_exit() {
     rc=$1
-    trap '' HUP INT TERM
+    trap 'interrupted=${interrupted:-HUP}' HUP
+    trap 'interrupted=${interrupted:-INT}' INT
+    trap 'interrupted=${interrupted:-TERM}' TERM
     if ! cleanup && [ "$rc" -eq 0 ]; then
         echo "CHECK chromium-policy-loaded VOID (exit 2): scratch cleanup failed" >&2; rc=2
+    fi
+    if [ -n "$interrupted" ]; then
+        case "$rc" in
+          0) echo "CHECK chromium-policy-loaded VOID (exit 2): SIG$interrupted during scratch cleanup" >&2; rc=2 ;;
+          1) echo "CHECK chromium-policy-loaded: SIG$interrupted during scratch cleanup is reported; FAIL (exit 1) stands: Chromium reported the policy absent or not in force" >&2 ;;
+          *) echo "CHECK chromium-policy-loaded: SIG$interrupted during scratch cleanup is reported; VOID stands" >&2 ;;
+        esac
     fi
     exit "$rc"
 }

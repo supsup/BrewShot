@@ -13,27 +13,44 @@ export LC_ALL=C
 # with errexit OFF and its status is checked explicitly, so a failed rm can
 # neither abort the trap nor leak its own status. The scratch directory is
 # removed (and checked) BEFORE the policy is moved into place, so a cleanup
-# failure leaves no output.
+# failure leaves no output. A HUP/INT/TERM that arrives DURING the exit cleanup
+# is recorded, never ignored: cleanup finishes (no writer work resumes) and the
+# exit is 2. A signal during the pre-publish scratch removal stops the writer
+# before the move (exit 2, nothing published); a signal during the move itself
+# lets that mv finish, so the policy can be in place although the exit is 2.
 work=""; tmp=""
 on_exit() {
+    # Record, never ignore, a signal during cleanup (first one wins).
+    interrupted=
+    trap 'interrupted=${interrupted:-HUP}' HUP
+    trap 'interrupted=${interrupted:-INT}' INT
+    trap 'interrupted=${interrupted:-TERM}' TERM
     rc=$1
     set +e
-    trap '' HUP INT TERM
     status=0
     if [ "$rc" -ne 0 ]; then
         echo "policy writer: refused (exit 2): failed with exit $rc" >&2; status=2
     fi
     if [ -n "$tmp" ]; then
         rm -f "$tmp"; cleanup=$?
+        # Once a trap has run, dash reports the EXIT status in $?, not rm's,
+        # so after a signal only the existence check counts.
+        [ -z "$interrupted" ] || cleanup=0
         if [ "$cleanup" -ne 0 ] || [ -e "$tmp" ] || [ -L "$tmp" ]; then
             echo "policy writer: CLEANUP FAILED, temp policy $tmp not removed (rm: $cleanup)" >&2; status=2
         fi
     fi
     if [ -n "$work" ]; then
         rm -rf "$work"; cleanup=$?
+        # Once a trap has run, dash reports the EXIT status in $?, not rm's,
+        # so after a signal only the existence check counts.
+        [ -z "$interrupted" ] || cleanup=0
         if [ "$cleanup" -ne 0 ] || [ -e "$work" ] || [ -L "$work" ]; then
             echo "policy writer: CLEANUP FAILED, scratch $work not removed (rm: $cleanup)" >&2; status=2
         fi
+    fi
+    if [ -n "$interrupted" ]; then
+        echo "policy writer: refused (exit 2): interrupted by SIG$interrupted during cleanup" >&2; status=2
     fi
     exit "$status"
 }

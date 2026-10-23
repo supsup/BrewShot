@@ -13,6 +13,11 @@
 #     one is VOID even when its output looks complete. A scratch directory
 #     that mktemp does not hand back as a real directory, or a scratch cleanup
 #     that fails after an otherwise passing evaluation, is VOID too.
+#   Signals: HUP/INT/TERM before the verdict is VOID (2). A signal DURING
+#     scratch cleanup is recorded, never ignored: cleanup finishes (no guard
+#     work resumes), then a passing evaluation becomes VOID (2), FAIL stays 1
+#     (the evaluation found the policy wrong) and VOID stays 2, each with a
+#     diagnostic.
 #   FAIL (1): evaluated and wrong: a forbidden root is not in the list; the
 #     file is a symlink or not a regular file; the file, its directory or the
 #     policies directory is not owned by OWNER_UID or is group/other-writable;
@@ -27,7 +32,13 @@ policy=$1; owner=${2:-0}
 case "$owner" in ''|*[!0-9]*) echo 'GUARD chromium-policy VOID: OWNER_UID must be numeric' >&2; exit 2 ;; esac
 g3=86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b
 aaa=d7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4
-void=0; fail=0; work=""; entries=0
+void=0; fail=0; work=""; entries=0; interrupted=""; sig_reported=0
+# Record, never ignore, a signal during cleanup (first one wins).
+record_signals() {
+    trap 'interrupted=${interrupted:-HUP}' HUP
+    trap 'interrupted=${interrupted:-INT}' INT
+    trap 'interrupted=${interrupted:-TERM}' TERM
+}
 voidp() { echo "GUARD chromium-policy VOID: $*" >&2; void=1; }
 failp() { echo "GUARD chromium-policy FAIL: $*" >&2; fail=1; }
 # Removes the trap-owned scratch and checks it is gone; returns 1 (with a
@@ -35,6 +46,9 @@ failp() { echo "GUARD chromium-policy FAIL: $*" >&2; fail=1; }
 cleanup() {
     [ -n "$work" ] || return 0
     rm -rf "$work"; c=$?
+    # Once a trap has run, dash reports the EXIT status in $?, not rm's, so
+    # after a signal only the existence check counts.
+    [ -z "$interrupted" ] || c=0
     if [ "$c" -ne 0 ] || [ -e "$work" ] || [ -L "$work" ]; then
         echo "GUARD chromium-policy CLEANUP FAILED: scratch $work not removed (rm: $c)" >&2
         work=""; return 1
@@ -42,11 +56,21 @@ cleanup() {
     work=""; return 0
 }
 finish() {
-    trap '' HUP INT TERM
-    # A cleanup failure turns a PASS into VOID; FAIL stays FAIL (the diagnostic
-    # above is printed) and VOID stays VOID.
+    record_signals
+    # A cleanup failure or a signal during cleanup turns a PASS into VOID; FAIL
+    # stays FAIL and VOID stays VOID (the diagnostic is printed either way).
     if ! cleanup && [ "$void" -eq 0 ] && [ "$fail" -eq 0 ]; then
         voidp "scratch cleanup failed after a passing evaluation"
+    fi
+    if [ -n "$interrupted" ]; then
+        sig_reported=1
+        if [ "$void" -eq 1 ]; then
+            echo "GUARD chromium-policy: SIG$interrupted during scratch cleanup is reported; VOID stands" >&2
+        elif [ "$fail" -eq 1 ]; then
+            echo "GUARD chromium-policy: SIG$interrupted during scratch cleanup is reported; FAIL (exit 1) stands: the evaluation found the policy wrong" >&2
+        else
+            voidp "SIG$interrupted during scratch cleanup after a passing evaluation"
+        fi
     fi
     if [ "$void" -eq 1 ]; then echo "GUARD chromium-policy VOID (exit 2): $policy" >&2; exit 2; fi
     if [ "$fail" -eq 1 ]; then echo "GUARD chromium-policy FAIL (exit 1): $policy" >&2; exit 1; fi
@@ -57,8 +81,15 @@ finish() {
 # cleanup failure can only raise the status to VOID, never lower it.
 on_exit() {
     rc=$1
-    trap '' HUP INT TERM
+    record_signals
     if ! cleanup && [ "$rc" -eq 0 ]; then rc=2; fi
+    if [ -n "$interrupted" ]; then
+        if [ "$rc" -eq 0 ]; then
+            echo "GUARD chromium-policy VOID (exit 2): SIG$interrupted during cleanup" >&2; rc=2
+        elif [ "$sig_reported" -eq 0 ]; then
+            echo "GUARD chromium-policy: SIG$interrupted during cleanup is reported; exit $rc stands" >&2
+        fi
+    fi
     exit "$rc"
 }
 trap 'on_exit "$?"' EXIT
