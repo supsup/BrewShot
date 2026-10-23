@@ -7,9 +7,14 @@
 # with no error, warning or ignored flag, and its values decode to DER whose
 # SHA-256 includes both forbidden roots.
 #
-# Exit 0 PASS, 1 FAIL (Chromium reports the policy absent or not in force, or
-# a forbidden root missing from its loaded value), 2 VOID (BrewShot or the
-# reader did not complete, or its report is not the exact v1 grammar).
+# Exit 0 PASS, 1 FAIL (Chromium reports the policy absent from the browser
+# (chrome) group or not in force: not mandatory, not platform, not machine
+# scope, an error or warning, ignored=true, or a forbidden root missing from
+# its loaded value), 2 VOID (BrewShot or the reader did not complete, its
+# report is not the exact v2 grammar, a producer failed, or scratch cleanup
+# failed after a passing evaluation). IGNORED is absent|false|true|invalid:
+# absent and false are not ignored (Chromium omits the key unless true), true
+# is FAIL, invalid (any non-boolean) is VOID.
 # CLASSPATH is the BrewShot jar or classes directory. EXPECTED_VERSION, when
 # given, must prefix the Chromium version the page reports (binds the check to
 # the pinned package).
@@ -17,17 +22,41 @@ set -u
 export LC_ALL=C
 [ "$#" -ge 1 ] && [ "$#" -le 2 ] || { echo 'usage: check-chromium-policy-loaded.sh CLASSPATH [EXPECTED_VERSION]' >&2; exit 2; }
 cp=$1; expected=${2:-}
-here=$(dirname "$0")
-reader="$here/chromium-policy-reader.js"
 g3=86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b
 aaa=d7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4
+work=""
 void() { echo "CHECK chromium-policy-loaded VOID (exit 2): $*" >&2; exit 2; }
 fail() { echo "CHECK chromium-policy-loaded FAIL (exit 1): $*" >&2; exit 1; }
+# Removes the trap-owned scratch and checks it is gone. Safe to call twice.
+cleanup() {
+    [ -n "$work" ] || return 0
+    rm -rf "$work"; c=$?
+    if [ "$c" -ne 0 ] || [ -e "$work" ] || [ -L "$work" ]; then
+        echo "CHECK chromium-policy-loaded CLEANUP FAILED: scratch $work not removed (rm: $c)" >&2
+        work=""; return 1
+    fi
+    work=""; return 0
+}
+# A cleanup failure raises PASS to VOID; FAIL stays 1 (diagnostic printed).
+on_exit() {
+    rc=$1
+    trap '' HUP INT TERM
+    if ! cleanup && [ "$rc" -eq 0 ]; then
+        echo "CHECK chromium-policy-loaded VOID (exit 2): scratch cleanup failed" >&2; rc=2
+    fi
+    exit "$rc"
+}
+trap 'on_exit "$?"' EXIT
+trap 'exit 2' HUP INT TERM
+here=$(dirname "$0") || void "dirname failed on $0"
+reader="$here/chromium-policy-reader.js"
 [ -e "$cp" ] || void "classpath $cp does not exist"
 [ -s "$reader" ] || void "reader $reader is missing"
-work=$(mktemp -d) || void 'cannot create a scratch directory'
-trap 'rm -rf "$work"' EXIT
-trap 'exit 2' HUP INT TERM
+# Assign the trap-owned $work only after mktemp succeeds AND yields a real
+# (non-symlink) directory.
+scratch=$(mktemp -d) && [ -n "$scratch" ] && [ -d "$scratch" ] && [ ! -L "$scratch" ] \
+    || void "mktemp -d did not yield a scratch directory: '${scratch:-}'"
+work=$scratch
 mkdir "$work/home" "$work/tmp" || void 'cannot create scratch HOME/tmp'
 
 # Scratch HOME/XDG/tmp: the browser leaves nothing in the image, and no NSS db
@@ -46,14 +75,14 @@ if [ "$rc" -ne 0 ]; then
     cat "$work/stderr" >&2
     void "brewshot exited $rc reading chrome://policy"
 fi
-cat "$work/stdout"
+cat "$work/stdout" || void 'cannot replay the reader report'
 
-# Strict v1 grammar, line by line. Present form:
+# Strict v2 grammar, line by line. Present form:
 #   READER, VERSION, ENTRY present, LEVEL, SOURCE, SCOPE, ERROR, WARNING,
 #   IGNORED, COUNT n, n VALUE lines, END.  Absent form: READER, VERSION, ENTRY absent, END.
 awk -v out="$work" '
   function bad() { failed=1; exit 3 }
-  NR==1 { if ($0 != "READER brewshot-chromium-policy v1") bad(); next }
+  NR==1 { if ($0 != "READER brewshot-chromium-policy v2") bad(); next }
   NR==2 { if ($0 !~ /^VERSION [^ ].*$/) bad(); v=$0; sub(/^VERSION /,"",v); print v > (out "/version"); next }
   NR==3 { if ($0 == "ENTRY absent") { state="absent"; next }
           if ($0 == "ENTRY present") { state="present"; next } bad() }
@@ -72,7 +101,7 @@ awk -v out="$work" '
   NR==11+count && state=="present" { if ($0 != "END") bad(); done=1; next }
   { bad() }
   END { if (failed || !done) exit 3; print state > (out "/state"); if (state=="present") print count > (out "/count") }
-' "$work/stdout" || void "reader output is not the v1 grammar"
+' "$work/stdout" || void "reader output is not the v2 grammar"
 
 version=$(cat "$work/version") || void 'no version'
 echo "CHECK chromium-policy-loaded: Chromium reports version $version"
@@ -85,22 +114,27 @@ for k in LEVEL SOURCE SCOPE ERROR WARNING IGNORED; do
     eval "$k=\$(cat \"\$work/$k\")" || void "no $k"
 done
 echo "CHECK chromium-policy-loaded: level=$LEVEL source=$SOURCE scope=$SCOPE error=$ERROR warning=$WARNING ignored=$IGNORED"
+# A malformed report is VOID before any FAIL is decided.
+case "$IGNORED" in absent|false|true) ;; *) void "reader reports IGNORED '$IGNORED' (not a boolean)" ;; esac
 [ "$LEVEL" = mandatory ] || fail "policy level is $LEVEL, not mandatory"
 [ "$SOURCE" = platform ] || fail "policy source is $SOURCE, not platform"
+[ "$SCOPE" = machine ] || fail "policy scope is $SCOPE, not machine"
 [ "$ERROR" = - ] || fail "Chromium reports a policy error: $ERROR"
 [ "$WARNING" = - ] || fail "Chromium reports a policy warning: $WARNING"
-[ "$IGNORED" = false ] || fail "Chromium reports the policy ignored"
+[ "$IGNORED" != true ] || fail "Chromium reports the policy ignored"
 count=$(cat "$work/count") || void 'no count'
+case "$count" in ''|*[!0-9]*) void "count '$count' unreadable" ;; esac
 have_g3=0; have_aaa=0; i=1
 while [ "$i" -le "$count" ]; do
     e="$work/value.$i"
     tr -d '\n' < "$e" > "$e.in" && openssl base64 -d -A -in "$e.in" -out "$e.der" 2>/dev/null \
         && [ -s "$e.der" ] && openssl dgst -sha256 -r "$e.der" > "$e.sum" \
         || void "loaded value $i does not decode"
-    read -r sum rest < "$e.sum"
+    read -r sum rest < "$e.sum" || void "loaded value $i digest unreadable"
     case "$sum" in "$g3") have_g3=1 ;; "$aaa") have_aaa=1 ;; esac
     i=$((i + 1))
 done
 [ "$have_g3" -eq 1 ] || fail "loaded policy does not distrust emSign ECC Root CA - G3"
 [ "$have_aaa" -eq 1 ] || fail "loaded policy does not distrust AAA Certificate Services"
+cleanup || void 'scratch cleanup failed'
 echo "CHECK chromium-policy-loaded PASS: Chromium $version has CADistrustedCertificates in force (mandatory, platform, OK) with emSign ECC Root CA - G3 and AAA Certificate Services"

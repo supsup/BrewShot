@@ -42,11 +42,15 @@ and the per-run profile.
   if the file is missing or is not the canonical line of canonical base64 DER
   certificates; else 1 if a forbidden root is not listed, the file is not a
   root-owned regular file, it or its directories are group/other-writable, or
-  another file sits in `managed/`; else 0.
+  another file sits in `managed/`; else 0. Every producer whose output it
+  uses is status-checked (a failing one is VOID even with complete output),
+  and a scratch cleanup failure after a pass is VOID.
 - `check-chromium-policy-loaded.sh` with `chromium-policy-reader.js`: runs
   BrewShot itself on `chrome://policy` and reads the policy state Chromium
-  loaded (the page's own export JSON). Exit 1 unless the entry is present,
-  mandatory, platform-sourced, free of error/warning/ignored, and lists both
-  roots; 2 if the run or the report cannot be evaluated or the Chromium version
-  is not the pinned one. `chrome-test` runs it after `chromeTest`; the runtime
+  loaded (the page's own export JSON, browser `chrome` group only). Exit 1
+  unless the entry is present there, mandatory, platform-sourced,
+  machine-scoped, free of error/warning, not ignored (Chromium omits
+  `ignored` unless it is true), and lists both roots; 2 if the run or the v2
+  report cannot be evaluated (including a non-boolean `ignored`) or the
+  Chromium version is not the pinned one. `chrome-test` runs it after `chromeTest`; the runtime
   stage runs it on the shipped jar.
