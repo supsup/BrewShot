@@ -9,7 +9,7 @@
 # found a problem, else 0. Run it as the last RUN of every stage it guards.
 set -u
 [ "$#" -eq 2 ] && [ -s "$1" ] && [ -s "$2" ] || { echo 'usage: guard-no-forbidden.sh OS_BUNDLE JAVA_CACERTS' >&2; exit 2; }
-here=$(dirname "$0")
+here=$(dirname "$0") || { echo "GUARD VOID: dirname failed on $0" >&2; exit 2; }
 bundle=$1; store=$2
 work=$(mktemp -d) || { echo 'GUARD VOID: cannot create a scratch directory' >&2; exit 2; }
 trap 'rm -rf "$work"' EXIT
