@@ -19,4 +19,34 @@ G3 in the JDK/JRE `cacerts`, and a `--pull` rebuild does not remove it.
 
 Each stage upgrades the distro CA package, filters the OS CA sources, regenerates
 the bundle, cleans `$JAVA_HOME/lib/security/cacerts`, and ends with the guard.
-This directory is identical in LatteX and Sirentide.
+The files above are identical in LatteX and Sirentide; the Chromium files below
+are BrewShot-only.
+
+## Chromium
+
+Chromium 149 (Alpine `chromium=149.0.7827.53-r0`) on Linux verifies against its
+compiled-in Chrome Root Store, which carries emSign ECC Root CA - G3 as a trust
+anchor, plus the NSS user database; it does not read the OS bundle, so the
+filtering above never reaches the browser BrewShot points at user URLs. The
+Chromium stages (`chrome-test` and runtime) therefore install the mandatory
+enterprise policy `CADistrustedCertificates` (Chromium 132+, Linux included:
+"any certificate with a matching SPKI will be distrusted") at
+`/etc/chromium/policies/managed/stafficy-emudhra-distrust.json`, outside HOME
+and the per-run profile.
+
+- `blocked-roots/`: the two forbidden root PEMs, the single source of the policy.
+- `write-chromium-policy.sh`: writes the policy as one canonical line from
+  those PEMs; refuses (exit 2) unless the directory holds exactly the two
+  pinned roots.
+- `guard-chromium-policy.sh`: file check run right after install. Exit 2 (VOID)
+  if the file is missing or is not the canonical line of canonical base64 DER
+  certificates; else 1 if a forbidden root is not listed, the file is not a
+  root-owned regular file, it or its directories are group/other-writable, or
+  another file sits in `managed/`; else 0.
+- `check-chromium-policy-loaded.sh` with `chromium-policy-reader.js`: runs
+  BrewShot itself on `chrome://policy` and reads the policy state Chromium
+  loaded (the page's own export JSON). Exit 1 unless the entry is present,
+  mandatory, platform-sourced, free of error/warning/ignored, and lists both
+  roots; 2 if the run or the report cannot be evaluated or the Chromium version
+  is not the pinned one. `chrome-test` runs it after `chromeTest`; the runtime
+  stage runs it on the shipped jar.

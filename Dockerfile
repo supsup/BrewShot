@@ -77,6 +77,14 @@ RUN apk add --no-cache \
         font-noto-emoji="${FONT_NOTO_EMOJI_VERSION}" \
     && rm -f /usr/lib/python3*/ensurepip/_bundled/*.whl \
     && ! ls /usr/lib/python3*/ensurepip/_bundled/*.whl 2>/dev/null
+# Chromium 149 trusts its compiled-in Chrome Root Store (which still holds emSign ECC
+# Root CA - G3), not the OS bundle filtered above. Distrust both roots by mandatory
+# CADistrustedCertificates policy, written from trust/blocked-roots/ (trust/README.md).
+RUN install -d -o root -g root -m 0755 /etc/chromium/policies /etc/chromium/policies/managed \
+    && sh /opt/trust/write-chromium-policy.sh /opt/trust/blocked-roots \
+        /etc/chromium/policies/managed/stafficy-emudhra-distrust.json \
+    && chown root:root /etc/chromium/policies/managed/stafficy-emudhra-distrust.json \
+    && sh /opt/trust/guard-chromium-policy.sh /etc/chromium/policies/managed/stafficy-emudhra-distrust.json
 ENV BREWSHOT_CHROME=/usr/bin/chromium-browser \
     BREWSHOT_CHROME_ARGS="--no-sandbox --disable-dev-shm-usage" \
     BREWSHOT_REQUIRE_CHROME=1
@@ -86,6 +94,8 @@ COPY . .
 # has no init, so orphaned helpers stay as zombies the real-Chrome cleanup tests then see.
 # Subreaper mode (-s) needs no pid 1. Plan a7074a87.
 RUN tini -s -- ./gradlew --no-daemon chromeTest --stacktrace
+# Prove Chromium LOADED the policy: BrewShot reads chrome://policy's loaded state.
+RUN tini -s -- sh /opt/trust/check-chromium-policy-loaded.sh /src/build/classes/java/main "${CHROMIUM_VERSION%-r*}"
 RUN sh /opt/trust/guard-no-forbidden.sh /etc/ssl/certs/ca-certificates.crt "${JAVA_HOME}/lib/security/cacerts"
 
 # ---- runtime: JRE + chromium + fonts ------------------------------------
@@ -116,6 +126,14 @@ RUN apk add --no-cache \
         font-noto-emoji="${FONT_NOTO_EMOJI_VERSION}" \
     && rm -f /usr/lib/python3*/ensurepip/_bundled/*.whl \
     && ! ls /usr/lib/python3*/ensurepip/_bundled/*.whl 2>/dev/null
+# Chromium 149 trusts its compiled-in Chrome Root Store (which still holds emSign ECC
+# Root CA - G3), not the OS bundle filtered above. Distrust both roots by mandatory
+# CADistrustedCertificates policy, written from trust/blocked-roots/ (trust/README.md).
+RUN install -d -o root -g root -m 0755 /etc/chromium/policies /etc/chromium/policies/managed \
+    && sh /opt/trust/write-chromium-policy.sh /opt/trust/blocked-roots \
+        /etc/chromium/policies/managed/stafficy-emudhra-distrust.json \
+    && chown root:root /etc/chromium/policies/managed/stafficy-emudhra-distrust.json \
+    && sh /opt/trust/guard-chromium-policy.sh /etc/chromium/policies/managed/stafficy-emudhra-distrust.json
 
 # Chrome's sandbox needs privileges containers don't grant by default;
 # BrewShot appends these flags to the launch.
@@ -139,6 +157,9 @@ COPY --from=build /out/brewshot-worker.jar /opt/brewshot/brewshot-worker.jar
 COPY docker/entrypoint.sh /opt/brewshot/entrypoint.sh
 RUN chmod 0555 /opt/brewshot/entrypoint.sh \
     && chmod 0444 /opt/brewshot/brewshot.jar /opt/brewshot/brewshot-worker.jar
+
+# The shipped jar and Chromium must report the distrust policy loaded (trust/README.md).
+RUN tini -s -- sh /opt/trust/check-chromium-policy-loaded.sh /opt/brewshot/brewshot.jar "${CHROMIUM_VERSION%-r*}"
 
 RUN sh /opt/trust/guard-no-forbidden.sh /etc/ssl/certs/ca-certificates.crt "${JAVA_HOME}/lib/security/cacerts"
 
