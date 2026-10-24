@@ -24,8 +24,11 @@ ARG TINI_VERSION=0.19.0-r3
 FROM ${TEMURIN_JDK_IMAGE} AS build
 # Remove the eMudhra-affected roots before Gradle fetches anything (trust/README.md).
 COPY trust/ /opt/trust/
-RUN apt-get update \
+ARG TRUST_REFRESH=2026-10-23
+RUN echo "$TRUST_REFRESH" > /etc/brewshot-trust-refresh \
+    && apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates openssl \
+    && apt-get install -y --only-upgrade ca-certificates \
     && mkdir -p /usr/local/share/ca-certificates \
     && sh /opt/trust/distrust-os-sources.sh /usr/share/ca-certificates /usr/local/share/ca-certificates \
     && update-ca-certificates \
@@ -61,7 +64,9 @@ ARG TINI_VERSION
 # Same removal on Alpine (trust/README.md). An upgrade over a locally modified bundle
 # writes ca-certificates.crt.apk-new; drop it and regenerate from the filtered sources.
 COPY trust/ /opt/trust/
-RUN apk add --no-cache --upgrade ca-certificates openssl \
+ARG TRUST_REFRESH=2026-10-23
+RUN echo "$TRUST_REFRESH" > /etc/brewshot-trust-refresh \
+    && apk add --no-cache --upgrade ca-certificates openssl \
     && rm -f /etc/ssl/certs/ca-certificates.crt.apk-new \
     && mkdir -p /usr/local/share/ca-certificates \
     && sh /opt/trust/distrust-os-sources.sh /usr/share/ca-certificates /usr/local/share/ca-certificates \
@@ -110,7 +115,9 @@ ARG TINI_VERSION
 # Same removal on Alpine (trust/README.md). An upgrade over a locally modified bundle
 # writes ca-certificates.crt.apk-new; drop it and regenerate from the filtered sources.
 COPY trust/ /opt/trust/
-RUN apk add --no-cache --upgrade ca-certificates openssl \
+ARG TRUST_REFRESH=2026-10-23
+RUN echo "$TRUST_REFRESH" > /etc/brewshot-trust-refresh \
+    && apk add --no-cache --upgrade ca-certificates openssl \
     && rm -f /etc/ssl/certs/ca-certificates.crt.apk-new \
     && mkdir -p /usr/local/share/ca-certificates \
     && sh /opt/trust/distrust-os-sources.sh /usr/share/ca-certificates /usr/local/share/ca-certificates \
