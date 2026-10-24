@@ -4,10 +4,54 @@
 set -eu
 export LC_ALL=C
 [ "$#" -gt 0 ] || { echo 'usage: distrust-os-sources.sh SOURCE_DIRECTORY ...' >&2; exit 2; }
+# Exit contract: 0 OK, 2 VOID. Any other non-zero exit (a producer aborting
+# under set -e), a failed scratch cleanup, or HUP/INT/TERM is VOID (2). Cleanup
+# runs with errexit OFF and its status is checked explicitly, so a failed rm can
+# neither abort the trap nor leak its own status (it used to turn 2 into 1, and
+# OK into 1). A HUP/INT/TERM that arrives DURING cleanup is recorded, never
+# ignored: cleanup finishes (no policy work resumes) and the exit is VOID (2),
+# even after successful work.
+work=""
+on_exit() {
+    # Record, never ignore, a signal during cleanup (first one wins).
+    interrupted=
+    trap 'interrupted=${interrupted:-HUP}' HUP
+    trap 'interrupted=${interrupted:-INT}' INT
+    trap 'interrupted=${interrupted:-TERM}' TERM
+    rc=$1
+    set +e
+    status=0
+    if [ "$rc" -ne 0 ]; then
+        echo "distrust-os-sources: VOID (exit 2): failed with exit $rc" >&2; status=2
+    fi
+    if [ -n "$work" ]; then
+        rm -rf "$work"; cleanup=$?
+        # Once a trap has run, dash reports the EXIT status in $?, not rm's,
+        # so after a signal only the existence check counts.
+        [ -z "$interrupted" ] || cleanup=0
+        if [ "$cleanup" -ne 0 ] || [ -e "$work" ]; then
+            [ -z "$interrupted" ] || cleanup="status unknown after SIG$interrupted"
+            echo "distrust-os-sources: CLEANUP FAILED, scratch $work not removed (rm: $cleanup)" >&2
+            [ "$rc" -ne 0 ] || echo "distrust-os-sources: VOID (exit 2): scratch cleanup failed" >&2
+            status=2
+        fi
+    fi
+    if [ -n "$interrupted" ]; then
+        echo "distrust-os-sources: VOID (exit 2): interrupted by SIG$interrupted during cleanup" >&2; status=2
+    fi
+    exit "$status"
+}
+on_signal() { echo "distrust-os-sources: VOID interrupted by SIG$1" >&2; exit 2; }
+# Installed before mktemp, so even a failed scratch creation is VOID.
+trap 'on_exit "$?"' EXIT
+trap 'on_signal HUP' HUP
+trap 'on_signal INT' INT
+trap 'on_signal TERM' TERM
 umask 077
-work=$(mktemp -d)
-trap 'status=$?; rm -rf "$work"; trap - EXIT; if [ "$status" -ne 0 ]; then exit 2; fi' EXIT
-trap 'exit 2' HUP INT TERM
+# Assign the trap-owned $work only after mktemp succeeds AND yields a directory:
+# a failed mktemp's stdout must never become a path the EXIT cleanup removes.
+scratch=$(mktemp -d) && [ -d "$scratch" ] || { echo 'distrust-os-sources: cannot create a scratch directory' >&2; exit 2; }
+work=$scratch
 if command -v timeout >/dev/null 2>&1; then deadline=timeout
 elif command -v gtimeout >/dev/null 2>&1; then deadline=gtimeout
 else echo 'timeout (or gtimeout) is required' >&2; exit 2; fi

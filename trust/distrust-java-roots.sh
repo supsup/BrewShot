@@ -2,12 +2,59 @@
 # b882214a: operate on this image's default cacerts, never a host-mounted store.
 # Certificate identity is DER SHA-256, independent of vendor alias or subject label.
 set -eu
+# Exit contract: 0 OK, 2 VOID. Any other non-zero exit (keytool or awk aborting
+# under set -e, including a forbidden root still present after deletion), a
+# failed scratch cleanup, or HUP/INT/TERM is VOID (2). Cleanup runs with errexit
+# OFF and its status is checked explicitly, so a failed rm can neither abort the
+# trap nor leak its own status (it used to turn 2 into 1, and OK into 1). A
+# signal ends the script: it used to remove the scratch and keep running. A
+# HUP/INT/TERM that arrives DURING cleanup is recorded, never ignored: cleanup
+# finishes (no policy work resumes) and the exit is VOID (2), even after
+# successful work.
+work=""
+on_exit() {
+    # Record, never ignore, a signal during cleanup (first one wins).
+    interrupted=
+    trap 'interrupted=${interrupted:-HUP}' HUP
+    trap 'interrupted=${interrupted:-INT}' INT
+    trap 'interrupted=${interrupted:-TERM}' TERM
+    rc=$1
+    set +e
+    status=0
+    if [ "$rc" -ne 0 ]; then
+        echo "distrust-java-roots: VOID (exit 2): failed with exit $rc" >&2; status=2
+    fi
+    if [ -n "$work" ]; then
+        rm -rf "$work"; cleanup=$?
+        # Once a trap has run, dash reports the EXIT status in $?, not rm's,
+        # so after a signal only the existence check counts.
+        [ -z "$interrupted" ] || cleanup=0
+        if [ "$cleanup" -ne 0 ] || [ -e "$work" ]; then
+            [ -z "$interrupted" ] || cleanup="status unknown after SIG$interrupted"
+            echo "distrust-java-roots: CLEANUP FAILED, scratch $work not removed (rm: $cleanup)" >&2
+            [ "$rc" -ne 0 ] || echo "distrust-java-roots: VOID (exit 2): scratch cleanup failed" >&2
+            status=2
+        fi
+    fi
+    if [ -n "$interrupted" ]; then
+        echo "distrust-java-roots: VOID (exit 2): interrupted by SIG$interrupted during cleanup" >&2; status=2
+    fi
+    exit "$status"
+}
+on_signal() { echo "distrust-java-roots: VOID interrupted by SIG$1" >&2; exit 2; }
+# Installed before mktemp, so even a failed scratch creation is VOID.
+trap 'on_exit "$?"' EXIT
+trap 'on_signal HUP' HUP
+trap 'on_signal INT' INT
+trap 'on_signal TERM' TERM
 [ "$#" -eq 1 ] && [ -s "$1" ] || { echo 'usage: distrust-java-roots.sh IMAGE_CACERTS' >&2; exit 2; }
 store=$1
 umask 077
 export LC_ALL=C
-work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT HUP INT TERM
+# Assign the trap-owned $work only after mktemp succeeds AND yields a directory:
+# a failed mktemp's stdout must never become a path the EXIT cleanup removes.
+scratch=$(mktemp -d) && [ -d "$scratch" ] || { echo 'distrust-java-roots: cannot create a scratch directory' >&2; exit 2; }
+work=$scratch
 
 scan() {
     keytool -J-Duser.language=en -J-Duser.country=US -list -v -keystore "$store" \
