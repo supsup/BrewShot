@@ -137,6 +137,47 @@ own arrival order; V1 claims no total order across those independent CDP
 streams. Raw strings receive the library's existing entry/UTF-8 byte bounds,
 not general secret redaction.
 
+### Signed-in captures without a credential in `ps`
+
+A value given as `--header 'Authorization: Bearer ...'` or `--cookie name=value`
+is in the process arguments, which any local user can read with `ps`, and it
+lands in shell history. For credentials, put them in a file and pass the path:
+
+```bash
+umask 077
+printf 'Authorization: Bearer %s\n' "$TOKEN" > ~/.brewshot-auth   # one 'Name: value' per line
+brewshot https://app.example/private -o shot.png --header-file ~/.brewshot-auth
+
+printf 'SESSION=%s@app.example\n' "$SID" > ~/.brewshot-cookies    # one name=value[@domain] per line
+brewshot https://app.example/private -o shot.png --cookie-file ~/.brewshot-cookies
+```
+
+The file is checked before Chrome starts and refused (usage error, **exit 2**)
+when it is a symlink, not a regular file, or accessible to group or others
+(the message names the mode, e.g. `0644`; `chmod 600` fixes it). Blank lines
+and `#` comments are skipped. A header value may contain colons; a cookie's
+domain is whatever follows the last `@` (default `localhost`). No value from
+the file is printed: a malformed line is refused by its line number only, and
+`--json` records the file paths and the header/cookie names with
+`"value": "<from file>"` (cookie domains are left out too). Both flags repeat.
+`--header`/`--cookie` remain for non-secret values. Values set this way are
+sent over the DevTools socket, never in Chrome's command line.
+
+**A file protects how the credential reaches BrewShot, not where Chrome sends
+it.** A header, from `--header-file` exactly as from `--header`, is added to
+EVERY request the page makes, including cross-origin subresources (scripts,
+images, fonts, iframes, beacons on other hosts), so an `Authorization:
+Bearer ...` header goes to every third-party host the page loads from. Use
+header auth only for pages you trust whose subresources you control. To keep
+a credential to one site, prefer `--cookie-file`: a cookie is set for its
+`@domain`, and the browser's own cookie rules decide where it is sent, so it
+is not attached to requests for unrelated hosts.
+
+Order: every `--header-file`/`--cookie-file` entry is applied AFTER every
+inline `--header`/`--cookie`, wherever the flags sit on the command line, so
+for the same header name (spelled identically) or the same cookie name and
+domain, the file's value wins.
+
 ### What cleanup left behind
 
 A capture that leaves no Chrome running prints nothing about cleanup and exits
