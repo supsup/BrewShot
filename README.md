@@ -163,6 +163,21 @@ the file is printed: a malformed line is refused by its line number only, and
 `--header`/`--cookie` remain for non-secret values. Values set this way are
 sent over the DevTools socket, never in Chrome's command line.
 
+**A file protects how the credential reaches BrewShot, not where Chrome sends
+it.** A header, from `--header-file` exactly as from `--header`, is added to
+EVERY request the page makes, including cross-origin subresources (scripts,
+images, fonts, iframes, beacons on other hosts), so an `Authorization:
+Bearer ...` header goes to every third-party host the page loads from. Use
+header auth only for pages you trust whose subresources you control. To keep
+a credential to one site, prefer `--cookie-file`: a cookie is set for its
+`@domain`, and the browser's own cookie rules decide where it is sent, so it
+is not attached to requests for unrelated hosts.
+
+Order: every `--header-file`/`--cookie-file` entry is applied AFTER every
+inline `--header`/`--cookie`, wherever the flags sit on the command line, so
+for the same header name (spelled identically) or the same cookie name and
+domain, the file's value wins.
+
 ### What cleanup left behind
 
 A capture that leaves no Chrome running prints nothing about cleanup and exits

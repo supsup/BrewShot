@@ -14,9 +14,9 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermissions;
+import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
@@ -125,10 +125,13 @@ class BrewShotAuthTest {
                 .start();
             child.set(cli.toHandle());
             boolean exited;
-            try {
-                exited = cli.waitFor(90, TimeUnit.SECONDS);
-            } finally {
-                cli.destroyForcibly();
+            // Custody of the child AND its Chrome: on a timeout or interrupt the child is asked
+            // to stop (SIGTERM, so its shutdown hook closes Chrome), then the child and every
+            // descendant snapshotted while it ran are SIGKILLed and joined, bounded; a survivor
+            // fails the test by pid. See OwnedProcessTree / OwnedProcessTreeTest.
+            try (OwnedProcessTree tree = OwnedProcessTree.adopt(cli,
+                    Duration.ofSeconds(10), Duration.ofSeconds(10))) {
+                exited = tree.waitFor(Duration.ofSeconds(90));
             }
             String outText = Files.readString(stdout, StandardCharsets.UTF_8);
             String errText = Files.readString(stderr, StandardCharsets.UTF_8);

@@ -1672,7 +1672,14 @@ public final class Main {
                            only the path is in argv. The file must be a regular
                            file, not a symlink, owner-only (chmod 600): a group-
                            or world-accessible file is refused (exit 2). Values
-                           are never printed; --json records <from file>
+                           are never printed; --json records <from file>.
+                           File entries apply AFTER inline --header/--cookie,
+                           whatever the argv order (same name: the file wins).
+                           SCOPE: a header (file or inline) goes on EVERY
+                           request, cross-origin subresources included, so a
+                           Bearer token reaches every host the page loads from;
+                           use it only for trusted pages. --cookie-file is the
+                           host-scoped alternative (sent per cookie rules)
               --color-scheme dark|light  force prefers-color-scheme before capture
               --media      print|screen  force the emulated media type (e.g. @media print)
               --timezone   IANA timezone ID applied by Chrome and verified from page Intl

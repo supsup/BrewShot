@@ -89,6 +89,20 @@ final class MainAuthFileTest {
         assertTrue(help.contains("<from file>"), help);
     }
 
+    // Review F2. Mutant: drop the SCOPE lines or the precedence lines from Main.usage() -> red.
+    @Test
+    void helpWarnsThatAHeaderGoesOnEveryRequestAndNamesTheCookieAlternative() throws Exception {
+        Run run = cli("--help");
+        assertEquals(0, run.code());
+        String help = run.stderr();
+        assertTrue(help.contains("goes on EVERY")
+            && help.contains("cross-origin subresources included"), help);
+        assertTrue(help.contains("use it only for trusted pages"), help);
+        assertTrue(help.contains("--cookie-file is the")
+            && help.contains("host-scoped alternative"), help);
+        assertTrue(help.contains("File entries apply AFTER inline --header/--cookie"), help);
+    }
+
     // Mutant: delete the NOT_OWNER permissions check in AuthFile.readOwnerOnly -> each of these
     // parses, reaches input resolution and exits 2 WITHOUT the mode in the message -> red.
     @Test
