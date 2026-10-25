@@ -137,6 +137,32 @@ own arrival order; V1 claims no total order across those independent CDP
 streams. Raw strings receive the library's existing entry/UTF-8 byte bounds,
 not general secret redaction.
 
+### Signed-in captures without a credential in `ps`
+
+A value given as `--header 'Authorization: Bearer ...'` or `--cookie name=value`
+is in the process arguments, which any local user can read with `ps`, and it
+lands in shell history. For credentials, put them in a file and pass the path:
+
+```bash
+umask 077
+printf 'Authorization: Bearer %s\n' "$TOKEN" > ~/.brewshot-auth   # one 'Name: value' per line
+brewshot https://app.example/private -o shot.png --header-file ~/.brewshot-auth
+
+printf 'SESSION=%s@app.example\n' "$SID" > ~/.brewshot-cookies    # one name=value[@domain] per line
+brewshot https://app.example/private -o shot.png --cookie-file ~/.brewshot-cookies
+```
+
+The file is checked before Chrome starts and refused (usage error, **exit 2**)
+when it is a symlink, not a regular file, or accessible to group or others
+(the message names the mode, e.g. `0644`; `chmod 600` fixes it). Blank lines
+and `#` comments are skipped. A header value may contain colons; a cookie's
+domain is whatever follows the last `@` (default `localhost`). No value from
+the file is printed: a malformed line is refused by its line number only, and
+`--json` records the file paths and the header/cookie names with
+`"value": "<from file>"` (cookie domains are left out too). Both flags repeat.
+`--header`/`--cookie` remain for non-secret values. Values set this way are
+sent over the DevTools socket, never in Chrome's command line.
+
 ### What cleanup left behind
 
 A capture that leaves no Chrome running prints nothing about cleanup and exits

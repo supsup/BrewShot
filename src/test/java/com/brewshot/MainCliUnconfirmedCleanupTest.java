@@ -199,7 +199,7 @@ final class MainCliUnconfirmedCleanupTest {
     /// through its "stop waiting, read liveness afterwards" arm instead of the 5 s teardown
     /// budget. The report under test reads liveness AFTER the wait, whichever way the wait
     /// ended; the full-budget wait on an undying process is CleanupReportingTest's fixture.
-    private static final class FakeChrome extends Process {
+    static final class FakeChrome extends Process {
         private final long pid;
         private final boolean exitsWhenAsked;
         private volatile boolean alive = true;
@@ -255,10 +255,13 @@ final class MainCliUnconfirmedCleanupTest {
     /// A DevTools endpoint in a few lines. Each command is answered by id on the Accumulator the
     /// session reads from; a navigation also fires the load event; a capture returns one pixel.
     /// Same shape as CdpInboxWiringTest's BootstrapWebSocket, with the still-shot methods added.
-    private static final class ScriptedChrome implements WebSocket {
+    static final class ScriptedChrome implements WebSocket {
         final AtomicInteger navigations = new AtomicInteger();
         final AtomicInteger captures = new AtomicInteger();
         final AtomicBoolean closed = new AtomicBoolean();
+        /// Every command as sent, in order: MainAuthFileTest reads what reached the browser.
+        final java.util.concurrent.ConcurrentLinkedQueue<String> sentCommands =
+            new java.util.concurrent.ConcurrentLinkedQueue<>();
         private final LinkedBlockingQueue<BrewShot.InboxMessage> inbox =
             new LinkedBlockingQueue<>(65);
         private final BrewShot.Accumulator listener =
@@ -271,6 +274,7 @@ final class MainCliUnconfirmedCleanupTest {
         }
 
         @Override public CompletableFuture<WebSocket> sendText(CharSequence data, boolean last) {
+            sentCommands.add(data.toString());
             @SuppressWarnings("unchecked")
             Map<String, Object> sent = (Map<String, Object>) MiniJson.parse(data.toString());
             int id = ((Number) sent.get("id")).intValue();

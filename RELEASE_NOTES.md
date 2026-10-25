@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **Session auth from a file, never from argv** (plan 728a0dfd). `--header-file`
+  and `--cookie-file` take a PATH, so a bearer token or session cookie is no
+  longer visible in `ps` or shell history. The file must be a regular file, not
+  a symlink, readable only by its owner (mode 0600 or 0400); anything else is
+  refused with the mode named. Values never appear in an error message, a log
+  line or the `--json` manifest (which records `<from file>`). `--header` and
+  `--cookie` still work for non-secret values. See README "Signed-in captures".
+
 - **Watched GIF jobs from website URLs or local ZIP bundles** (plan a15a0d3b).
   Drop a versioned `*.brewshot.json` URL job or a `*.brewshot.zip` containing
   `job.json`, HTML and relative assets. Typed options delegate to the existing

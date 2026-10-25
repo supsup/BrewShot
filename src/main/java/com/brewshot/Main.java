@@ -184,6 +184,10 @@ public final class Main {
         boolean failConsoleErrors = false;
         java.util.List<String[]> cookies = new java.util.ArrayList<>();
         java.util.List<String[]> headers = new java.util.ArrayList<>();
+        java.util.List<AuthFile.Header> fileHeaders = new java.util.ArrayList<>();
+        java.util.List<AuthFile.Cookie> fileCookies = new java.util.ArrayList<>();
+        java.util.List<Path> headerFiles = new java.util.ArrayList<>();
+        java.util.List<Path> cookieFiles = new java.util.ArrayList<>();
         String colorScheme = null;
         String mediaType = null;
         String timezone = null;
@@ -260,6 +264,18 @@ public final class Main {
                     String[] hv = requireValue(args, ++i).split(":", 2);
                     if (hv.length != 2) { return err("--header wants 'Name: value'"); }
                     headers.add(new String[] {hv[0].trim(), hv[1].trim()});
+                }
+                // Plan 728a0dfd: the credential-safe forms. Only the PATH is in argv; the file
+                // is checked (regular, not a symlink, owner-only) and read here, before Chrome.
+                case "--header-file" -> {
+                    Path file = Path.of(requireValue(args, ++i));
+                    fileHeaders.addAll(AuthFile.readHeaders(file));
+                    headerFiles.add(file);
+                }
+                case "--cookie-file" -> {
+                    Path file = Path.of(requireValue(args, ++i));
+                    fileCookies.addAll(AuthFile.readCookies(file));
+                    cookieFiles.add(file);
                 }
                 case "--color-scheme" -> colorScheme =
                     requireOneOf("--color-scheme", requireValue(args, ++i), "dark", "light");
@@ -437,6 +453,7 @@ public final class Main {
             witness.shot = shot;
             for (String[] h : headers) { shot.header(h[0], h[1]); }
             for (String[] c : cookies) { shot.cookie(c[0], c[1], c[2]); }
+            applyFileAuth(shot, fileHeaders, fileCookies);
             if (colorScheme != null) { shot.colorScheme(colorScheme); }
             if (mediaType != null) { shot.media(mediaType); }
             if (timezone != null) { shot.timezone(timezone); }
@@ -574,7 +591,8 @@ public final class Main {
                 devicePixelRatio, dprApplied,
                 visionDeficiency == null ? null : visionDeficiency.cdpValue(),
                 visionDeficiency == null ? null : Boolean.TRUE,
-                viewportSource, witness.settle());
+                viewportSource, witness.settle(),
+                fileAuthManifestField(headerFiles, fileHeaders, cookieFiles, fileCookies));
         }
         System.err.println("brewshot: wrote " + out);
         if (!failJsPassed) {
@@ -1074,7 +1092,7 @@ public final class Main {
      * Cleanup-aware overload (plan f5f02722), and the one every other overload ends in. The CLI
      * always passes the session's outcome, so a capture manifest always carries {@code cleanup};
      * a null outcome omits the key and keeps the earlier byte shape for callers of the overloads
-     * above. {@code viewportSource} as in the overload above.
+     * above. {@code viewportSource} as in the overload above. No file auth: the key is omitted.
      */
     static void writeManifest(Path manifest, String input, String mode,
             int width, int height, long settleMs, String waitJs, Path out,
@@ -1084,6 +1102,28 @@ public final class Main {
             String timezoneApplied, Integer dprRequested, Integer dprApplied,
             String visionDeficiencyRequested, Boolean visionCommandAccepted,
             String viewportSource, CleanupOutcome cleanup)
+            throws java.io.IOException {
+        writeManifest(manifest, input, mode, width, height, settleMs, waitJs, out,
+            evalResult, failJs, failJsPassed, elapsedMs, requestedGifDelayMs, jpegQuality,
+            diagnostics, timezoneRequested, timezoneApplied, dprRequested, dprApplied,
+            visionDeficiencyRequested, visionCommandAccepted, viewportSource, cleanup, null);
+    }
+
+    /**
+     * File-auth-aware overload (plan 728a0dfd), and the one every other overload ends in.
+     * {@code fileAuth} is {@link #fileAuthManifestField}'s record of where auth came from, with
+     * every value already replaced by {@link AuthFile#REDACTED}; null (no --header-file and no
+     * --cookie-file) omits the key and keeps the earlier byte shape.
+     */
+    static void writeManifest(Path manifest, String input, String mode,
+            int width, int height, long settleMs, String waitJs, Path out,
+            Object evalResult, String failJs, boolean failJsPassed, long elapsedMs,
+            Integer requestedGifDelayMs, Integer jpegQuality,
+            PageDiagnosticsReceipt diagnostics, String timezoneRequested,
+            String timezoneApplied, Integer dprRequested, Integer dprApplied,
+            String visionDeficiencyRequested, Boolean visionCommandAccepted,
+            String viewportSource, CleanupOutcome cleanup,
+            java.util.Map<String, Object> fileAuth)
             throws java.io.IOException {
         java.util.Map<String, Object> fields = new java.util.LinkedHashMap<>();
         fields.put("input", input);
@@ -1133,9 +1173,76 @@ public final class Main {
         if (cleanup != null) {
             fields.put("cleanup", cleanup.toJson());
         }
+        if (fileAuth != null) {
+            fields.put("auth", fileAuth);
+        }
         fields.put("brewshot", BrewShot.VERSION);
         ArtifactWriter.writePrivateString(
             manifest, MiniJson.stringifyPretty(fields) + "\n", StandardCharsets.UTF_8);
+    }
+
+    /**
+     * The manifest's record of file-sourced auth (plan 728a0dfd): the file paths, the header
+     * and cookie NAMES, and {@link AuthFile#REDACTED} where each value would be. A cookie's
+     * domain is left out as well (see {@link AuthFile#parseCookies}). Null when no auth file
+     * was given, so the key is absent from every manifest that used none.
+     */
+    static java.util.Map<String, Object> fileAuthManifestField(
+            java.util.List<Path> headerFiles, java.util.List<AuthFile.Header> fileHeaders,
+            java.util.List<Path> cookieFiles, java.util.List<AuthFile.Cookie> fileCookies) {
+        if (headerFiles.isEmpty() && cookieFiles.isEmpty()) { return null; }
+        java.util.Map<String, Object> auth = new java.util.LinkedHashMap<>();
+        if (!headerFiles.isEmpty()) {
+            auth.put("headerFiles", headerFiles.stream().map(Path::toString).toList());
+            java.util.List<Object> names = new java.util.ArrayList<>();
+            for (AuthFile.Header header : fileHeaders) {
+                java.util.Map<String, Object> entry = new java.util.LinkedHashMap<>();
+                entry.put("name", header.name());
+                entry.put("value", AuthFile.REDACTED);
+                names.add(entry);
+            }
+            auth.put("headers", names);
+        }
+        if (!cookieFiles.isEmpty()) {
+            auth.put("cookieFiles", cookieFiles.stream().map(Path::toString).toList());
+            java.util.List<Object> names = new java.util.ArrayList<>();
+            for (AuthFile.Cookie cookie : fileCookies) {
+                java.util.Map<String, Object> entry = new java.util.LinkedHashMap<>();
+                entry.put("name", cookie.name());
+                entry.put("value", AuthFile.REDACTED);
+                names.add(entry);
+            }
+            auth.put("cookies", names);
+        }
+        return auth;
+    }
+
+    /**
+     * Hand file-sourced auth to the session (plan 728a0dfd). A failure here is re-thrown with
+     * NO cause and no library detail: the library's messages name a cookie's domain, and the
+     * browser's error for a refused header may quote what it refused, either of which can be a
+     * value from the file. The flag, the entry's name and the failure's type are kept.
+     */
+    static void applyFileAuth(BrewShot shot, java.util.List<AuthFile.Header> fileHeaders,
+            java.util.List<AuthFile.Cookie> fileCookies) {
+        for (AuthFile.Header header : fileHeaders) {
+            try {
+                shot.header(header.name(), header.value());
+            } catch (RuntimeException failure) {
+                throw new IllegalStateException("applying header '" + header.name()
+                    + "' from --header-file failed (" + failure.getClass().getSimpleName()
+                    + "; detail withheld because it may quote the value)");
+            }
+        }
+        for (AuthFile.Cookie cookie : fileCookies) {
+            try {
+                shot.cookie(cookie.name(), cookie.value(), cookie.domain());
+            } catch (RuntimeException failure) {
+                throw new IllegalStateException("applying cookie '" + cookie.name()
+                    + "' from --cookie-file failed (" + failure.getClass().getSimpleName()
+                    + "; detail withheld because it may quote the value)");
+            }
+        }
     }
 
     /**
@@ -1557,6 +1664,15 @@ public final class Main {
               --clip-padding   CSS px of breathing room inflated around the clip rect
               --cookie     name=value[@domain] session auth  (repeatable)
               --header     'Name: value' on every request    (repeatable)
+                           WARNING: a --cookie/--header value is in the process
+                           arguments, visible to other local users (ps) and kept
+                           in shell history; use the -file forms for credentials
+              --cookie-file PATH  one name=value[@domain] per line   (repeatable)
+              --header-file PATH  one 'Name: value' per line         (repeatable)
+                           only the path is in argv. The file must be a regular
+                           file, not a symlink, owner-only (chmod 600): a group-
+                           or world-accessible file is refused (exit 2). Values
+                           are never printed; --json records <from file>
               --color-scheme dark|light  force prefers-color-scheme before capture
               --media      print|screen  force the emulated media type (e.g. @media print)
               --timezone   IANA timezone ID applied by Chrome and verified from page Intl
