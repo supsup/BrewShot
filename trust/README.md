@@ -8,7 +8,7 @@ G3 in the JDK/JRE `cacerts`, and a `--pull` rebuild does not remove it.
 
 - `distrust-os-sources.sh`, `distrust-java-roots.sh`: byte-for-byte copies of
   Stafficy `modules/agent-runtime-workers/trust/` at
-  `b573f8e70b23e0d8e495288ceb6012a8d2f1695f`. Do not edit them here; update
+  `739f1c80ff53c5a7774cc0e121963202c4727006`. Do not edit them here; update
   from the origin and keep the hashes equal.
 - `guard-no-forbidden.sh`: runs those scripts on scratch copies of the image
   stores. Both arms (OS bundle, Java `cacerts`) always run. It fails the build
