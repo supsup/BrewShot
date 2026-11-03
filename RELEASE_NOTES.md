@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **Producer-receipt test contract, Stage A only** (plan 0181881e). Seven explicit
+  test cases and their kill criteria are proposed before production implementation.
+  This checkpoint changes no production code and does not add a usable CLI flag.
+  The proposed opt-in `--artifact-sha256` adds only `outSha256` and
+  `outSha256Provenance`; the stable `capture-time-producer` value means:
+  BrewShot generated exactly these bytes (sha256 X).
+  Consumers must recompute SHA-256 after transport or immediately before use.
+  It makes no current-file-state, signature, trusted-capture, immutability,
+  transport or atomic-pair promise. All seven Stage A source/contract cases need
+  independent acceptance before production changes; compilation/setup failures
+  are not semantic mutant results. See README "Producer-receipt test contract".
+
 - **Session auth from a file, never from argv** (plan 728a0dfd). `--header-file`
   and `--cookie-file` take a PATH, so a bearer token or session cookie is no
   longer visible in `ps` or shell history. The file must be a regular file, not
