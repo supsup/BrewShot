@@ -6,7 +6,10 @@ import java.awt.image.SampleModel;
 import java.awt.image.WritableRaster;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.io.OutputStream;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.MessageDigest;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
@@ -14,6 +17,7 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import javax.imageio.IIOImage;
 import javax.imageio.ImageIO;
 import javax.imageio.ImageReader;
@@ -23,6 +27,7 @@ import javax.imageio.metadata.IIOMetadata;
 import javax.imageio.metadata.IIOMetadataNode;
 import javax.imageio.stream.ImageInputStream;
 import javax.imageio.stream.ImageOutputStream;
+import javax.imageio.stream.MemoryCacheImageOutputStream;
 
 /**
  * Animated-GIF assembly from PNG frames using only the JDK's ImageIO GIF
@@ -41,6 +46,11 @@ import javax.imageio.stream.ImageOutputStream;
  * consistently rather than shifting frame-to-frame.
  */
 final class GifWriter {
+
+    @FunctionalInterface
+    interface EncodedStreamObserver {
+        void observe(ImageOutputStream stream) throws IOException;
+    }
 
     /** Total colours in the shared palette (GIF hard-caps at 256). */
     private static final int MAX_COLORS = 256;
@@ -257,6 +267,13 @@ final class GifWriter {
      */
     static void write(List<byte[]> pngFrames, int frameDelayMs, int firstFrameDelayMs, Path out)
             throws IOException {
+        writeWithReceipt(pngFrames, frameDelayMs, firstFrameDelayMs, out, false, null);
+    }
+
+    /** The ordinary encoder, with an optional receipt from its completed encoded stream. */
+    static ArtifactWriter.ProducerReceipt writeWithReceipt(List<byte[]> pngFrames,
+            int frameDelayMs, int firstFrameDelayMs, Path out, boolean enabled,
+            EncodedStreamObserver observer) throws IOException {
         if (pngFrames == null) { throw new IllegalArgumentException("frames must not be null"); }
         if (pngFrames.isEmpty()) { throw new IllegalArgumentException("no frames"); }
         BrewShot.effectiveGifDelayMs(frameDelayMs);
@@ -286,8 +303,17 @@ final class GifWriter {
         }
 
         IndexColorModel palette = buildGlobalPalette(frames);
-        ArtifactWriter.write(out,
-            temporary -> writeSequence(frames, palette, frameDelayMs, firstFrameDelayMs, temporary));
+        ArtifactWriter.ProducerReceipt[] receipt = new ArtifactWriter.ProducerReceipt[1];
+        ArtifactWriter.write(out, temporary -> {
+            if (enabled) {
+                receipt[0] = writeSequenceWithReceipt(
+                    frames, palette, frameDelayMs, firstFrameDelayMs, temporary, observer);
+            } else {
+                writeSequence(frames, palette, frameDelayMs, firstFrameDelayMs, temporary);
+            }
+        });
+        // The stream's snapshot stays local until the existing artifact commit also succeeds.
+        return receipt[0];
     }
 
     private static void writeSequence(List<BufferedImage> frames, IndexColorModel palette,
@@ -298,19 +324,202 @@ final class GifWriter {
             if (os == null) {
                 throw new IOException("could not create GIF output stream for " + out);
             }
-            writer.setOutput(os);
-            writer.prepareWriteSequence(null);
-            for (int i = 0; i < frames.size(); i++) {
-                BufferedImage indexed = ditherToPalette(frames.get(i), palette);
-                IIOMetadata meta = writer.getDefaultImageMetadata(
-                    ImageTypeSpecifier.createFromRenderedImage(indexed),
-                    writer.getDefaultWriteParam());
-                applyFrameMetadata(meta, i == 0 ? firstFrameDelayMs : frameDelayMs);
-                writer.writeToSequence(new IIOImage(indexed, null, meta), null);
-            }
-            writer.endWriteSequence();
+            encodeSequence(writer, os, frames, palette, frameDelayMs, firstFrameDelayMs);
         } finally {
             writer.dispose();
+        }
+    }
+
+    private static ArtifactWriter.ProducerReceipt writeSequenceWithReceipt(
+            List<BufferedImage> frames, IndexColorModel palette, int frameDelayMs,
+            int firstFrameDelayMs, Path out, EncodedStreamObserver observer) throws IOException {
+        MessageDigest digest = ArtifactWriter.newSha256();
+        ImageWriter writer = ImageIO.getImageWritersByFormatName("gif").next();
+        CountingDigestSink sink;
+        try {
+            sink = new CountingDigestSink(Files.newOutputStream(out), digest);
+            try (CountingDigestSink owned = sink;
+                    ImageOutputStream os = new SequentialGifStream(owned, observer)) {
+                encodeSequence(writer, os, frames, palette, frameDelayMs, firstFrameDelayMs);
+            }
+        } finally {
+            writer.dispose();
+        }
+        return ArtifactWriter.completedReceipt(sink.completedCount(), digest);
+    }
+
+    private static void encodeSequence(ImageWriter writer, ImageOutputStream os,
+            List<BufferedImage> frames, IndexColorModel palette,
+            int frameDelayMs, int firstFrameDelayMs) throws IOException {
+        writer.setOutput(os);
+        writer.prepareWriteSequence(null);
+        for (int i = 0; i < frames.size(); i++) {
+            BufferedImage indexed = ditherToPalette(frames.get(i), palette);
+            IIOMetadata meta = writer.getDefaultImageMetadata(
+                ImageTypeSpecifier.createFromRenderedImage(indexed), writer.getDefaultWriteParam());
+            applyFrameMetadata(meta, i == 0 ? firstFrameDelayMs : frameDelayMs);
+            writer.writeToSequence(new IIOImage(indexed, null, meta), null);
+        }
+        writer.endWriteSequence();
+    }
+
+    /** Counts/hashes successful sink writes, including the trailer; no encoded-artifact tee. */
+    private static final class CountingDigestSink extends OutputStream {
+        private final OutputStream out;
+        private final MessageDigest digest;
+        private long count;
+        private boolean failed;
+        private boolean closed;
+
+        CountingDigestSink(OutputStream out, MessageDigest digest) {
+            this.out = out;
+            this.digest = digest;
+        }
+
+        private void writable() throws IOException {
+            if (failed || closed) throw new IOException("GIF sink is closed or failed");
+        }
+
+        @Override public void write(int value) throws IOException {
+            writable();
+            try {
+                out.write(value);
+                digest.update((byte) value);
+                count = Math.addExact(count, 1L);
+            } catch (IOException | RuntimeException | Error failure) {
+                failed = true;
+                throw failure;
+            }
+        }
+
+        @Override public void write(byte[] bytes, int offset, int length) throws IOException {
+            Objects.checkFromIndexSize(offset, length, bytes.length);
+            writable();
+            try {
+                out.write(bytes, offset, length);
+                digest.update(bytes, offset, length);
+                count = Math.addExact(count, length);
+            } catch (IOException | RuntimeException | Error failure) {
+                failed = true;
+                throw failure;
+            }
+        }
+
+        @Override public void flush() throws IOException {
+            writable();
+            try {
+                out.flush();
+            } catch (IOException | RuntimeException | Error failure) {
+                failed = true;
+                throw failure;
+            }
+        }
+
+        @Override public void close() throws IOException {
+            if (closed) return;
+            closed = true;
+            // The unbuffered file is closed even after failure; never retry a failed flush.
+            try {
+                out.close();
+            } catch (IOException | RuntimeException | Error failure) {
+                failed = true;
+                throw failure;
+            }
+        }
+
+        long completedCount() throws IOException {
+            if (failed || !closed) throw new IOException("no completed GIF sink snapshot");
+            return count;
+        }
+    }
+
+    /** Sequential ImageIO output with at most two retained 8192-byte cache blocks. */
+    private static final class SequentialGifStream extends MemoryCacheImageOutputStream {
+        private static final int CHUNK = 8192;
+        private final EncodedStreamObserver observer;
+        private boolean failed;
+        private boolean closeAttempted;
+
+        SequentialGifStream(OutputStream sink, EncodedStreamObserver observer) {
+            super(sink);
+            this.observer = observer;
+        }
+
+        private void writable() throws IOException {
+            if (failed || closeAttempted) throw new IOException("GIF stream is closed or failed");
+            if (getBitOffset() != 0) throw new IOException("GIF output must stay byte-aligned");
+        }
+
+        private void observe() throws IOException {
+            if (observer != null && !closeAttempted) observer.observe(this);
+        }
+
+        @Override public void write(int value) throws IOException {
+            writable();
+            try {
+                super.write(value);
+                observe();
+                flushBefore(getStreamPosition());
+            } catch (IOException | RuntimeException | Error failure) {
+                failed = true;
+                throw failure;
+            }
+        }
+
+        @Override public void write(byte[] bytes, int offset, int length) throws IOException {
+            Objects.checkFromIndexSize(offset, length, bytes.length);
+            writable();
+            try {
+                for (int at = offset; at < offset + length; ) {
+                    int step = Math.min(CHUNK, offset + length - at);
+                    super.write(bytes, at, step);
+                    observe();
+                    flushBefore(getStreamPosition());
+                    at += step;
+                }
+            } catch (IOException | RuntimeException | Error failure) {
+                failed = true;
+                throw failure;
+            }
+        }
+
+        @Override public void flushBefore(long position) throws IOException {
+            if (failed) throw new IOException("failed GIF flush must not be retried");
+            try {
+                observe();
+                super.flushBefore(position);
+                observe();
+            } catch (IOException | RuntimeException | Error failure) {
+                failed = true;
+                throw failure;
+            }
+        }
+
+        @Override public void seek(long position) throws IOException {
+            // A rejected probe changes nothing; an encoder still receives the loud refusal.
+            if (position != getStreamPosition()) throw new IOException("GIF output is sequential");
+            super.seek(position); // inherited close may seek to its already-current length
+        }
+
+        @Override public int read() throws IOException { throw new IOException("GIF producer read refused"); }
+        @Override public int read(byte[] bytes, int offset, int length) throws IOException {
+            throw new IOException("GIF producer read refused");
+        }
+        @Override public int readBit() throws IOException { throw new IOException("GIF bit read refused"); }
+        @Override public long readBits(int count) throws IOException { throw new IOException("GIF bit read refused"); }
+        @Override public void writeBit(int bit) throws IOException { throw new IOException("GIF bit write refused"); }
+        @Override public void writeBits(long bits, int count) throws IOException { throw new IOException("GIF bit write refused"); }
+
+        @Override public void close() throws IOException {
+            if (closeAttempted) return;
+            closeAttempted = true;
+            if (failed) throw new IOException("failed GIF stream close must not retry output");
+            try {
+                super.close();
+            } catch (IOException | RuntimeException | Error failure) {
+                failed = true;
+                throw failure;
+            }
         }
     }
 

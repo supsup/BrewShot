@@ -126,9 +126,36 @@ class MainManifestTest {
         assertFalse(Files.exists(out), "the receipt is not a current-filesystem-state promise");
         String exactClaim = "BrewShot generated exactly these bytes (sha256 X).";
         String recompute = "Consumers must recompute SHA-256 after transport or immediately before use.";
-        for (String path : List.of("README.md", "RELEASE_NOTES.md")) {
+        Map<String, String> expectedParagraphs = Map.of(
+            "README.md", """
+                The `capture-time-producer` value of `outSha256Provenance` means:
+                BrewShot generated exactly these bytes (sha256 X).
+                `X` is the lowercase 64-hex digest in `outSha256`.
+                Consumers must recompute SHA-256 after transport or immediately before use.
+                This is a capture-time producer claim, not a signature, trusted-capture,
+                current-file-state, immutability, transport, or cross-file atomicity proof.
+                """.strip(),
+            "RELEASE_NOTES.md", """
+                - **Opt-in producer receipts** (plan 0181881e). `--artifact-sha256` requires an
+                  explicit `--json PATH` and adds only `outSha256` and `outSha256Provenance`.
+                  The stable `capture-time-producer` value means:
+                  BrewShot generated exactly these bytes (sha256 X).
+                  Consumers must recompute SHA-256 after transport or immediately before use.
+                  This is a capture-time producer claim, not a signature, trusted-capture,
+                  current-file-state, immutability, transport, or cross-file atomicity proof.
+                  Existing `outBytes` uses that same completed snapshot; PNG/JPEG/PDF use the
+                  producer array and GIF uses the encoded stream through its trailer, without
+                  re-reading the artifact or making an artifact-sized copy. Flag omission keeps
+                  both new keys absent and the legacy sidecar bytes unchanged.
+                """.strip());
+        for (var expectation : expectedParagraphs.entrySet()) {
+            String path = expectation.getKey();
             String documentation = Files.readString(Path.of(path));
-            assertTrue(documentation.contains(exactClaim), path + ": keep the exact narrow claim");
+            List<String> claims = java.util.Arrays.stream(documentation.replace("\r\n", "\n")
+                .split("\\n\\s*\\n")).filter(p -> p.contains(exactClaim)).toList();
+            assertEquals(1, claims.size(), path + ": exactly one producer-claim paragraph");
+            assertEquals(expectation.getValue(), claims.get(0).strip(),
+                path + ": additions or substitutions must not broaden the producer claim");
             assertFalse(documentation.contains("the artifact is"), path + ": no broadened current-file claim");
             assertTrue(documentation.contains(recompute), path + ": preserve the end-to-end boundary");
         }
@@ -142,7 +169,7 @@ class MainManifestTest {
             null, out, null, null, true, 12, null, null);
     }
 
-    /** Proposed named entry avoids ambiguous null overloads on all the existing APIs. */
+    /** The named receipt entry avoids ambiguous null overloads on all existing APIs. */
     private static void writeProducerManifest(Path manifest, Path out,
             ArtifactWriter.ProducerReceipt receipt) throws Exception {
         Main.writeManifestWithProducerReceipt(manifest, "page.html", "file", 640, 480, 25,
