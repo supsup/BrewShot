@@ -329,7 +329,10 @@ class BrewShotTransportDeadlineTest {
                 long step = TimeUnit.MILLISECONDS.toNanos(10);
                 TimeUnit.NANOSECONDS.sleep(Math.min(step, remaining));
                 if (remaining < step) return null;
-                events.incrementAndGet();
+                // Keep the deadline-reset discriminator finite even if a mutant
+                // renews every poll: 26 events cannot fit this 100 ms budget.
+                assertTrue(events.incrementAndGet() <= 25,
+                    "interleaved event wait renewed beyond its outer budget");
                 return BrewShot.InboxMessage.untracked("{\"method\":\"Network.loadingFinished\"}");
             }
         };
@@ -371,10 +374,15 @@ class BrewShotTransportDeadlineTest {
         Object expired = after.invoke(null, 0L);
         var wait = BrewShot.class.getDeclaredMethod("waitFor", String.class, long.class, type);
         wait.setAccessible(true);
+        var nextId = BrewShot.class.getDeclaredField("nextId");
+        nextId.setAccessible(true);
+        int before = nextId.getInt(shot);
         try {
             var failure = assertThrows(java.lang.reflect.InvocationTargetException.class,
                 () -> wait.invoke(shot, "ready", 1L, expired));
             assertOuterTimeout((IllegalStateException) failure.getCause(), 1);
+            assertEquals(before, nextId.getInt(shot),
+                "outer expiry must stop before command's redundant no-send guard");
             assertEquals(0, socket.sendCalls.get());
             assertThrows(IllegalArgumentException.class, () -> shot.waitFor("ready", 0));
         } finally { shot.close(); }

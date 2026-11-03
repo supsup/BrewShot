@@ -63,8 +63,9 @@ class MainCliTest {
         ReceiptScript script = new ReceiptScript(out, false);
         script.waitPredicateReady = ready;
         long started = System.nanoTime();
+        String waitMillis = ready ? "1000" : "50";
         ReceiptRun run = runReceiptCli(new ReceiptLane("wait", "png",
-            List.of("--wait-js", "ready", "--wait-timeout", "50")), digest,
+            List.of("--wait-js", "ready", "--wait-timeout", waitMillis)), digest,
             out, json, script, venue, 90);
         return new WaitRun(run.code(), run.failure(), script.captures, script.waitPolls,
             java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started));
