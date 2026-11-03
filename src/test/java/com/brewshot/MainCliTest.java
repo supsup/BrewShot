@@ -89,6 +89,9 @@ class MainCliTest {
                 assertEquals("640x480", root.get("viewport"), "viewport stays request metadata");
                 if (!enabled) {
                     oldKeys = java.util.Set.copyOf(root.keySet());
+                    assertTrue(oldKeys.containsAll(java.util.Set.of("input", "mode", "viewport",
+                        "settleMs", "waitJs", "out", "outBytes", "eval", "failJs", "failJsPassed",
+                        "elapsedMs", "brewshot")), "CLI must preserve every unconditional legacy key");
                     assertFalse(root.containsKey("outSha256"));
                     assertFalse(root.containsKey("outSha256Provenance"));
                     assertEquals(Files.size(out), ((Number) root.get("outBytes")).longValue(),

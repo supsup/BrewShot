@@ -129,6 +129,7 @@ class MainManifestTest {
         for (String path : List.of("README.md", "RELEASE_NOTES.md")) {
             String documentation = Files.readString(Path.of(path));
             assertTrue(documentation.contains(exactClaim), path + ": keep the exact narrow claim");
+            assertFalse(documentation.contains("the artifact is"), path + ": no broadened current-file claim");
             assertTrue(documentation.contains(recompute), path + ": preserve the end-to-end boundary");
         }
     }

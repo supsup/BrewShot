@@ -1105,7 +1105,7 @@ as killing a semantic mutant.
 | 4 · `MainCliTest.everyCliLaneKeepsItsCompletedProducerReceiptAcrossPostCaptureReplacement` | Actual `Main` and `BrewShot` run over scripted CDP and a synthetic process: PNG, JPEG, PDF, full-page GIF, element GIF, selector clip, JS clip, scale and vision preview. Enabled positive captures and close-time replacement runs include the whole Main call in the no-content-read census. Expected CDP bytes and legacy GIF reference bytes are prepared before recording; close never reads the artifact. Flagged count/hash retain that snapshot; unflagged count retains the legacy later-file-size behavior. Real commit failures preserve prior JSON. | Use `Files.size` or recompute the enabled receipt from the replaced path: snapshot assertions must fail. Leave any CLI forwarding path on the old void-only receipt route: that lane must fail. Publish JSON after a failed artifact commit: the prior-sidecar assertion must fail. |
 | 5 · `MainManifestTest.noReceiptPreservesTheExactLegacySidecarThroughEveryOverload` | An independent raw JSON golden at base version 0.9.0 pins fields, values, order, formatting and newline through every existing overload and the proposed null-receipt entry. Both added keys are absent. | Add either key while disabled, reorder a field, or alter a legacy value/format: the byte golden must fail. |
 | 6 · `MainCliTest.artifactDigestRequiresExplicitJsonBeforeAvailabilityLaunchOrAnyWrite` | Real `Main.run` returns usage 2 with neither browser-work hook nor output write for the invalid combination in either argument order. A valid explicit-JSON control reaches both the availability and launch witnesses through `Main.SessionLauncher` and preserves a prior sidecar when launch fails. | Remove the early cross-flag refusal or move it after browser work: the lookup/launch-zero assertion must fail. An always-refusing parser must fail the positive control. |
-| 7 · `MainManifestTest.receiptAndDocsKeepTheExactCaptureTimeClaimAndConsumerRecomputeBoundary` | A completed receipt can be published after the output path is removed. The provenance tag, exact claim above and recomputation guidance stay explicit in the receipt contract, README and release notes. | Change the provenance to a current-file claim or replace the exact sentence with “the artifact is X”: the value/wording assertions must fail. |
+| 7 · `MainManifestTest.receiptAndDocsKeepTheExactCaptureTimeClaimAndConsumerRecomputeBoundary` | A completed receipt can be published after the output path is removed. The provenance tag, exact claim above and recomputation guidance stay explicit in the receipt contract, README and release notes. | Change the provenance to a current-file claim, or add or substitute a broadened current-file-state claim: the value/wording assertions must fail. |
 
 The GIF observer must inspect the **production** stream after writes and flushes,
 including before eager discard, and must fire on scalar and bulk progress. It
@@ -1154,8 +1154,10 @@ metadata query. The allocation counter measures the current writer thread and
 has escaping-copy controls before and after measurement. It is not an RSS or
 total-heap claim. Source review must also rule out off-thread buffering and
 hidden read paths. Missing probes, unavailable counters/JFR, data loss or an
-unfamiliar cache layout fail the instrument; they never skip green. The existing
-test-JVM `java.desktop/javax.imageio.stream` opens are required for the physical
+unfamiliar cache layout fail the instrument; they never skip green. The
+GIF cache census does not observe an artifact-sized tee or `ByteArrayOutputStream`
+outside the ImageIO cache; Stage B source review must rule those out explicitly.
+The existing test-JVM `java.desktop/javax.imageio.stream` opens are required for the physical
 GIF cache census. Java 21 and Java 25 venues must be identified separately.
 
 API references: [JDK Recording](https://docs.oracle.com/en/java/javase/25/docs/api/jdk.jfr/jdk/jfr/Recording.html),

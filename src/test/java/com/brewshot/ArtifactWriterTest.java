@@ -48,10 +48,9 @@ class ArtifactWriterTest {
             String expectedHash = receiptHash(produced);
             var receipt = withoutArtifactReads(venue,
                 () -> ArtifactWriter.writeBytesWithReceipt(target, produced, true));
-            assertEquals(produced.length, receipt.outBytes(), format);
-            assertEquals(expectedHash, receipt.outSha256(), format);
             org.junit.jupiter.api.Assertions.assertArrayEquals(produced, Files.readAllBytes(target));
             java.util.Arrays.fill(produced, (byte) 0x7f);
+            assertEquals(produced.length, receipt.outBytes(), format);
             assertEquals(expectedHash, receipt.outSha256(), "receipt must not retain mutable input");
         }
 
@@ -125,6 +124,7 @@ class ArtifactWriterTest {
         int firstProbe = 0, lastProbe = 0;
         List<String> artifactReads = new java.util.ArrayList<>();
         Path absolute = directory.toAbsolutePath().normalize();
+        Path real = directory.toRealPath();
         for (var event : RecordingFile.readAllEvents(recordingPath)) {
             assertFalse(event.getEventType().getName().equals("jdk.DataLoss"),
                 "INSTRUMENT: JFR dropped events; read census is incomplete");
@@ -134,7 +134,7 @@ class ArtifactWriterTest {
             Path path = Path.of(name).toAbsolutePath().normalize();
             if (path.equals(before.toAbsolutePath().normalize())) firstProbe++;
             else if (path.equals(after.toAbsolutePath().normalize())) lastProbe++;
-            else if (path.startsWith(absolute)) artifactReads.add(path.toString());
+            else if (path.startsWith(absolute) || path.startsWith(real)) artifactReads.add(path.toString());
         }
         assertTrue(firstProbe > 0 && lastProbe > 0,
             "INSTRUMENT: both real content-read probes must appear; first=" + firstProbe + ", last=" + lastProbe);
