@@ -39,6 +39,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.IntConsumer;
+import java.util.function.LongSupplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -2406,8 +2407,12 @@ public final class BrewShot implements AutoCloseable {
     }
 
     /** Send one CDP command and block for its id-matched result. */
-    @SuppressWarnings("unchecked")
     private Map<String, Object> command(String method, String paramsJson) {
+        return command(method, paramsJson, null);
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> command(String method, String paramsJson, Deadline deadline) {
         // FAIL FAST on a transport already known dead. Without this the latch would be
         // a flag nobody reads: a caller whose drain consumed the sentinel would still
         // spend the full commandTimeout waiting for a response that can never arrive.
@@ -2428,7 +2433,10 @@ public final class BrewShot implements AutoCloseable {
         // One budget for the complete round-trip. Starting it before send is
         // load-bearing: a backpressured WebSocket send must spend the same
         // commandTimeout budget as the response it is waiting to produce.
-        Deadline deadline = Deadline.afterMillis(commandTimeoutMs);
+        if (deadline == null) { deadline = Deadline.afterMillis(commandTimeoutMs); }
+        if (deadline.expired()) {
+            throw new IllegalStateException("CDP timeout sending " + method);
+        }
         sendWithinDeadline(msg, method, deadline);
 
         while (true) {
@@ -2496,9 +2504,15 @@ public final class BrewShot implements AutoCloseable {
     private static final class Deadline {
         private final long startedNanos;
         private final long budgetNanos;
+        private final LongSupplier nanoClock;
 
         private Deadline(long budgetNanos) {
-            this.startedNanos = System.nanoTime();
+            this(budgetNanos, System::nanoTime);
+        }
+
+        private Deadline(long budgetNanos, LongSupplier nanoClock) {
+            this.nanoClock = nanoClock;
+            this.startedNanos = nanoClock.getAsLong();
             this.budgetNanos = budgetNanos;
         }
 
@@ -2508,7 +2522,7 @@ public final class BrewShot implements AutoCloseable {
         }
 
         long remainingNanos() {
-            long elapsed = System.nanoTime() - startedNanos;
+            long elapsed = nanoClock.getAsLong() - startedNanos;
             if (elapsed <= 0) { return budgetNanos; }
             return elapsed >= budgetNanos ? 0 : budgetNanos - elapsed;
         }
@@ -2516,7 +2530,7 @@ public final class BrewShot implements AutoCloseable {
         Deadline cappedAtMillis(long timeoutMs) {
             long cap = timeoutMs <= 0
                 ? 0 : TimeUnit.MILLISECONDS.toNanos(timeoutMs);
-            return new Deadline(Math.min(remainingNanos(), cap));
+            return new Deadline(Math.min(remainingNanos(), cap), nanoClock);
         }
 
         boolean expired() { return remainingNanos() <= 0; }
@@ -2527,7 +2541,7 @@ public final class BrewShot implements AutoCloseable {
         for (Map<String, Object> e : pendingEvents) {
             if (method.equals(e.get("method"))) { pendingEvents.remove(e); return; }
         }
-        long deadline = System.currentTimeMillis() + timeoutMs;
+        Deadline deadline = Deadline.afterMillis(timeoutMs);
         while (true) {
             Map<String, Object> m = nextMessage(deadline, "event " + method);
             if (method.equals(m.get("method"))) { return; }
@@ -2667,12 +2681,6 @@ public final class BrewShot implements AutoCloseable {
         return nextMessageNanos(deadline.remainingNanos(), waitingFor);
     }
 
-    private Map<String, Object> nextMessage(long deadlineMillis, String waitingFor) {
-        long waitMillis = deadlineMillis - System.currentTimeMillis();
-        long waitNanos = waitMillis > 0 ? TimeUnit.MILLISECONDS.toNanos(waitMillis) : 0;
-        return nextMessageNanos(waitNanos, waitingFor);
-    }
-
     @SuppressWarnings("unchecked")
     private Map<String, Object> nextMessageNanos(long waitNanos, String waitingFor) {
         try {
@@ -2778,20 +2786,56 @@ public final class BrewShot implements AutoCloseable {
     /**
      * Poll a JS predicate until it's truthy — the deterministic alternative to
      * {@link #settle} guesses: {@code shot.waitFor("document.querySelector('.done')", 5000)}.
-     * Fails loud with the predicate text on timeout.
+     * One monotonic budget covers sends, responses and retry pauses, capped by
+     * the configured command timeout per evaluation. A true returned after the
+     * outer deadline is rejected. Fails loud with the predicate text on timeout.
      */
     public void waitFor(String jsPredicate, long timeoutMs) {
         Validation.positiveLong("waitFor timeoutMs", timeoutMs);
-        Deadline deadline = Deadline.afterMillis(timeoutMs);
+        waitFor(jsPredicate, timeoutMs, Deadline.afterMillis(timeoutMs));
+    }
+
+    @FunctionalInterface
+    interface RetryPause {
+        void pause(long nanos) throws InterruptedException;
+    }
+
+    private void waitFor(String jsPredicate, long timeoutMs, Deadline deadline) {
+        waitFor(jsPredicate, timeoutMs, deadline, TimeUnit.NANOSECONDS::sleep);
+    }
+
+    private void waitFor(String jsPredicate, long timeoutMs, Deadline deadline, RetryPause pause) {
         while (true) {
-            Object v = eval("!!(" + jsPredicate + ")");
-            if (Boolean.TRUE.equals(v)) { return; }
-            if (deadline.expired()) {
-                throw new IllegalStateException(
-                    "waitFor timed out after " + timeoutMs + "ms: " + jsPredicate);
+            if (Thread.currentThread().isInterrupted()) {
+                throw new IllegalStateException("interrupted");
             }
-            settle(60);
+            if (deadline.expired()) { throw waitForTimeout(jsPredicate, timeoutMs, null); }
+            Object value;
+            try {
+                value = eval("!!(" + jsPredicate + ")", deadline.cappedAtMillis(commandTimeoutMs));
+            } catch (IllegalStateException failure) {
+                // Translate only transport timeouts caused by the outer budget.
+                // JS errors, closed Chrome/socket and interruption remain causal.
+                if (deadline.expired() && String.valueOf(failure.getMessage()).startsWith("CDP timeout")) {
+                    throw waitForTimeout(jsPredicate, timeoutMs, failure);
+                }
+                throw failure;
+            }
+            // A response queued on time but delivered late cannot satisfy readiness.
+            if (deadline.expired()) { throw waitForTimeout(jsPredicate, timeoutMs, null); }
+            if (Boolean.TRUE.equals(value)) { return; }
+            long pauseNanos = Math.min(TimeUnit.MILLISECONDS.toNanos(60), deadline.remainingNanos());
+            try { pause.pause(pauseNanos); }
+            catch (InterruptedException failure) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("interrupted", failure);
+            }
         }
+    }
+
+    private static IllegalStateException waitForTimeout(String predicate, long timeoutMs,
+            IllegalStateException cause) {
+        return new IllegalStateException("waitFor timed out after " + timeoutMs + "ms: " + predicate, cause);
     }
 
     /**
@@ -3135,9 +3179,13 @@ public final class BrewShot implements AutoCloseable {
      * Throws with the page-side description on an uncaught exception.
      */
     public Object eval(String expression) {
+        return eval(expression, null);
+    }
+
+    private Object eval(String expression, Deadline deadline) {
         Map<String, Object> r = command("Runtime.evaluate",
             "{\"expression\":\"" + MiniJson.esc(expression)
-                + "\",\"returnByValue\":true,\"awaitPromise\":true}");
+                + "\",\"returnByValue\":true,\"awaitPromise\":true}", deadline);
         Object ex = r.get("exceptionDetails");
         if (ex != null) {
             Object desc = MiniJson.get(r, "exceptionDetails.exception.description");
@@ -4038,8 +4086,8 @@ public final class BrewShot implements AutoCloseable {
             ? "{\"format\":\"png\",\"everyNthFrame\":1,\"maxWidth\":" + maxWidth + "}"
             : "{\"format\":\"png\",\"everyNthFrame\":1}");
         try {
-            long deadline = System.currentTimeMillis() + durationMs;
-            while (System.currentTimeMillis() < deadline) {
+            Deadline deadline = Deadline.afterMillis(durationMs);
+            while (!deadline.expired()) {
                 Map<String, Object> m;
                 try {
                     m = nextMessage(deadline, "Page.screencastFrame");

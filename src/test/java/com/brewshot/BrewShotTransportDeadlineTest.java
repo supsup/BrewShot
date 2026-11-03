@@ -23,6 +23,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.stream.Stream;
@@ -220,6 +221,329 @@ class BrewShotTransportDeadlineTest {
         } finally {
             shot.close();
         }
+    }
+
+    @Test
+    void waitForBackpressuredSendSpendsOnlyOuterBudget(@TempDir Path temp) throws Exception {
+        FakeWebSocket socket = new FakeWebSocket();
+        CompletableFuture<WebSocket> stuck = new CompletableFuture<>();
+        socket.onSend = ignored -> stuck;
+        BrewShot shot = new BrewShot(new FakeProcess(true), profile(temp, "wait-send"),
+            socket, new LinkedBlockingQueue<>(), 40);
+        shot.commandTimeout(1_000);
+        long started = System.nanoTime();
+        try {
+            assertOuterTimeout(assertThrows(IllegalStateException.class,
+                () -> shot.waitFor("ready", 50)), 50);
+            assertElapsed(started, 25, 700);
+            assertTrue(stuck.isCancelled());
+            assertEquals(1, socket.abortCalls.get());
+        } finally { shot.close(); }
+    }
+
+    @Test
+    void waitForSendAndAbsentResponseShareOuterBudget(@TempDir Path temp) throws Exception {
+        FakeWebSocket socket = new FakeWebSocket();
+        socket.onSend = ignored -> new DelayedSuccessfulFuture(socket, 140);
+        BrewShot shot = new BrewShot(new FakeProcess(true), profile(temp, "wait-response"),
+            socket, new LinkedBlockingQueue<>(), 40);
+        shot.commandTimeout(1_000);
+        long started = System.nanoTime();
+        try {
+            assertOuterTimeout(assertThrows(IllegalStateException.class,
+                () -> shot.waitFor("ready", 200)), 200);
+            assertElapsed(started, 170, 310);
+            assertEquals(1, socket.sendCalls.get());
+        } finally { shot.close(); }
+    }
+
+    @Test
+    void waitForRejectsTrueQueuedOnTimeButReturnedAfterExpiry(@TempDir Path temp) throws Exception {
+        LinkedBlockingQueue<BrewShot.InboxMessage> inbox = new LinkedBlockingQueue<>() {
+            @Override public BrewShot.InboxMessage poll(long timeout, TimeUnit unit)
+                    throws InterruptedException {
+                // Deliberately return a queued response after the caller's deadline:
+                // models descheduling after poll acquired it, without helper threads.
+                TimeUnit.MILLISECONDS.sleep(100);
+                return super.poll();
+            }
+        };
+        FakeWebSocket socket = new FakeWebSocket();
+        socket.onSend = text -> {
+            respond(inbox, text, true);
+            return CompletableFuture.completedFuture(socket);
+        };
+        BrewShot shot = new BrewShot(new FakeProcess(true), profile(temp, "late-true"), socket, inbox, 40);
+        long started = System.nanoTime();
+        try {
+            assertOuterTimeout(assertThrows(IllegalStateException.class,
+                () -> shot.waitFor("ready", 40)), 40);
+            assertElapsed(started, 80, 650);
+            assertEquals(1, socket.sendCalls.get());
+        } finally { shot.close(); }
+    }
+
+    @Test
+    void waitForAcceptsOnTimeTrueAndFalseThenTrue(@TempDir Path temp) throws Exception {
+        for (int falsePolls : new int[] {0, 1}) {
+            LinkedBlockingQueue<BrewShot.InboxMessage> inbox = new LinkedBlockingQueue<>();
+            FakeWebSocket socket = new FakeWebSocket();
+            AtomicInteger polls = new AtomicInteger();
+            socket.onSend = text -> {
+                respond(inbox, text, polls.incrementAndGet() > falsePolls);
+                return CompletableFuture.completedFuture(socket);
+            };
+            BrewShot shot = new BrewShot(new FakeProcess(true), profile(temp, "on-time-" + falsePolls),
+                socket, inbox, 40);
+            try {
+                shot.waitFor("ready", 1_000);
+                assertEquals(falsePolls + 1, polls.get());
+            } finally { shot.close(); }
+        }
+    }
+
+    @Test
+    void nearExpiryFalseDoesNotStartFreshPauseOrEvaluation(@TempDir Path temp) throws Exception {
+        AtomicLong clock = new AtomicLong();
+        AtomicLong requestedPause = new AtomicLong(-1);
+        AtomicInteger pauses = new AtomicInteger();
+        LinkedBlockingQueue<BrewShot.InboxMessage> inbox = new LinkedBlockingQueue<>();
+        FakeWebSocket socket = new FakeWebSocket();
+        socket.onSend = text -> {
+            // The first false response spends exactly 100ms of a 110ms budget.
+            // Any erroneous second send expires it, keeping the bad path finite
+            // even if a faulty pause requests zero or the retry check is removed.
+            clock.set(TimeUnit.MILLISECONDS.toNanos(socket.sendCalls.get() == 1 ? 100 : 110));
+            respond(inbox, text, false);
+            return CompletableFuture.completedFuture(socket);
+        };
+        BrewShot shot = new BrewShot(new FakeProcess(true), profile(temp, "near-expiry"), socket, inbox, 40)
+            .commandTimeout(1_000);
+        try {
+            Class<?> deadlineType = Class.forName("com.brewshot.BrewShot$Deadline");
+            var constructor = deadlineType.getDeclaredConstructor(long.class, java.util.function.LongSupplier.class);
+            constructor.setAccessible(true);
+            Object deadline = constructor.newInstance(TimeUnit.MILLISECONDS.toNanos(110),
+                (java.util.function.LongSupplier) clock::get);
+            BrewShot.RetryPause pause = nanos -> {
+                requestedPause.set(nanos);
+                pauses.incrementAndGet();
+                clock.addAndGet(nanos);
+            };
+            var wait = BrewShot.class.getDeclaredMethod("waitFor", String.class, long.class,
+                deadlineType, BrewShot.RetryPause.class);
+            wait.setAccessible(true);
+            var failure = assertThrows(java.lang.reflect.InvocationTargetException.class,
+                () -> wait.invoke(shot, "ready", 110L, deadline, pause));
+            assertTrue(failure.getCause() instanceof IllegalStateException,
+                "wait must fail with its timeout, not a reflection/setup error: " + failure.getCause());
+            assertOuterTimeout((IllegalStateException) failure.getCause(), 110);
+            assertEquals(TimeUnit.MILLISECONDS.toNanos(10), requestedPause.get(),
+                "actual retry pause must request exactly the remaining 10ms, never a fresh 60ms");
+            assertEquals(1, pauses.get(), "one false response permits exactly one bounded pause");
+            assertEquals(TimeUnit.MILLISECONDS.toNanos(110), clock.get());
+            assertEquals(1, socket.sendCalls.get(), "expiry must be checked before the next send");
+        } finally { shot.close(); }
+    }
+
+    @Test
+    void interleavedEventsDoNotRenewWaitForBudget(@TempDir Path temp) throws Exception {
+        AtomicInteger events = new AtomicInteger();
+        LinkedBlockingQueue<BrewShot.InboxMessage> inbox = new LinkedBlockingQueue<>() {
+            @Override public BrewShot.InboxMessage poll(long timeout, TimeUnit unit)
+                    throws InterruptedException {
+                long remaining = unit.toNanos(timeout);
+                long step = TimeUnit.MILLISECONDS.toNanos(10);
+                TimeUnit.NANOSECONDS.sleep(Math.min(step, remaining));
+                if (remaining < step) return null;
+                // Keep the deadline-reset discriminator finite even if a mutant
+                // renews every poll: 26 events cannot fit this 100 ms budget.
+                assertTrue(events.incrementAndGet() <= 25,
+                    "interleaved event wait renewed beyond its outer budget");
+                return BrewShot.InboxMessage.untracked("{\"method\":\"Network.loadingFinished\"}");
+            }
+        };
+        FakeWebSocket socket = new FakeWebSocket();
+        BrewShot shot = new BrewShot(new FakeProcess(true), profile(temp, "interleaved"), socket, inbox, 40);
+        shot.commandTimeout(1_000);
+        long started = System.nanoTime();
+        try {
+            assertOuterTimeout(assertThrows(IllegalStateException.class,
+                () -> shot.waitFor("ready", 100)), 100);
+            assertElapsed(started, 75, 700);
+            assertTrue(events.get() > 0, "control must route events before expiry");
+            assertEquals(1, socket.sendCalls.get());
+        } finally { shot.close(); }
+    }
+
+    @Test
+    void waitForPreservesShorterConfiguredCommandTimeout(@TempDir Path temp) throws Exception {
+        BrewShot shot = new BrewShot(new FakeProcess(true), profile(temp, "short-command"),
+            new FakeWebSocket(), new LinkedBlockingQueue<>(), 40);
+        shot.commandTimeout(40);
+        long started = System.nanoTime();
+        try {
+            IllegalStateException failure = assertThrows(IllegalStateException.class,
+                () -> shot.waitFor("ready", 1_000));
+            assertTrue(failure.getMessage().startsWith("CDP timeout"), failure.getMessage());
+            assertElapsed(started, 20, 700);
+        } finally { shot.close(); }
+    }
+
+    @Test
+    void expiredInitialWaitForBudgetSendsNothing(@TempDir Path temp) throws Exception {
+        FakeWebSocket socket = new FakeWebSocket();
+        BrewShot shot = new BrewShot(new FakeProcess(true), profile(temp, "expired"),
+            socket, new LinkedBlockingQueue<>(), 40);
+        Class<?> type = Class.forName("com.brewshot.BrewShot$Deadline");
+        var after = type.getDeclaredMethod("afterMillis", long.class);
+        after.setAccessible(true);
+        Object expired = after.invoke(null, 0L);
+        var wait = BrewShot.class.getDeclaredMethod("waitFor", String.class, long.class, type);
+        wait.setAccessible(true);
+        var nextId = BrewShot.class.getDeclaredField("nextId");
+        nextId.setAccessible(true);
+        int before = nextId.getInt(shot);
+        try {
+            var failure = assertThrows(java.lang.reflect.InvocationTargetException.class,
+                () -> wait.invoke(shot, "ready", 1L, expired));
+            assertOuterTimeout((IllegalStateException) failure.getCause(), 1);
+            assertEquals(before, nextId.getInt(shot),
+                "outer expiry must stop before command's redundant no-send guard");
+            assertEquals(0, socket.sendCalls.get());
+            assertThrows(IllegalArgumentException.class, () -> shot.waitFor("ready", 0));
+        } finally { shot.close(); }
+    }
+
+    @Test
+    void waitForPreservesClosedTransportAndInterruptCause(@TempDir Path temp) throws Exception {
+        LinkedBlockingQueue<BrewShot.InboxMessage> inbox = new LinkedBlockingQueue<>();
+        inbox.add(BrewShot.InboxMessage.closed());
+        FakeWebSocket socket = new FakeWebSocket();
+        BrewShot shot = new BrewShot(new FakeProcess(true), profile(temp, "causal"), socket, inbox, 40);
+        try {
+            IllegalStateException closed = assertThrows(IllegalStateException.class,
+                () -> shot.waitFor("ready", 500));
+            assertTrue(closed.getMessage().contains("DevTools socket closed"), closed.getMessage());
+            int sends = socket.sendCalls.get();
+            assertThrows(IllegalStateException.class, () -> shot.waitFor("ready", 500));
+            assertEquals(sends, socket.sendCalls.get(), "latched close must fail before another send");
+            Thread.currentThread().interrupt();
+            try {
+                IllegalStateException interrupted = assertThrows(IllegalStateException.class,
+                    () -> shot.waitFor("ready", 500));
+                assertTrue(interrupted.getMessage().contains("interrupted"));
+                assertTrue(Thread.currentThread().isInterrupted());
+            } finally { Thread.interrupted(); }
+        } finally { shot.close(); }
+    }
+
+    @Test
+    void waitForInterruptedSendCancelsAndKeepsInterrupt(@TempDir Path temp) throws Exception {
+        FakeWebSocket socket = new FakeWebSocket();
+        CompletableFuture<WebSocket> stuck = new CompletableFuture<>();
+        socket.onSend = ignored -> { Thread.currentThread().interrupt(); return stuck; };
+        BrewShot shot = new BrewShot(new FakeProcess(true), profile(temp, "interrupt-send"),
+            socket, new LinkedBlockingQueue<>(), 40);
+        try {
+            IllegalStateException failure = assertThrows(IllegalStateException.class,
+                () -> shot.waitFor("ready", 500));
+            assertTrue(failure.getMessage().contains("interrupted sending"));
+            assertTrue(Thread.currentThread().isInterrupted());
+            assertTrue(stuck.isCancelled());
+            assertEquals(1, socket.abortCalls.get());
+        } finally { Thread.interrupted(); shot.close(); }
+    }
+
+    @Test
+    void waitForPreservesPageErrorEvenWhenDeliveredAfterOuterExpiry(@TempDir Path temp) throws Exception {
+        LinkedBlockingQueue<BrewShot.InboxMessage> inbox = new LinkedBlockingQueue<>() {
+            @Override public BrewShot.InboxMessage poll(long timeout, TimeUnit unit)
+                    throws InterruptedException {
+                TimeUnit.MILLISECONDS.sleep(80);
+                return super.poll();
+            }
+        };
+        FakeWebSocket socket = new FakeWebSocket();
+        socket.onSend = text -> {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> sent = (Map<String, Object>) MiniJson.parse(text);
+            int id = ((Number) sent.get("id")).intValue();
+            inbox.add(BrewShot.InboxMessage.untracked("{\"id\":" + id
+                + ",\"result\":{\"exceptionDetails\":{\"text\":\"predicate-error\"}}}"));
+            return CompletableFuture.completedFuture(socket);
+        };
+        BrewShot shot = new BrewShot(new FakeProcess(true), profile(temp, "page-error"), socket, inbox, 40);
+        try {
+            IllegalStateException failure = assertThrows(IllegalStateException.class,
+                () -> shot.waitFor("ready", 40));
+            assertTrue(failure.getMessage().startsWith("page JS threw:"), failure.getMessage());
+        } finally { shot.close(); }
+    }
+
+    @Test
+    void waitForInterruptedResponseKeepsInterrupt(@TempDir Path temp) throws Exception {
+        LinkedBlockingQueue<BrewShot.InboxMessage> inbox = new LinkedBlockingQueue<>() {
+            @Override public BrewShot.InboxMessage poll(long timeout, TimeUnit unit)
+                    throws InterruptedException {
+                throw new InterruptedException("scripted response interruption");
+            }
+        };
+        BrewShot shot = new BrewShot(new FakeProcess(true), profile(temp, "interrupt-response"),
+            new FakeWebSocket(), inbox, 40);
+        try {
+            IllegalStateException failure = assertThrows(IllegalStateException.class,
+                () -> shot.waitFor("ready", 500));
+            assertTrue(failure.getMessage().contains("interrupted"));
+            assertTrue(Thread.currentThread().isInterrupted());
+        } finally { Thread.interrupted(); shot.close(); }
+    }
+
+    @Test
+    void waitEventUsesMonotonicSaturatedBudgetAndPreservesPendingEvent(@TempDir Path temp) throws Exception {
+        AtomicInteger timedPolls = new AtomicInteger();
+        LinkedBlockingQueue<BrewShot.InboxMessage> inbox = new LinkedBlockingQueue<>() {
+            @Override public BrewShot.InboxMessage poll(long timeout, TimeUnit unit)
+                    throws InterruptedException {
+                assertTrue(unit.toNanos(timeout) > TimeUnit.DAYS.toNanos(1),
+                    "Long.MAX_VALUE navigation budget must saturate rather than overflow wall clock");
+                timedPolls.incrementAndGet();
+                return super.poll(timeout, unit);
+            }
+        };
+        inbox.add(BrewShot.InboxMessage.untracked("{\"method\":\"Page.loadEventFired\"}"));
+        BrewShot shot = new BrewShot(new FakeProcess(true), profile(temp, "event-max"),
+            new FakeWebSocket(), inbox, 40);
+        var wait = BrewShot.class.getDeclaredMethod("waitEvent", String.class, long.class);
+        wait.setAccessible(true);
+        var route = BrewShot.class.getDeclaredMethod("routeEvent", Map.class);
+        route.setAccessible(true);
+        try {
+            wait.invoke(shot, "Page.loadEventFired", Long.MAX_VALUE);
+            assertEquals(1, timedPolls.get());
+            route.invoke(shot, Map.of("method", "Page.loadEventFired"));
+            wait.invoke(shot, "Page.loadEventFired", 0L);
+            assertEquals(1, timedPolls.get(), "pending event stays consumable without a new poll");
+        } finally { shot.close(); }
+    }
+
+    private static void respond(LinkedBlockingQueue<BrewShot.InboxMessage> inbox, String text, boolean ready) {
+        @SuppressWarnings("unchecked")
+        Map<String, Object> sent = (Map<String, Object>) MiniJson.parse(text);
+        int id = ((Number) sent.get("id")).intValue();
+        inbox.add(BrewShot.InboxMessage.untracked("{\"id\":" + id
+            + ",\"result\":{\"result\":{\"value\":" + ready + "}}}"));
+    }
+
+    private static void assertOuterTimeout(IllegalStateException failure, long budgetMs) {
+        assertTrue(failure.getMessage().startsWith("waitFor timed out after " + budgetMs + "ms: ready"),
+            failure.getMessage());
+    }
+
+    private static void assertElapsed(long started, long minimum, long maximum) {
+        long elapsed = elapsedMillis(started);
+        assertTrue(elapsed >= minimum && elapsed < maximum,
+            "bounded wait completed in " + elapsed + "ms; expected [" + minimum + ", " + maximum + ")");
     }
 
     @Test
