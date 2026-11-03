@@ -317,7 +317,8 @@ class BrewShotTransportDeadlineTest {
             respond(inbox, text, false);
             return CompletableFuture.completedFuture(socket);
         };
-        BrewShot shot = new BrewShot(new FakeProcess(true), profile(temp, "near-expiry"), socket, inbox, 40);
+        BrewShot shot = new BrewShot(new FakeProcess(true), profile(temp, "near-expiry"), socket, inbox, 40)
+            .commandTimeout(1_000);
         try {
             Class<?> deadlineType = Class.forName("com.brewshot.BrewShot$Deadline");
             var constructor = deadlineType.getDeclaredConstructor(long.class, java.util.function.LongSupplier.class);
