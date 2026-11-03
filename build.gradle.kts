@@ -64,6 +64,13 @@ fun org.gradle.api.tasks.testing.Test.configureBrewShotTests() {
     // Keep the test JVM explicit and deterministic on both desktop and CI hosts.
     systemProperty("java.awt.headless", "true")
 
+    // GifProducerStreamDiscriminatorTest (plan 0181881e, feasibility slice brewshot/864) reads the
+    // retained block arrays of the JDK MemoryCache by reflection to bound the encoded-cache payload.
+    // The module java.desktop keeps javax.imageio.stream closed, so the test JVM opens it here;
+    // without this line the probe fails MEMORY_OBSERVATION=UNKNOWN on every stock run (14/14 red,
+    // measured 2026-11-03). Test JVM only; no production artifact carries it.
+    jvmArgs("--add-opens=java.desktop/javax.imageio.stream=ALL-UNNAMED")
+
     // Every BrewShot.launch() creates its profile under java.io.tmpdir and then runs the
     // stale-profile reaper beside it, so a test run on the host default would delete the
     // developer's own leftover brewshot-<digits> profiles as a side effect. The test JVM
