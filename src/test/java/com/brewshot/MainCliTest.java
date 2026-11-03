@@ -29,6 +29,47 @@ import org.junit.jupiter.api.parallel.Isolated;
 @Isolated("Scripted Main launch, process and stderr seams are restored before other tests run")
 class MainCliTest {
 
+    @Test
+    void failedWaitDoesNotCaptureOrReturnSuccessAndOnTimeWaitStillCaptures(
+            @TempDir Path directory) throws Exception {
+        for (boolean ready : new boolean[] {false, true}) {
+            Path venue = Files.createDirectory(directory.resolve("wait-" + ready));
+            Path out = venue.resolve("capture.png");
+            Path json = venue.resolve("capture.json");
+            WaitRun run = runWaitCli(venue, out, json, false, ready);
+            assertEquals(1, run.polls(), "actual waitFor evaluation must be reached");
+            if (ready) {
+                assertNull(run.failure());
+                assertEquals(Integer.valueOf(0), run.code());
+                assertEquals(1, run.captures());
+                assertTrue(Files.isRegularFile(out));
+                assertTrue(Files.isRegularFile(json));
+            } else {
+                assertTrue(run.failure() instanceof IllegalStateException, String.valueOf(run.failure()));
+                assertTrue(run.failure().getMessage().startsWith("waitFor timed out after 50ms"));
+                assertNull(run.code(), "Main.run propagates runtime capture failures to its existing caller");
+                assertEquals(0, run.captures());
+                assertFalse(Files.exists(out));
+                assertFalse(Files.exists(json));
+                assertTrue(run.elapsedMs() < 1_000, "wait must not spend the default 15s command budget");
+            }
+        }
+    }
+
+    record WaitRun(Integer code, Exception failure, int captures, int polls, long elapsedMs) { }
+
+    static WaitRun runWaitCli(Path venue, Path out, Path json, boolean digest, boolean ready)
+            throws Exception {
+        ReceiptScript script = new ReceiptScript(out, false);
+        script.waitPredicateReady = ready;
+        long started = System.nanoTime();
+        ReceiptRun run = runReceiptCli(new ReceiptLane("wait", "png",
+            List.of("--wait-js", "ready", "--wait-timeout", "50")), digest,
+            out, json, script, venue, 90);
+        return new WaitRun(run.code(), run.failure(), script.captures, script.waitPolls,
+            java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started));
+    }
+
     /** Case 4: real Main/BrewShot paths, with replacement at close BEFORE manifest publication. */
     @Test
     void everyCliLaneKeepsItsCompletedProducerReceiptAcrossPostCaptureReplacement(
@@ -224,6 +265,8 @@ class MainCliTest {
         final LinkedBlockingQueue<BrewShot.InboxMessage> inbox = new LinkedBlockingQueue<>(65);
         final BrewShot.Accumulator listener = new BrewShot.Accumulator(inbox, 1 << 20, 64);
         int navigations, captures;
+        boolean waitPredicateReady;
+        int waitPolls;
         boolean closed;
         byte[] expectedProduced;
         Exception oracleFailure;
@@ -260,7 +303,13 @@ class MainCliTest {
                 case "Runtime.evaluate" -> {
                     String expression = String.valueOf(MiniJson.get(sent, "params.expression"));
                     Object value;
-                    if (expression.equals("window.innerWidth+'x'+window.innerHeight")) value = "0x0";
+                    if (expression.equals("!!(ready)")) {
+                        waitPolls++;
+                        // No response models an awaited predicate that never resolves.
+                        if (!waitPredicateReady) return CompletableFuture.completedFuture(this);
+                        value = true;
+                    }
+                    else if (expression.equals("window.innerWidth+'x'+window.innerHeight")) value = "0x0";
                     else if (expression.contains("document.querySelector(") && expression.contains("getBoundingClientRect")) value = "0,0,16,12";
                     else if (expression.equals("document.documentElement.scrollWidth")) value = 16.0;
                     else if (expression.equals("document.documentElement.scrollHeight")) value = 12.0;

@@ -20,7 +20,42 @@ import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.io.TempDir;
 
 /** The CLI manifest preserves eval's JSON types instead of stringifying them. */
+@org.junit.jupiter.api.parallel.Isolated("Wait tests restore Main launch and cleanup seams")
 class MainManifestTest {
+
+    @Test
+    void waitTimeoutCannotPublishNewSidecarOrErasePriorArtifactAndReceipt(
+            @TempDir Path directory) throws Exception {
+        for (boolean prior : new boolean[] {false, true}) {
+            for (boolean digest : new boolean[] {false, true}) {
+                Path venue = Files.createDirectory(directory.resolve("wait-" + prior + "-" + digest));
+                Path out = venue.resolve("capture.png");
+                Path manifest = venue.resolve("capture.json");
+                byte[] priorArtifact = new byte[] {8, 6, 7, 5, 3, 0, 9};
+                String priorSidecar = "known-good-prior-sidecar";
+                if (prior) {
+                    Files.write(out, priorArtifact);
+                    Files.writeString(manifest, priorSidecar);
+                }
+                MainCliTest.WaitRun run = MainCliTest.runWaitCli(venue, out, manifest, digest, false);
+                assertTrue(run.failure() instanceof IllegalStateException, String.valueOf(run.failure()));
+                assertTrue(run.failure().getMessage().startsWith("waitFor timed out after 50ms"));
+                assertNull(run.code());
+                assertEquals(1, run.polls());
+                assertEquals(0, run.captures(), "failed readiness must stop before any artifact producer");
+                if (prior) {
+                    org.junit.jupiter.api.Assertions.assertArrayEquals(priorArtifact, Files.readAllBytes(out));
+                    assertEquals(priorSidecar, Files.readString(manifest));
+                } else {
+                    assertFalse(Files.exists(out));
+                    assertFalse(Files.exists(manifest));
+                }
+                try (var files = Files.list(venue)) {
+                    assertFalse(files.anyMatch(path -> path.getFileName().toString().endsWith(".tmp")));
+                }
+            }
+        }
+    }
 
     /** Case 1: equal byte counts are not byte identity; both old receipts really are equal. */
     @Test

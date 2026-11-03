@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Bounded predicate waits** (plan 2459e652). `waitFor` now spends one monotonic
+  outer budget across WebSocket sends, responses and retry pauses, while keeping
+  any shorter command timeout. True returned after expiry is a timeout, and a
+  near-expiry false cannot start a fresh pause or evaluation budget. CLI readiness
+  waits inherit this behavior before artifact or sidecar publication. Navigation
+  event waits and screencast message windows also use monotonic elapsed time.
+
 - **Opt-in producer receipts** (plan 0181881e). `--artifact-sha256` requires an
   explicit `--json PATH` and adds only `outSha256` and `outSha256Provenance`.
   The stable `capture-time-producer` value means:

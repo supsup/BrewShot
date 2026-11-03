@@ -1029,6 +1029,13 @@ Resource controls, each a separate axis:
   full-page screenshot of a tall document is the motivating case: navigation was
   fast, the single capture call wasn't). `BREWSHOT_COMMAND_TIMEOUT_MS` or
   `shot.commandTimeout(ms)`; falls back to `BREWSHOT_TIMEOUT_MS`, then 15s.
+- **Predicate wait budget** — `waitFor(predicate, ms)` and CLI `--wait-js` /
+  `--wait-timeout` share one monotonic outer budget across WebSocket sends,
+  responses and retry pauses. Each evaluation also respects a shorter configured
+  command timeout. A true returned after outer expiry is rejected as a timeout;
+  a near-expiry false gets only the remaining pause, with no fresh evaluation
+  after expiry. Navigation event waits and screencast message windows also use
+  monotonic elapsed time, so wall-clock changes do not renew their budgets.
 - **Recording heap budget** — the GIF recorders hold every PNG frame in memory
   until encoding, so an unbounded recording is an OOM waiting for a long enough
   page. Both recorder families (frame-count and screencast) stop at
