@@ -39,6 +39,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.IntConsumer;
+import java.util.function.LongSupplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -2503,9 +2504,15 @@ public final class BrewShot implements AutoCloseable {
     private static final class Deadline {
         private final long startedNanos;
         private final long budgetNanos;
+        private final LongSupplier nanoClock;
 
         private Deadline(long budgetNanos) {
-            this.startedNanos = System.nanoTime();
+            this(budgetNanos, System::nanoTime);
+        }
+
+        private Deadline(long budgetNanos, LongSupplier nanoClock) {
+            this.nanoClock = nanoClock;
+            this.startedNanos = nanoClock.getAsLong();
             this.budgetNanos = budgetNanos;
         }
 
@@ -2515,7 +2522,7 @@ public final class BrewShot implements AutoCloseable {
         }
 
         long remainingNanos() {
-            long elapsed = System.nanoTime() - startedNanos;
+            long elapsed = nanoClock.getAsLong() - startedNanos;
             if (elapsed <= 0) { return budgetNanos; }
             return elapsed >= budgetNanos ? 0 : budgetNanos - elapsed;
         }
@@ -2523,7 +2530,7 @@ public final class BrewShot implements AutoCloseable {
         Deadline cappedAtMillis(long timeoutMs) {
             long cap = timeoutMs <= 0
                 ? 0 : TimeUnit.MILLISECONDS.toNanos(timeoutMs);
-            return new Deadline(Math.min(remainingNanos(), cap));
+            return new Deadline(Math.min(remainingNanos(), cap), nanoClock);
         }
 
         boolean expired() { return remainingNanos() <= 0; }
@@ -2788,7 +2795,16 @@ public final class BrewShot implements AutoCloseable {
         waitFor(jsPredicate, timeoutMs, Deadline.afterMillis(timeoutMs));
     }
 
+    @FunctionalInterface
+    interface RetryPause {
+        void pause(long nanos) throws InterruptedException;
+    }
+
     private void waitFor(String jsPredicate, long timeoutMs, Deadline deadline) {
+        waitFor(jsPredicate, timeoutMs, deadline, TimeUnit.NANOSECONDS::sleep);
+    }
+
+    private void waitFor(String jsPredicate, long timeoutMs, Deadline deadline, RetryPause pause) {
         while (true) {
             if (Thread.currentThread().isInterrupted()) {
                 throw new IllegalStateException("interrupted");
@@ -2809,7 +2825,7 @@ public final class BrewShot implements AutoCloseable {
             if (deadline.expired()) { throw waitForTimeout(jsPredicate, timeoutMs, null); }
             if (Boolean.TRUE.equals(value)) { return; }
             long pauseNanos = Math.min(TimeUnit.MILLISECONDS.toNanos(60), deadline.remainingNanos());
-            try { TimeUnit.NANOSECONDS.sleep(pauseNanos); }
+            try { pause.pause(pauseNanos); }
             catch (InterruptedException failure) {
                 Thread.currentThread().interrupt();
                 throw new IllegalStateException("interrupted", failure);

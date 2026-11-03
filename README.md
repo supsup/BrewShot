@@ -1033,9 +1033,14 @@ Resource controls, each a separate axis:
   `--wait-timeout` share one monotonic outer budget across WebSocket sends,
   responses and retry pauses. Each evaluation also respects a shorter configured
   command timeout. A true returned after outer expiry is rejected as a timeout;
-  a near-expiry false gets only the remaining pause, with no fresh evaluation
-  after expiry. Navigation event waits and screencast message windows also use
-  monotonic elapsed time, so wall-clock changes do not renew their budgets.
+  a near-expiry false requests a pause of at most 60 ms or the remaining budget,
+  whichever is smaller, with no fresh evaluation after expiry. This bounds the
+  requested pause; indefinite thread scheduling can delay the caller's return.
+  Interruption on entry or during a retry pause retains the interrupt flag and
+  fails before another command, without aborting an idle transport. A send still
+  pending at expiry is cancelled and the transport aborted. Navigation event
+  waits and screencast message windows also use monotonic elapsed time, so
+  wall-clock changes do not renew their budgets.
 - **Recording heap budget** — the GIF recorders hold every PNG frame in memory
   until encoding, so an unbounded recording is an OOM waiting for a long enough
   page. Both recorder families (frame-count and screencast) stop at

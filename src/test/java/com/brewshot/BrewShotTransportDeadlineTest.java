@@ -23,6 +23,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.stream.Stream;
@@ -303,18 +304,43 @@ class BrewShotTransportDeadlineTest {
 
     @Test
     void nearExpiryFalseDoesNotStartFreshPauseOrEvaluation(@TempDir Path temp) throws Exception {
+        AtomicLong clock = new AtomicLong();
+        AtomicLong requestedPause = new AtomicLong(-1);
+        AtomicInteger pauses = new AtomicInteger();
         LinkedBlockingQueue<BrewShot.InboxMessage> inbox = new LinkedBlockingQueue<>();
         FakeWebSocket socket = new FakeWebSocket();
         socket.onSend = text -> {
+            // The first false response spends exactly 100ms of a 110ms budget.
+            // Any erroneous second send expires it, keeping the bad path finite
+            // even if a faulty pause requests zero or the retry check is removed.
+            clock.set(TimeUnit.MILLISECONDS.toNanos(socket.sendCalls.get() == 1 ? 100 : 110));
             respond(inbox, text, false);
-            return new DelayedSuccessfulFuture(socket, 100);
+            return CompletableFuture.completedFuture(socket);
         };
         BrewShot shot = new BrewShot(new FakeProcess(true), profile(temp, "near-expiry"), socket, inbox, 40);
-        long started = System.nanoTime();
         try {
-            assertOuterTimeout(assertThrows(IllegalStateException.class,
-                () -> shot.waitFor("ready", 110)), 110);
-            assertElapsed(started, 90, 150);
+            Class<?> deadlineType = Class.forName("com.brewshot.BrewShot$Deadline");
+            var constructor = deadlineType.getDeclaredConstructor(long.class, java.util.function.LongSupplier.class);
+            constructor.setAccessible(true);
+            Object deadline = constructor.newInstance(TimeUnit.MILLISECONDS.toNanos(110),
+                (java.util.function.LongSupplier) clock::get);
+            BrewShot.RetryPause pause = nanos -> {
+                requestedPause.set(nanos);
+                pauses.incrementAndGet();
+                clock.addAndGet(nanos);
+            };
+            var wait = BrewShot.class.getDeclaredMethod("waitFor", String.class, long.class,
+                deadlineType, BrewShot.RetryPause.class);
+            wait.setAccessible(true);
+            var failure = assertThrows(java.lang.reflect.InvocationTargetException.class,
+                () -> wait.invoke(shot, "ready", 110L, deadline, pause));
+            assertTrue(failure.getCause() instanceof IllegalStateException,
+                "wait must fail with its timeout, not a reflection/setup error: " + failure.getCause());
+            assertOuterTimeout((IllegalStateException) failure.getCause(), 110);
+            assertEquals(TimeUnit.MILLISECONDS.toNanos(10), requestedPause.get(),
+                "actual retry pause must request exactly the remaining 10ms, never a fresh 60ms");
+            assertEquals(1, pauses.get(), "one false response permits exactly one bounded pause");
+            assertEquals(TimeUnit.MILLISECONDS.toNanos(110), clock.get());
             assertEquals(1, socket.sendCalls.get(), "expiry must be checked before the next send");
         } finally { shot.close(); }
     }

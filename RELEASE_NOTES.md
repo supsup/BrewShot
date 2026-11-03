@@ -5,9 +5,14 @@
 - **Bounded predicate waits** (plan 2459e652). `waitFor` now spends one monotonic
   outer budget across WebSocket sends, responses and retry pauses, while keeping
   any shorter command timeout. True returned after expiry is a timeout, and a
-  near-expiry false cannot start a fresh pause or evaluation budget. CLI readiness
-  waits inherit this behavior before artifact or sidecar publication. Navigation
-  event waits and screencast message windows also use monotonic elapsed time.
+  near-expiry false requests at most the lesser of 60 ms and the remaining
+  budget, with no fresh evaluation after expiry. This bounds the requested pause,
+  without a hard return-time guarantee under indefinite thread scheduling.
+  Interruption on entry or during a retry pause retains the flag and fails before
+  another command without aborting an idle transport; a send pending at expiry
+  is still cancelled and the transport aborted. CLI readiness waits inherit this
+  behavior before artifact or sidecar publication. Navigation event waits and
+  screencast message windows also use monotonic elapsed time.
 
 - **Opt-in producer receipts** (plan 0181881e). `--artifact-sha256` requires an
   explicit `--json PATH` and adds only `outSha256` and `outSha256Provenance`.
