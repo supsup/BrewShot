@@ -10,7 +10,10 @@ import java.nio.file.StandardCopyOption;
 import java.nio.file.attribute.PosixFileAttributeView;
 import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.HashSet;
+import java.util.HexFormat;
 import java.util.Objects;
 import java.util.Set;
 
@@ -30,6 +33,9 @@ import java.util.Set;
  * a temporary file is created.
  */
 final class ArtifactWriter {
+
+    /** A completed producer snapshot; it retains neither mutable bytes nor a filesystem path. */
+    record ProducerReceipt(long outBytes, String outSha256) { }
 
     @FunctionalInterface
     interface TempFileWriter {
@@ -117,6 +123,36 @@ final class ArtifactWriter {
     static void writeBytes(Path target, byte[] bytes) throws IOException {
         Objects.requireNonNull(bytes, "bytes");
         write(target, temporary -> Files.write(temporary, bytes));
+    }
+
+    /**
+     * The capture owns this stable byte array until this call returns. Hash that same array,
+     * without retaining or copying it, and expose the snapshot only after publication succeeds.
+     * Disabled calls retain the existing writer and do no digest work.
+     */
+    static ProducerReceipt writeBytesWithReceipt(Path target, byte[] bytes, boolean enabled)
+            throws IOException {
+        Objects.requireNonNull(bytes, "bytes");
+        if (!enabled) {
+            writeBytes(target, bytes);
+            return null;
+        }
+        MessageDigest digest = newSha256();
+        digest.update(bytes);
+        writeBytes(target, bytes);
+        return completedReceipt(bytes.length, digest);
+    }
+
+    static MessageDigest newSha256() throws IOException {
+        try {
+            return MessageDigest.getInstance("SHA-256");
+        } catch (NoSuchAlgorithmException unavailable) {
+            throw new IOException("SHA-256 is unavailable; no producer receipt was completed", unavailable);
+        }
+    }
+
+    static ProducerReceipt completedReceipt(long count, MessageDigest digest) {
+        return new ProducerReceipt(count, HexFormat.of().formatHex(digest.digest()));
     }
 
     static void writeString(Path target, String value, Charset charset) throws IOException {

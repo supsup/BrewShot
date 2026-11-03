@@ -3343,10 +3343,13 @@ public final class BrewShot implements AutoCloseable {
      * cleared to {@link VisionDeficiency#NONE} even when capture or artifact writing fails.
      */
     public void screenshot(Path out, VisionDeficiency deficiency) throws IOException {
-        captureWithVisionDeficiency(deficiency, () -> {
-            screenshot(out);
-            return null;
-        });
+        screenshotWithReceipt(out, deficiency, false);
+    }
+
+    ArtifactWriter.ProducerReceipt screenshotWithReceipt(Path out,
+            VisionDeficiency deficiency, boolean receipt) throws IOException {
+        return captureWithVisionDeficiency(deficiency,
+            () -> screenshotWithReceipt(out, ImageFormat.PNG, 0, receipt));
     }
 
     /**
@@ -3356,6 +3359,11 @@ public final class BrewShot implements AutoCloseable {
      * The PNG default of {@link #screenshot(Path)} is unchanged.
      */
     public void screenshot(Path out, ImageFormat fmt, int quality) throws IOException {
+        screenshotWithReceipt(out, fmt, quality, false);
+    }
+
+    ArtifactWriter.ProducerReceipt screenshotWithReceipt(Path out,
+            ImageFormat fmt, int quality, boolean receipt) throws IOException {
         Map<String, Object> r = command("Page.captureScreenshot",
             "{" + captureFormatParams(fmt, quality) + ",\"captureBeyondViewport\":true}");
         String b64 = (String) r.get("data");
@@ -3364,7 +3372,7 @@ public final class BrewShot implements AutoCloseable {
         // Bound FIRST, then hand the accepted bytes to main's atomic writer: an
         // over-bound capture must be refused before anything reaches the target,
         // so a rejected re-shoot still leaves the previous good artifact intact.
-        ArtifactWriter.writeBytes(out, bytes);
+        return ArtifactWriter.writeBytesWithReceipt(out, bytes, receipt);
     }
 
     /**
@@ -3459,9 +3467,14 @@ public final class BrewShot implements AutoCloseable {
      * paper size, margins, background, scale, and orientation.
      */
     public void pdf(Path out, PdfOptions opts) throws IOException {
+        pdfWithReceipt(out, opts, false);
+    }
+
+    ArtifactWriter.ProducerReceipt pdfWithReceipt(Path out, PdfOptions opts,
+            boolean receipt) throws IOException {
         Map<String, Object> r = command("Page.printToPDF", "{" + printPdfParams(opts) + "}");
         String b64 = (String) r.get("data");
-        ArtifactWriter.writeBytes(out, Base64.getDecoder().decode(b64));
+        return ArtifactWriter.writeBytesWithReceipt(out, Base64.getDecoder().decode(b64), receipt);
     }
 
     /**
@@ -3844,6 +3857,19 @@ public final class BrewShot implements AutoCloseable {
     public void recordGifElement(String cssSelector, int frames, int captureDelayMs,
                                  int playbackDelayMs, int firstFrameDelayMs, double scale,
                                  IntConsumer beforeFrame, Path out) throws IOException {
+        recordGifElementWithReceipt(cssSelector, frames, captureDelayMs, playbackDelayMs,
+            firstFrameDelayMs, scale, beforeFrame, out, false);
+    }
+
+    ArtifactWriter.ProducerReceipt recordGifElementWithReceipt(String cssSelector, int frames,
+            int frameDelayMs, double scale, Path out, boolean receipt) throws IOException {
+        return recordGifElementWithReceipt(cssSelector, frames, frameDelayMs, frameDelayMs,
+            frameDelayMs, scale, NO_HOOK, out, receipt);
+    }
+
+    private ArtifactWriter.ProducerReceipt recordGifElementWithReceipt(String cssSelector,
+            int frames, int captureDelayMs, int playbackDelayMs, int firstFrameDelayMs,
+            double scale, IntConsumer beforeFrame, Path out, boolean receipt) throws IOException {
         validateFrameRecorder(frames, captureDelayMs, playbackDelayMs);
         effectiveGifDelayMs(firstFrameDelayMs);
         Validation.positiveFinite("recording scale", scale);
@@ -3858,7 +3884,8 @@ public final class BrewShot implements AutoCloseable {
             }
             settle(captureDelayMs);
         }
-        GifWriter.write(budget.frames(), playbackDelayMs, firstFrameDelayMs, out);
+        return GifWriter.writeWithReceipt(
+            budget.frames(), playbackDelayMs, firstFrameDelayMs, out, receipt, null);
     }
 
     /**
@@ -3905,6 +3932,11 @@ public final class BrewShot implements AutoCloseable {
      */
     public void recordGifFullPage(int frames, int frameDelayMs, double scale, Path out)
             throws IOException {
+        recordGifFullPageWithReceipt(frames, frameDelayMs, scale, out, false);
+    }
+
+    ArtifactWriter.ProducerReceipt recordGifFullPageWithReceipt(int frames, int frameDelayMs,
+            double scale, Path out, boolean receipt) throws IOException {
         validateFrameRecorder(frames, frameDelayMs, frameDelayMs);
         Validation.positiveFinite("recording scale", scale);
         double w = ((Number) eval("document.documentElement.scrollWidth")).doubleValue();
@@ -3916,7 +3948,8 @@ public final class BrewShot implements AutoCloseable {
             }
             settle(frameDelayMs);
         }
-        GifWriter.write(budget.frames(), frameDelayMs, out);
+        return GifWriter.writeWithReceipt(
+            budget.frames(), frameDelayMs, frameDelayMs, out, receipt, null);
     }
 
     /**

@@ -13,6 +13,8 @@ import java.nio.file.Path;
 import java.util.List;
 import javax.imageio.ImageIO;
 import javax.imageio.metadata.IIOMetadataNode;
+import javax.imageio.stream.ImageOutputStream;
+import javax.imageio.stream.MemoryCacheImageOutputStream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.w3c.dom.Node;
@@ -24,6 +26,96 @@ import org.w3c.dom.Node;
  * partial/truncated GIF on disk masquerading as a finished artifact.
  */
 class GifWriterTest {
+
+    /**
+     * Case 3, Stage A: this names the proposed real-writer receipt/observer overload.
+     * The observer sees the production stream after writes and flushes, including before
+     * eager discard; it does not supply a replacement encoder or test-local hashing stream.
+     */
+    @Test
+    void realGifReceiptMatchesLegacyBytesAndItsEncodedCacheStaysBounded(
+            @TempDir Path directory) throws Exception {
+        List<byte[]> frames = new java.util.ArrayList<>();
+        int random = 0x13579bdf;
+        for (int frame = 0; frame < 16; frame++) {
+            BufferedImage image = new BufferedImage(96, 96, BufferedImage.TYPE_INT_RGB);
+            for (int y = 0; y < 96; y++) for (int x = 0; x < 96; x++) {
+                random ^= random << 13; random ^= random >>> 17; random ^= random << 5;
+                image.setRGB(x, y, random & 0xffffff);
+            }
+            ByteArrayOutputStream encoded = new ByteArrayOutputStream();
+            assertTrue(ImageIO.write(image, "png", encoded));
+            frames.add(encoded.toByteArray());
+        }
+        Path legacy = directory.resolve("legacy.gif");
+        GifWriter.write(frames, 25, 75, legacy);
+        byte[] legacyBytes = Files.readAllBytes(legacy);
+        assertTrue(legacyBytes.length > 32_768,
+            "INSTRUMENT: the real encoding must pressure more than the allowed encoded cache");
+
+        Path venue = Files.createDirectory(directory.resolve("receipt"));
+        Path out = venue.resolve("capture.gif");
+        EncodedCacheCensus census = new EncodedCacheCensus();
+        var receipt = ArtifactWriterTest.withoutArtifactReads(venue,
+            () -> GifWriter.writeWithReceipt(frames, 25, 75, out, true, census::observe));
+        byte[] actual = Files.readAllBytes(out); // independent oracle AFTER producer/recording stop
+        org.junit.jupiter.api.Assertions.assertArrayEquals(legacyBytes, actual,
+            "opt-in must preserve palette, metadata, frame order, delays and trailer bytes");
+        assertEquals(actual.length, receipt.outBytes());
+        assertEquals(ArtifactWriterTest.receiptHash(actual), receipt.outSha256());
+        assertEquals(0x3b, actual[actual.length - 1] & 0xff, "the digest includes the final trailer");
+        assertTrue(census.calls > frames.size(), "INSTRUMENT: observer must reach the real stream");
+        assertTrue(census.scalarSteps > 0 && census.chunkSteps > 0,
+            "INSTRUMENT: real scalar AND bulk writes must be observed");
+        assertTrue(census.peak > 0 && census.peak <= 16_384,
+            "physical retained encoded payload, not logical pending bytes: " + census.peak);
+        assertTrue(census.backwardChecks > 0, "INSTRUMENT: backward-seek guard must be reached");
+        assertEquals("8", encodedDelay(out, 0));
+        assertEquals("3", encodedDelay(out, 1));
+    }
+
+    private static final class EncodedCacheCensus {
+        long calls, lastPosition, scalarSteps, chunkSteps, peak, backwardChecks;
+
+        void observe(ImageOutputStream stream) throws IOException {
+            calls++;
+            assertTrue(stream instanceof MemoryCacheImageOutputStream,
+                "INSTRUMENT: observe the actual bounded memory stream, not an unrelated counter");
+            long position = stream.getStreamPosition();
+            long step = position - lastPosition;
+            if (step == 1) scalarSteps++;
+            if (step > 1) chunkSteps++;
+            lastPosition = position;
+            try {
+                var cacheField = MemoryCacheImageOutputStream.class.getDeclaredField("cache");
+                cacheField.setAccessible(true);
+                Object cache = cacheField.get(stream);
+                var blocksField = cache.getClass().getDeclaredField("cache");
+                blocksField.setAccessible(true);
+                Object value = blocksField.get(cache);
+                assertTrue(value instanceof List<?>, "INSTRUMENT: unfamiliar JDK cache representation");
+                long retained = 0;
+                for (Object block : (List<?>) value) {
+                    if (block == null) continue;
+                    assertTrue(block instanceof byte[], "INSTRUMENT: unfamiliar retained block");
+                    retained += ((byte[]) block).length;
+                }
+                peak = Math.max(peak, retained);
+                assertTrue(retained <= 16_384,
+                    "encoded cache retains " + retained + " bytes at stream position " + position);
+            } catch (ReflectiveOperationException | java.lang.reflect.InaccessibleObjectException unavailable) {
+                throw new AssertionError("INSTRUMENT: supply the declared java.desktop test opens", unavailable);
+            }
+            if (position > 0) {
+                // The actual production stream must refuse even an unflushed backwards move:
+                // hashing a prefix and subsequently editing it would no longer attest the file.
+                assertThrows(IOException.class, () -> stream.seek(position - 1),
+                    "a receipt stream must fail loudly rather than accept a backwards seek");
+                backwardChecks++;
+                assertEquals(position, stream.getStreamPosition(), "refusal must not move the cursor");
+            }
+        }
+    }
 
     /** A minimal, genuinely-decodable PNG frame. */
     private static byte[] validPng(int rgb) throws IOException {

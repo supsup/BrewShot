@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -20,6 +21,173 @@ import org.junit.jupiter.api.io.TempDir;
 
 /** The CLI manifest preserves eval's JSON types instead of stringifying them. */
 class MainManifestTest {
+
+    /** Case 1: equal byte counts are not byte identity; both old receipts really are equal. */
+    @Test
+    void equalLengthProducerSnapshotsKeepLegacyBytesButHaveDifferentOptInDigests(
+            @TempDir Path directory) throws Exception {
+        Path out = directory.resolve("capture.png");
+        Path manifest = directory.resolve("capture.json");
+        byte[] first = "equal-length-A".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+        byte[] second = "equal-length-B".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+        assertEquals(first.length, second.length, "INSTRUMENT: equal-length discriminator");
+        var firstReceipt = ArtifactWriter.writeBytesWithReceipt(out, first, true);
+        writeLegacy(manifest, out);
+        byte[] firstLegacy = Files.readAllBytes(manifest);
+        var secondReceipt = ArtifactWriter.writeBytesWithReceipt(out, second, true);
+        writeLegacy(manifest, out);
+        org.junit.jupiter.api.Assertions.assertArrayEquals(firstLegacy, Files.readAllBytes(manifest));
+        var oldKeys = manifestObject(manifest).keySet();
+
+        // The first receipt is deliberately published AFTER the second bytes replace the path.
+        // Reopening the file would give the wrong digest even though its byte count is equal.
+        writeProducerManifest(manifest, out, firstReceipt);
+        Map<String, Object> a = manifestObject(manifest);
+        writeProducerManifest(manifest, out, secondReceipt);
+        Map<String, Object> b = manifestObject(manifest);
+        assertEquals(ArtifactWriterTest.receiptHash(first), a.get("outSha256"));
+        assertEquals(ArtifactWriterTest.receiptHash(second), b.get("outSha256"));
+        assertNotEquals(a.get("outSha256"), b.get("outSha256"), "kills a constant/reused digest");
+        assertTrue(String.valueOf(a.get("outSha256")).matches("[0-9a-f]{64}"));
+        java.util.Set<String> expectedKeys = new java.util.HashSet<>(oldKeys);
+        expectedKeys.addAll(java.util.Set.of("outSha256", "outSha256Provenance"));
+        assertEquals(expectedKeys, a.keySet(), "exactly two added fields; outBytes already existed");
+        assertEquals(expectedKeys, b.keySet());
+        assertEquals(first.length, ((Number) a.get("outBytes")).longValue());
+    }
+
+    /** Case 5: an independent byte golden pins every existing overload, including field order. */
+    @Test
+    void noReceiptPreservesTheExactLegacySidecarThroughEveryOverload(@TempDir Path directory)
+            throws Exception {
+        Path out = directory.resolve("capture.png");
+        Files.write(out, new byte[] {1, 2, 3});
+        String golden = """
+            {
+              "input": "page.html",
+              "mode": "file",
+              "viewport": "640x480",
+              "settleMs": 25,
+              "waitJs": null,
+              "out": $OUT,
+              "outBytes": 3,
+              "eval": null,
+              "failJs": null,
+              "failJsPassed": true,
+              "elapsedMs": 12,
+              "brewshot": "0.9.0"
+            }
+            """.replace("$OUT", MiniJson.stringify(out.toString()));
+        List<LegacyManifestCall> calls = List.of(
+            m -> Main.writeManifest(m, "page.html", "file", 640, 480, 25,
+                null, out, null, null, true, 12, null, null),
+            m -> Main.writeManifest(m, "page.html", "file", 640, 480, 25,
+                null, out, null, null, true, 12, null, null, null),
+            m -> Main.writeManifest(m, "page.html", "file", 640, 480, 25,
+                null, out, null, null, true, 12, null, null, null, null, null),
+            m -> Main.writeManifest(m, "page.html", "file", 640, 480, 25,
+                null, out, null, null, true, 12, null, null, null, null, null, null, null),
+            m -> Main.writeManifest(m, "page.html", "file", 640, 480, 25,
+                null, out, null, null, true, 12, null, null,
+                null, null, null, null, null, null, null),
+            m -> Main.writeManifest(m, "page.html", "file", 640, 480, 25,
+                null, out, null, null, true, 12, null, null,
+                null, null, null, null, null, null, null, null),
+            m -> Main.writeManifest(m, "page.html", "file", 640, 480, 25,
+                null, out, null, null, true, 12, null, null,
+                null, null, null, null, null, null, null, null, null),
+            m -> Main.writeManifest(m, "page.html", "file", 640, 480, 25,
+                null, out, null, null, true, 12, null, null,
+                null, null, null, null, null, null, null, null, null, null),
+            m -> writeProducerManifest(m, out, null)
+        );
+        for (int i = 0; i < calls.size(); i++) {
+            Path manifest = directory.resolve("overload-" + i + ".json");
+            calls.get(i).write(manifest);
+            assertEquals(golden, Files.readString(manifest), "legacy overload " + i);
+            assertFalse(manifestObject(manifest).containsKey("outSha256"));
+            assertFalse(manifestObject(manifest).containsKey("outSha256Provenance"));
+        }
+    }
+
+    /** Case 7: a producer receipt still speaks truth when the current path no longer exists. */
+    @Test
+    void receiptAndDocsKeepTheExactCaptureTimeClaimAndConsumerRecomputeBoundary(
+            @TempDir Path directory) throws Exception {
+        Path out = directory.resolve("historical.png");
+        byte[] produced = new byte[] {7, 3, 9, 1};
+        var receipt = ArtifactWriter.writeBytesWithReceipt(out, produced, true);
+        Files.delete(out);
+        Path manifest = directory.resolve("historical.json");
+        writeProducerManifest(manifest, out, receipt);
+        Map<String, Object> root = manifestObject(manifest);
+        assertEquals(ArtifactWriterTest.receiptHash(produced), root.get("outSha256"));
+        assertEquals("capture-time-producer", root.get("outSha256Provenance"));
+        assertFalse(Files.exists(out), "the receipt is not a current-filesystem-state promise");
+        String exactClaim = "BrewShot generated exactly these bytes (sha256 X).";
+        String recompute = "Consumers must recompute SHA-256 after transport or immediately before use.";
+        Map<String, String> expectedParagraphs = Map.of(
+            "README.md", """
+                The `capture-time-producer` value of `outSha256Provenance` means:
+                BrewShot generated exactly these bytes (sha256 X).
+                `X` is the lowercase 64-hex digest in `outSha256`.
+                Consumers must recompute SHA-256 after transport or immediately before use.
+                This is a capture-time producer claim, not a signature, trusted-capture,
+                current-file-state, immutability, transport, or cross-file atomicity proof.
+                """.strip(),
+            "RELEASE_NOTES.md", """
+                - **Opt-in producer receipts** (plan 0181881e). `--artifact-sha256` requires an
+                  explicit `--json PATH` and adds only `outSha256` and `outSha256Provenance`.
+                  The stable `capture-time-producer` value means:
+                  BrewShot generated exactly these bytes (sha256 X).
+                  Consumers must recompute SHA-256 after transport or immediately before use.
+                  This is a capture-time producer claim, not a signature, trusted-capture,
+                  current-file-state, immutability, transport, or cross-file atomicity proof.
+                  Existing `outBytes` uses that same completed snapshot; PNG/JPEG/PDF use the
+                  producer array and GIF uses the encoded stream through its trailer, without
+                  re-reading the artifact or making an artifact-sized copy. Flag omission keeps
+                  both new keys absent and the legacy sidecar bytes unchanged.
+                """.strip());
+        for (var expectation : expectedParagraphs.entrySet()) {
+            String path = expectation.getKey();
+            String documentation = Files.readString(Path.of(path));
+            List<String> claims = java.util.Arrays.stream(documentation.replace("\r\n", "\n")
+                .split("\\n\\s*\\n")).filter(p -> p.contains(exactClaim)).toList();
+            assertEquals(1, claims.size(), path + ": exactly one producer-claim paragraph");
+            assertEquals(expectation.getValue(), claims.get(0).strip(),
+                path + ": additions or substitutions must not broaden the producer claim");
+            assertFalse(documentation.contains("the artifact is"), path + ": no broadened current-file claim");
+            assertTrue(documentation.contains(recompute), path + ": preserve the end-to-end boundary");
+        }
+    }
+
+    @FunctionalInterface
+    private interface LegacyManifestCall { void write(Path manifest) throws Exception; }
+
+    private static void writeLegacy(Path manifest, Path out) throws Exception {
+        Main.writeManifest(manifest, "page.html", "file", 640, 480, 25,
+            null, out, null, null, true, 12, null, null);
+    }
+
+    /** The named receipt entry avoids ambiguous null overloads on all existing APIs. */
+    private static void writeProducerManifest(Path manifest, Path out,
+            ArtifactWriter.ProducerReceipt receipt) throws Exception {
+        Main.writeManifestWithProducerReceipt(manifest, "page.html", "file", 640, 480, 25,
+            null, out, null, null, true, 12, null, null,
+            null, // page diagnostics
+            null, null, // timezone
+            null, null, // DPR
+            null, null, // vision preview
+            null, // viewport source
+            null, // cleanup
+            null, // file auth
+            receipt);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> manifestObject(Path manifest) throws Exception {
+        return (Map<String, Object>) MiniJson.parse(Files.readString(manifest));
+    }
 
     @Test
     @SuppressWarnings("unchecked")

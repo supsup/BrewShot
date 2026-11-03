@@ -72,12 +72,13 @@ public final class Main {
     /**
      * TEST-ONLY seam (review brewshot/740 R1): stands in for the two {@code BrewShot.launch}
      * calls in {@link #runCapture}, so the CLI can be driven from {@link #run} to its exit code
-     * over a scripted session with no Chrome on the host. While it is set the "no Chrome found"
-     * check is skipped as well: the seam IS the browser. Null by default and written only by
+     * over a scripted session with no Chrome on the host. Its default availability witness
+     * stands in for browser discovery as well. Null by default and written only by
      * tests, the same shape as {@code BrewShot.exitedButUnreapedProbeForTests}.
      */
     @FunctionalInterface
     interface SessionLauncher {
+        default boolean available() { return true; }
         BrewShot launch(int width, int height, Integer devicePixelRatio) throws java.io.IOException;
     }
 
@@ -179,6 +180,7 @@ public final class Main {
         double clipPadding = 0;
         String failJs = null;
         Path jsonManifest = null;
+        boolean artifactSha256 = false;
         boolean pageDiagnostics = false;
         boolean failPageErrors = false;
         boolean failConsoleErrors = false;
@@ -244,6 +246,7 @@ public final class Main {
                 case "--clip-padding" -> clipPadding = nonNegDouble("--clip-padding", requireValue(args, ++i));
                 case "--fail-js" -> failJs = requireValue(args, ++i);
                 case "--json" -> jsonManifest = Path.of(requireValue(args, ++i));
+                case "--artifact-sha256" -> artifactSha256 = true;
                 case "--page-diagnostics" -> pageDiagnostics = true;
                 case "--fail-page-errors" -> failPageErrors = true;
                 case "--fail-console-errors" -> failConsoleErrors = true;
@@ -312,6 +315,9 @@ public final class Main {
             return err(e.getMessage());
         }
         if (input == null) { usage(); return 2; }
+        if (artifactSha256 && jsonManifest == null) {
+            return err("--artifact-sha256 requires an explicit --json PATH");
+        }
         if (waitTimeoutSet && waitJs == null) {
             return err("--wait-timeout requires --wait-js");
         }
@@ -433,7 +439,8 @@ public final class Main {
         }
 
         SessionLauncher launcher = sessionLauncherForTests;
-        if (launcher == null && !BrewShot.available()) {
+        boolean available = launcher == null ? BrewShot.available() : launcher.available();
+        if (!available) {
             System.err.println("brewshot: no Chrome/Chromium found (set BREWSHOT_CHROME)");
             return 3;
         }
@@ -445,6 +452,7 @@ public final class Main {
         long captureElapsedMs = 0;
         String timezoneApplied = null;
         Integer dprApplied = null;
+        ArtifactWriter.ProducerReceipt producerReceipt = null;
         try (BrewShot shot = launcher != null
                 ? launcher.launch(width, height, devicePixelRatio)
                 : devicePixelRatio == null
@@ -475,9 +483,11 @@ public final class Main {
                 // --scale composes as a true re-raster, exactly like the still path.
                 try {
                     if (gifElement != null) {
-                        shot.recordGifElement(gifElement, gifFrames, gifDelayMs, scale, out);
+                        producerReceipt = shot.recordGifElementWithReceipt(
+                            gifElement, gifFrames, gifDelayMs, scale, out, artifactSha256);
                     } else {
-                        shot.recordGifFullPage(gifFrames, gifDelayMs, scale, out);
+                        producerReceipt = shot.recordGifFullPageWithReceipt(
+                            gifFrames, gifDelayMs, scale, out, artifactSha256);
                     }
                 } catch (IllegalArgumentException e) {
                     // No element matches --gif-element: a page-content failure (parity with
@@ -496,7 +506,8 @@ public final class Main {
                 // Output path ends .pdf (case-insensitive) → render the whole document via
                 // Page.printToPDF. Clip/scale flags are raster-only and don't map to PDF paged
                 // output; a .pdf combined with them was already refused above (never silent here).
-                shot.pdf(out);
+                producerReceipt = shot.pdfWithReceipt(
+                    out, BrewShot.PdfOptions.defaults(), artifactSha256);
             } else if (clipSelector != null) {
                 // Selector-driven clip: elementBox throws on no-match — that's a page-content
                 // failure (the page didn't have the element), not a usage error: exit 1, loud.
@@ -517,7 +528,7 @@ public final class Main {
                         jpegOut ? jpegQuality : 0)
                     : shot.screenshotClip(
                         x, y, captureWidth, captureHeight, scale, visionDeficiency);
-                ArtifactWriter.writeBytes(out, capture);
+                producerReceipt = ArtifactWriter.writeBytesWithReceipt(out, capture, artifactSha256);
             } else if (clipJs != null) {
                 Object r = shot.eval(clipJs);
                 Object x = MiniJson.get(r, "x"), y = MiniJson.get(r, "y");
@@ -536,7 +547,7 @@ public final class Main {
                         jpegOut ? jpegQuality : 0)
                     : shot.screenshotClip(captureX, captureY, captureWidth, captureHeight, scale,
                         visionDeficiency);
-                ArtifactWriter.writeBytes(out, capture);
+                producerReceipt = ArtifactWriter.writeBytesWithReceipt(out, capture, artifactSha256);
             } else if (scale != 1.0) {
                 // Standalone --scale: clip the full PAGE box (scroll dimensions, not just the
                 // viewport) at scale — crisp full-page stills with zero extra flags. Chrome's
@@ -552,14 +563,14 @@ public final class Main {
                         jpegOut ? jpegQuality : 0)
                     : shot.screenshotClip(
                         0, 0, captureWidth, captureHeight, scale, visionDeficiency);
-                ArtifactWriter.writeBytes(out, capture);
+                producerReceipt = ArtifactWriter.writeBytesWithReceipt(out, capture, artifactSha256);
             } else {
                 if (visionDeficiency == null) {
-                    shot.screenshot(out,
+                    producerReceipt = shot.screenshotWithReceipt(out,
                         jpegOut ? BrewShot.ImageFormat.JPEG : BrewShot.ImageFormat.PNG,
-                        jpegOut ? jpegQuality : 0);
+                        jpegOut ? jpegQuality : 0, artifactSha256);
                 } else {
-                    shot.screenshot(out, visionDeficiency);
+                    producerReceipt = shot.screenshotWithReceipt(out, visionDeficiency, artifactSha256);
                 }
             }
             // --fail-js: assert AFTER the screenshot so failures still carry eyes.
@@ -583,7 +594,7 @@ public final class Main {
         // set of runs that publish a manifest, and the order "manifest, then the wrote line",
         // are what they were.
         if (jsonManifest != null) {
-            writeManifest(jsonManifest, input, mode, width, height, settleMs, waitJs,
+            writeManifestWithProducerReceipt(jsonManifest, input, mode, width, height, settleMs, waitJs,
                 out, evalResult, failJs, failJsPassed,
                 captureElapsedMs, gifSet ? gifDelayMs : null,
                 jpegOut ? jpegQuality : null, diagnosticsReceipt,
@@ -592,7 +603,8 @@ public final class Main {
                 visionDeficiency == null ? null : visionDeficiency.cdpValue(),
                 visionDeficiency == null ? null : Boolean.TRUE,
                 viewportSource, witness.settle(),
-                fileAuthManifestField(headerFiles, fileHeaders, cookieFiles, fileCookies));
+                fileAuthManifestField(headerFiles, fileHeaders, cookieFiles, fileCookies),
+                producerReceipt);
         }
         System.err.println("brewshot: wrote " + out);
         if (!failJsPassed) {
@@ -1125,6 +1137,22 @@ public final class Main {
             String viewportSource, CleanupOutcome cleanup,
             java.util.Map<String, Object> fileAuth)
             throws java.io.IOException {
+        writeManifestWithProducerReceipt(manifest, input, mode, width, height, settleMs, waitJs,
+            out, evalResult, failJs, failJsPassed, elapsedMs, requestedGifDelayMs, jpegQuality,
+            diagnostics, timezoneRequested, timezoneApplied, dprRequested, dprApplied,
+            visionDeficiencyRequested, visionCommandAccepted, viewportSource, cleanup, fileAuth, null);
+    }
+
+    static void writeManifestWithProducerReceipt(Path manifest, String input, String mode,
+            int width, int height, long settleMs, String waitJs, Path out,
+            Object evalResult, String failJs, boolean failJsPassed, long elapsedMs,
+            Integer requestedGifDelayMs, Integer jpegQuality,
+            PageDiagnosticsReceipt diagnostics, String timezoneRequested,
+            String timezoneApplied, Integer dprRequested, Integer dprApplied,
+            String visionDeficiencyRequested, Boolean visionCommandAccepted,
+            String viewportSource, CleanupOutcome cleanup,
+            java.util.Map<String, Object> fileAuth, ArtifactWriter.ProducerReceipt producerReceipt)
+            throws java.io.IOException {
         java.util.Map<String, Object> fields = new java.util.LinkedHashMap<>();
         fields.put("input", input);
         fields.put("mode", mode);
@@ -1135,7 +1163,11 @@ public final class Main {
         fields.put("settleMs", settleMs);
         fields.put("waitJs", waitJs);
         fields.put("out", out.toString());
-        fields.put("outBytes", Files.size(out));
+        fields.put("outBytes", producerReceipt == null ? Files.size(out) : producerReceipt.outBytes());
+        if (producerReceipt != null) {
+            fields.put("outSha256", producerReceipt.outSha256());
+            fields.put("outSha256Provenance", "capture-time-producer");
+        }
         fields.put("eval", evalResult);
         fields.put("failJs", failJs);
         fields.put("failJsPassed", failJsPassed);
@@ -1692,6 +1724,8 @@ public final class Main {
               --reduced-motion  force prefers-reduced-motion: reduce before capture
               --fail-js    JS assertion; false -> exit 4 (output artifact still written)
               --json       write a machine-readable manifest beside the output
+              --artifact-sha256  add a capture-time producer digest to --json
+                           (requires explicit --json PATH; consumers recompute before use)
               --page-diagnostics  include bounded console/error text, drop counters,
                            completeness, and gate outcome in --json (requires --json)
               --fail-page-errors  exit 4 after image+JSON on an uncaught page exception

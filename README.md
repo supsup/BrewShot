@@ -54,6 +54,22 @@ Direct stdin HTML is capped at 16 MiB and `--eval-file` at 1 MiB (byte caps,
 UTF-8); inputs at the exact cap are accepted and cap+1 is refused before
 decoding.
 
+### Capture-time artifact identity
+
+Add `--artifact-sha256` with an explicit `--json PATH` to record the completed
+producer's SHA-256 and byte count for PNG, JPEG, PDF or GIF:
+
+```bash
+brewshot page.html -o shot.png --json shot.json --artifact-sha256
+```
+
+The optional fields are `outSha256` and `outSha256Provenance`; existing `outBytes`
+then uses that same producer snapshot. This does not re-open the artifact after
+capture. Recompute the digest after transport or before use to compare the bytes
+you actually received. Without the flag, both new keys stay absent and the
+existing sidecar behavior remains. See the producer claim and verification
+contract below for the exact meaning and limits.
+
 ### SVG files size their own viewport
 
 `--size WxH` sets the viewport (default `1280x900`). A local `.svg` input with no
@@ -1049,3 +1065,120 @@ playwright's chromium driver
 
 This project is provided under the Apache License 2.0 on an "AS IS" basis,
 without warranties or conditions of any kind. See the LICENSE file for details.
+
+## Producer receipts: verification contract
+
+The test-source contract was reviewed before production implementation. Source
+acceptance establishes the required oracles; it does not establish runtime
+success or merge approval. This implementation still requires fresh positive,
+semantic-mutant, restored, format-parity and full-build evidence at its exact
+tip, followed by independent review and a non-author land. A compiler error,
+unavailable instrument, or fixture failure is **SETUP**, never semantic RED.
+
+### Product meaning to preserve
+
+`--artifact-sha256` requires an explicit `--json PATH` and adds exactly
+`outSha256` and `outSha256Provenance`.
+
+The `capture-time-producer` value of `outSha256Provenance` means:
+BrewShot generated exactly these bytes (sha256 X).
+`X` is the lowercase 64-hex digest in `outSha256`.
+Consumers must recompute SHA-256 after transport or immediately before use.
+This is a capture-time producer claim, not a signature, trusted-capture,
+current-file-state, immutability, transport, or cross-file atomicity proof.
+
+Existing `outBytes` comes from that same completed producer snapshot when the flag
+is present. PNG, JPEG and PDF
+use the exact byte array already at the writer; GIF uses the exact encoded stream,
+including its final trailer. The receipt does not describe a later file read.
+`viewport` remains request metadata; no new output-dimension fields or invented
+PDF pixel units are added. Every artifact-derived dimension actually reported
+must belong to that same snapshot.
+
+The digest is an opt-in equality oracle
+for potentially sensitive imagery. It contains no image content in its prose.
+When the flag is absent, both new keys stay absent and the legacy sidecar bytes,
+overload behavior and post-close `outBytes` semantics remain unchanged.
+
+### Seven required cases and their kill criteria
+
+All seven cases are explicit JUnit methods. Loop iterations and helper probes are
+not additional JUnit cases. Every mutation is temporary in the verifier's own
+checkout; record its source delta, expected assertion, original terminal result
+and restored source hash. A syntax, compile, fixture or tool failure never counts
+as killing a semantic mutant.
+
+| Case / test method | Positive oracle | Required semantic control |
+| --- | --- | --- |
+| 1 · `MainManifestTest.equalLengthProducerSnapshotsKeepLegacyBytesButHaveDifferentOptInDigests` | Two equal-length, different producer arrays give identical legacy JSON bytes and distinct independently recomputed digests. Only the two approved fields are added. The first receipt is published after the second array replaces the path. | Return a constant or reuse the first digest: the distinct-digest assertions must fail. Recompute from the current path: the first snapshot assertion must fail. |
+| 2 · `ArtifactWriterTest.arrayReceiptUsesTheSuppliedSnapshotWithoutArtifactReadsOrAnArtifactSizedCopy` | Real PNG/JPEG fixtures and a small PDF pass through the actual writer. Count/hash equal the supplied array; changing that input later cannot change the receipt. JFR records no artifact or sibling-temporary content reads. A current-thread allocation counter observes the writer without charging fixture construction. | Reopen the artifact or temporary to hash it: the read census must fail. Substitute a wrong count/hash: the independent oracle must fail. Add an escaping artifact-sized array copy in the writer: the allocation assertion must fail. |
+| 3 · `GifWriterTest.realGifReceiptMatchesLegacyBytesAndItsEncodedCacheStaysBounded` | The actual `GifWriter` encodes sixteen deterministic noisy frames. Opt-in bytes equal the legacy encoding exactly; independent count/hash include the final trailer. The actual stream observer sees scalar and bulk progress and physical retained cache payload at most 16,384 bytes, with a larger encoded artifact. No output content read occurs. | Drop, duplicate or reorder emitted bytes, omit the trailer, allow a backwards seek, suppress eager discard, or hash only frame payloads. Each of these seven faults must fail its named byte/seek/cache/digest assertion, then NONE/restored must pass. |
+| 4 · `MainCliTest.everyCliLaneKeepsItsCompletedProducerReceiptAcrossPostCaptureReplacement` | Actual `Main` and `BrewShot` run over scripted CDP and a synthetic process: PNG, JPEG, PDF, full-page GIF, element GIF, selector clip, JS clip, scale and vision preview. Enabled positive captures and close-time replacement runs include the whole Main call in the no-content-read census. Expected CDP bytes and legacy GIF reference bytes are prepared before recording; close never reads the artifact. Flagged count/hash retain that snapshot; unflagged count retains the legacy later-file-size behavior. Real commit failures preserve prior JSON. | Use `Files.size` or recompute the enabled receipt from the replaced path: snapshot assertions must fail. Leave any CLI forwarding path on the old void-only receipt route: that lane must fail. Publish JSON after a failed artifact commit: the prior-sidecar assertion must fail. |
+| 5 · `MainManifestTest.noReceiptPreservesTheExactLegacySidecarThroughEveryOverload` | An independent raw JSON golden at base version 0.9.0 pins fields, values, order, formatting and newline through every existing overload and the null-receipt entry. Both added keys are absent. | Add either key while disabled, reorder a field, or alter a legacy value/format: the byte golden must fail. |
+| 6 · `MainCliTest.artifactDigestRequiresExplicitJsonBeforeAvailabilityLaunchOrAnyWrite` | Real `Main.run` returns usage 2 with neither browser-work hook nor output write for the invalid combination in either argument order. A valid explicit-JSON control reaches both the availability and launch witnesses through `Main.SessionLauncher` and preserves a prior sidecar when launch fails. | Remove the early cross-flag refusal or move it after browser work: the lookup/launch-zero assertion must fail. An always-refusing parser must fail the positive control. |
+| 7 · `MainManifestTest.receiptAndDocsKeepTheExactCaptureTimeClaimAndConsumerRecomputeBoundary` | A completed receipt can be published after the output path is removed. Independent exact-paragraph goldens retain the provenance meaning, narrow claim and recomputation guidance in README and release notes. | Change the provenance to a current-file claim, or add or substitute a broadened current-file-state claim: reject it. The exact-paragraph test rejects additions or substitutions regardless of wording within the claim block; required source review also checks all surrounding documentation for contradictory claims. |
+
+The GIF observer must inspect the **production** stream after writes and flushes,
+including before eager discard, and must fire on scalar and bulk progress. It
+does not replace the encoder or provide a test-local receipt implementation.
+The former GIF feasibility controls remain useful historical evidence; the seven
+faults above must also exercise the completed real writer before Stage B can be
+accepted.
+
+### Package-private producer surface
+
+- `ArtifactWriter.ProducerReceipt`: immutable `outBytes()` and `outSha256()`;
+  no retained artifact array or path-based recomputation.
+- `ArtifactWriter.writeBytesWithReceipt(Path, byte[], boolean)`: the actual
+  existing publication boundary returns the completed snapshot.
+- `GifWriter.writeWithReceipt(List<byte[]>, int, int, Path, boolean,
+  EncodedStreamObserver)`: the actual encoder returns that same receipt shape.
+  The internal observer accepts the real `ImageOutputStream` and may throw
+  `IOException`; ordinary callers need no observer. Existing public void APIs
+  keep their signatures and behavior.
+- `Main.writeManifestWithProducerReceipt`: a distinctly named internal entry
+  with the existing full manifest arguments plus the optional producer receipt.
+  A null receipt preserves the complete old overload chain and avoids ambiguous
+  `null` overload calls.
+- `Main.SessionLauncher.available()`: a default `true` method on the existing
+  test seam, so a scripted valid control can witness browser discovery as well
+  as launch. Normal production discovery still calls `BrewShot.available()`;
+  the default method preserves the seam's functional-interface callers.
+
+Receipt-returning package-private forwarding on the actual `BrewShot` screenshot,
+PDF and two CLI GIF paths carries these snapshots. The scripted
+CLI case also covers existing byte-array clip/scale branches and vision preview.
+Do not transfer the receipt through a thread-local or an implicit global.
+
+### Verification venue and limits
+
+Marlow's phase is source-only. The named build delegate executes in an admitted
+slot. Record actual JDK, commands, source hashes, original raw XML/console,
+anchors, terminal statuses, counts and source restoration. Stage A does not
+claim a fresh 474-case suite from adding seven methods to an older 467-case run.
+
+The content-read instrument uses JDK Flight Recorder `jdk.FileRead`, with zero
+threshold, throttling off, before/after read probes and a data-loss check. It
+observes JDK content reads under the artifact directory, including sibling
+temporaries; it does not claim to observe every possible native syscall or file
+metadata query. The allocation counter measures the current writer thread and
+has escaping-copy controls before and after measurement. It is not an RSS or
+total-heap claim. Source review must also rule out off-thread buffering and
+hidden read paths. Missing probes, unavailable counters/JFR, data loss or an
+unfamiliar cache layout fail the instrument; they never skip green. The
+GIF cache census does not observe an artifact-sized tee or `ByteArrayOutputStream`
+outside the ImageIO cache; Stage B source review must rule those out explicitly.
+The existing test-JVM `java.desktop/javax.imageio.stream` opens are required for the physical
+GIF cache census. Java 21 and Java 25 venues must be identified separately.
+
+API references: [JDK Recording](https://docs.oracle.com/en/java/javase/25/docs/api/jdk.jfr/jdk/jfr/Recording.html),
+[RecordingFile](https://docs.oracle.com/en/java/javase/25/docs/api/jdk.jfr/jdk/jfr/consumer/RecordingFile.html),
+[ThreadMXBean](https://docs.oracle.com/en/java/javase/25/docs/api/jdk.management/com/sun/management/ThreadMXBean.html).
+The first compilation must disclose any source error separately from a semantic
+failure. Only after implementation and a positive run can a
+single-violation mutation yield semantic RED and a restored run yield PASS.
+
+Kill or re-RFC if a receipt field uses another snapshot, digesting requires an
+artifact reread or additional artifact-sized copy, disabled behavior changes,
+or the capture-time claim cannot stay narrow. Browser-free receipt tests do not
+replace the separately admitted browser-capable full build and format parity.

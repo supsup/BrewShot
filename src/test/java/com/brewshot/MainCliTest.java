@@ -2,6 +2,8 @@ package com.brewshot;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -9,12 +11,300 @@ import java.io.InputStream;
 import java.io.PrintStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
+import java.util.Map;
+import java.util.Base64;
+import java.util.ArrayList;
+import java.net.http.WebSocket;
+import java.nio.ByteBuffer;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.api.parallel.Isolated;
 
-/** CLI arg handling — no Chrome needed: every case exits before launch. */
+/** CLI argument validation and scripted capture paths; receipt fixtures launch no real Chrome. */
+@Isolated("Scripted Main launch, process and stderr seams are restored before other tests run")
 class MainCliTest {
+
+    /** Case 4: real Main/BrewShot paths, with replacement at close BEFORE manifest publication. */
+    @Test
+    void everyCliLaneKeepsItsCompletedProducerReceiptAcrossPostCaptureReplacement(
+            @TempDir Path directory) throws Exception {
+        List<ReceiptLane> lanes = List.of(
+            new ReceiptLane("png", "png", List.of()),
+            new ReceiptLane("jpeg", "jpg", List.of("--jpeg-quality", "80")),
+            new ReceiptLane("pdf", "pdf", List.of()),
+            new ReceiptLane("gif-page", "gif", List.of("--gif", "3", "--gif-delay", "1")),
+            new ReceiptLane("gif-element", "gif", List.of("--gif", "3", "--gif-delay", "1",
+                "--gif-element", "#fixture")),
+            new ReceiptLane("selector", "png", List.of("--clip-selector", "#fixture")),
+            new ReceiptLane("clip-js", "png", List.of("--clip-js", "({x:0,y:0,w:16,h:12})")),
+            new ReceiptLane("scale", "png", List.of("--scale", "2")),
+            new ReceiptLane("vision", "png", List.of("--vision-deficiency", "deuteranopia"))
+        );
+        int id = 0;
+        for (ReceiptLane lane : lanes) {
+            Path positiveVenue = Files.createDirectory(directory.resolve(lane.name() + "-positive"));
+            Path positiveOut = positiveVenue.resolve("capture." + lane.extension());
+            Path positiveJson = positiveVenue.resolve("capture.json");
+            ReceiptScript positive = new ReceiptScript(positiveOut, false);
+            positive.prepareExpected(lane, directory.resolve(lane.name() + "-reference.gif"));
+            int positiveId = id++;
+            ReceiptRun captured = ArtifactWriterTest.withoutArtifactReads(positiveVenue,
+                () -> runReceiptCli(lane, true, positiveOut, positiveJson, positive, positiveVenue, positiveId));
+            assertNull(captured.failure(), "positive CLI capture failed: " + captured.failure());
+            assertEquals(Integer.valueOf(0), captured.code());
+            org.junit.jupiter.api.Assertions.assertArrayEquals(positive.expectedProduced,
+                Files.readAllBytes(positiveOut), "real enabled CLI must write its capture bytes");
+            @SuppressWarnings("unchecked")
+            Map<String, Object> positiveRoot = (Map<String, Object>) MiniJson.parse(Files.readString(positiveJson));
+            assertEquals(ArtifactWriterTest.receiptHash(positive.expectedProduced), positiveRoot.get("outSha256"));
+
+            java.util.Set<String> oldKeys = null;
+            for (boolean enabled : new boolean[] {false, true}) {
+                Path venue = Files.createDirectory(directory.resolve(lane.name() + "-" + enabled));
+                Path out = venue.resolve("capture." + lane.extension());
+                Path json = venue.resolve("capture.json");
+                ReceiptScript script = new ReceiptScript(out, true);
+                script.prepareExpected(lane, directory.resolve(lane.name() + "-replacement-reference.gif"));
+                int runId = id++;
+                ReceiptRun run = enabled
+                    ? ArtifactWriterTest.withoutArtifactReads(venue,
+                        () -> runReceiptCli(lane, true, out, json, script, venue, runId))
+                    : runReceiptCli(lane, false, out, json, script, venue, runId);
+                assertNull(run.failure(), "real CLI failed before receipt assertions: " + run.failure());
+                assertEquals(Integer.valueOf(0), run.code(), lane.name());
+                assertNull(script.oracleFailure, "INSTRUMENT: close-time replacement failed");
+                assertEquals(1, script.navigations);
+                assertEquals(lane.extension().equals("gif") ? 3 : 1, script.captures);
+                assertTrue(script.closed, "INSTRUMENT: actual transport close must occur before JSON");
+                assertTrue(script.expectedProduced != null && script.expectedProduced.length > 0);
+                assertTrue(Files.size(out) > script.expectedProduced.length,
+                    "INSTRUMENT: replacement must differ in size as well as identity");
+                @SuppressWarnings("unchecked")
+                Map<String, Object> root = (Map<String, Object>) MiniJson.parse(Files.readString(json));
+                assertEquals("640x480", root.get("viewport"), "viewport stays request metadata");
+                if (!enabled) {
+                    oldKeys = java.util.Set.copyOf(root.keySet());
+                    assertTrue(oldKeys.containsAll(java.util.Set.of("input", "mode", "viewport",
+                        "settleMs", "waitJs", "out", "outBytes", "eval", "failJs", "failJsPassed",
+                        "elapsedMs", "brewshot")), "CLI must preserve every unconditional legacy key");
+                    assertFalse(root.containsKey("outSha256"));
+                    assertFalse(root.containsKey("outSha256Provenance"));
+                    assertEquals(Files.size(out), ((Number) root.get("outBytes")).longValue(),
+                        "unflagged receipt retains its old post-close Files.size semantics");
+                } else {
+                    assertEquals(script.expectedProduced.length, ((Number) root.get("outBytes")).longValue());
+                    assertEquals(ArtifactWriterTest.receiptHash(script.expectedProduced), root.get("outSha256"));
+                    assertEquals("capture-time-producer", root.get("outSha256Provenance"));
+                    var expectedKeys = new java.util.HashSet<>(oldKeys);
+                    expectedKeys.addAll(java.util.Set.of("outSha256", "outSha256Provenance"));
+                    assertEquals(expectedKeys, root.keySet(), "exactly the two approved added keys");
+                }
+            }
+
+            // A genuine artifact commit failure, after a live capture, cannot replace prior JSON.
+            Path venue = Files.createDirectory(directory.resolve(lane.name() + "-write-failure"));
+            Path out = Files.createDirectory(venue.resolve("capture." + lane.extension()));
+            Files.writeString(out.resolve("keep"), "existing-directory");
+            Path json = venue.resolve("capture.json");
+            Files.writeString(json, "known-good-prior-sidecar");
+            ReceiptScript script = new ReceiptScript(out, false);
+            ReceiptRun failed = runReceiptCli(lane, true, out, json, script, venue, id++);
+            assertTrue(failed.failure() instanceof java.io.IOException,
+                "artifact publication must fail, not publish a partial receipt: " + failed.failure());
+            assertTrue(script.captures > 0, "INSTRUMENT: failure must follow a real capture response");
+            assertEquals("known-good-prior-sidecar", Files.readString(json));
+            assertEquals("existing-directory", Files.readString(out.resolve("keep")));
+            try (var files = Files.list(venue)) {
+                assertFalse(files.anyMatch(f -> f.getFileName().toString().endsWith(".tmp")),
+                    "failed receipt/artifact publication must clean its sibling temporary");
+            }
+        }
+    }
+
+    /** Case 6: the existing launch seam gains only a default availability witness for this gate. */
+    @Test
+    void artifactDigestRequiresExplicitJsonBeforeAvailabilityLaunchOrAnyWrite(
+            @TempDir Path directory) throws Exception {
+        AtomicInteger lookups = new AtomicInteger(), launches = new AtomicInteger();
+        Main.SessionLauncher saved = Main.sessionLauncherForTests;
+        Main.sessionLauncherForTests = new Main.SessionLauncher() {
+            @Override public boolean available() { lookups.incrementAndGet(); return true; }
+            @Override public BrewShot launch(int width, int height, Integer dpr) throws java.io.IOException {
+                launches.incrementAndGet();
+                throw new java.io.IOException("receipt-positive-launch-witness");
+            }
+        };
+        PrintStream original = System.err;
+        ByteArrayOutputStream errors = new ByteArrayOutputStream();
+        try {
+            System.setErr(new PrintStream(errors, true, java.nio.charset.StandardCharsets.UTF_8));
+            Path out = directory.resolve("capture.png");
+            for (String[] args : List.of(
+                    new String[] {"https://example.invalid/", "--artifact-sha256", "-o", out.toString()},
+                    new String[] {"https://example.invalid/", "-o", out.toString(), "--artifact-sha256"})) {
+                errors.reset();
+                Integer code = null;
+                Exception failure = null;
+                try { code = Main.run(args); } catch (Exception actual) { failure = actual; }
+                assertEquals(0, lookups.get(), "invalid combination reached browser discovery");
+                assertEquals(0, launches.get(), "invalid combination reached process launch");
+                assertNull(failure, "usage refusal must return its code, not throw");
+                assertEquals(Integer.valueOf(2), code);
+                assertTrue(errors.toString(java.nio.charset.StandardCharsets.UTF_8).contains("--json"));
+                assertFalse(Files.exists(out));
+                try (var files = Files.list(directory)) { assertEquals(0, files.count()); }
+            }
+            // Positive control goes through actual Main parsing and BOTH browser-work hooks.
+            Path json = directory.resolve("explicit.json");
+            Files.writeString(json, "known-good-sidecar");
+            Exception observed = null;
+            try {
+                Main.run(new String[] {"https://example.invalid/", "--artifact-sha256",
+                    "--json", json.toString(), "-o", out.toString()});
+            } catch (Exception actual) { observed = actual; }
+            assertEquals(1, lookups.get(), "INSTRUMENT: valid explicit JSON must reach lookup");
+            assertEquals(1, launches.get(), "INSTRUMENT: valid explicit JSON must reach launch");
+            assertTrue(observed instanceof java.io.IOException
+                && "receipt-positive-launch-witness".equals(observed.getMessage()),
+                "INSTRUMENT: the deliberate launcher witness must decide the positive control");
+            assertFalse(Files.exists(out));
+            assertEquals("known-good-sidecar", Files.readString(json));
+        } finally {
+            System.setErr(original);
+            Main.sessionLauncherForTests = saved;
+        }
+    }
+
+    private record ReceiptLane(String name, String extension, List<String> options) { }
+    private record ReceiptRun(Integer code, Exception failure) { }
+
+    private static ReceiptRun runReceiptCli(ReceiptLane lane, boolean digest, Path out, Path json,
+            ReceiptScript script, Path venue, int id) throws Exception {
+        Main.SessionLauncher saved = Main.sessionLauncherForTests;
+        var savedProbe = BrewShot.exitedButUnreapedProbeForTests;
+        var chrome = new MainCliUnconfirmedCleanupTest.FakeChrome(524300L + id, true);
+        Path profile = Files.createDirectory(venue.resolve("synthetic-profile"));
+        BrewShot.exitedButUnreapedProbeForTests = pid -> false;
+        Main.sessionLauncherForTests = (width, height, dpr) -> {
+            assertEquals(640, width); assertEquals(480, height);
+            return script.session(chrome, profile);
+        };
+        List<String> args = new ArrayList<>(List.of("https://example.invalid/receipt", "--size", "640x480",
+            "--settle", "1", "-o", out.toString(), "--json", json.toString()));
+        args.addAll(lane.options());
+        if (digest) args.add("--artifact-sha256");
+        Integer code = null;
+        Exception failure = null;
+        try { code = Main.run(args.toArray(String[]::new)); }
+        catch (Exception actual) { failure = actual; }
+        finally {
+            try {
+                chrome.die();
+                BrewShot.runShutdownCleanupForTests();
+            } finally {
+                Main.sessionLauncherForTests = saved;
+                BrewShot.exitedButUnreapedProbeForTests = savedProbe;
+            }
+        }
+        return new ReceiptRun(code, failure);
+    }
+
+    /** Scripted CDP, real BrewShot client/encoder/write/close/manifest. No browser process. */
+    private static final class ReceiptScript implements WebSocket {
+        final Path out;
+        final boolean replace;
+        final byte[] png = ArtifactWriterTest.receiptFixture("png");
+        final byte[] jpeg = ArtifactWriterTest.receiptFixture("jpeg");
+        final byte[] pdf = ArtifactWriterTest.receiptFixture("pdf");
+        final LinkedBlockingQueue<BrewShot.InboxMessage> inbox = new LinkedBlockingQueue<>(65);
+        final BrewShot.Accumulator listener = new BrewShot.Accumulator(inbox, 1 << 20, 64);
+        int navigations, captures;
+        boolean closed;
+        byte[] expectedProduced;
+        Exception oracleFailure;
+
+        ReceiptScript(Path out, boolean replace) throws java.io.IOException {
+            this.out = out; this.replace = replace;
+        }
+
+        void prepareExpected(ReceiptLane lane, Path reference) throws java.io.IOException {
+            // Independent oracles precede the Main/JFR window. Close never reads the artifact.
+            expectedProduced = switch (lane.extension()) {
+                case "jpg" -> jpeg;
+                case "pdf" -> pdf;
+                case "gif" -> {
+                    GifWriter.write(List.of(png, png, png), 1, reference);
+                    yield Files.readAllBytes(reference);
+                }
+                default -> png;
+            };
+        }
+
+        BrewShot session(Process process, Path profile) {
+            return new BrewShot(process, profile, this, inbox, 1_000L);
+        }
+
+        @Override public CompletableFuture<WebSocket> sendText(CharSequence text, boolean last) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> sent = (Map<String, Object>) MiniJson.parse(text.toString());
+            int id = ((Number) sent.get("id")).intValue();
+            String method = String.valueOf(sent.get("method"));
+            Object result;
+            switch (method) {
+                case "Page.navigate" -> { navigations++; result = Map.of("frameId", "main"); }
+                case "Runtime.evaluate" -> {
+                    String expression = String.valueOf(MiniJson.get(sent, "params.expression"));
+                    Object value;
+                    if (expression.equals("window.innerWidth+'x'+window.innerHeight")) value = "0x0";
+                    else if (expression.contains("document.querySelector(") && expression.contains("getBoundingClientRect")) value = "0,0,16,12";
+                    else if (expression.equals("document.documentElement.scrollWidth")) value = 16.0;
+                    else if (expression.equals("document.documentElement.scrollHeight")) value = 12.0;
+                    else if (expression.contains("scrollWidth") && expression.contains("join(','")) value = "16,12";
+                    else if (expression.equals("({x:0,y:0,w:16,h:12})")) value = Map.of("x", 0, "y", 0, "w", 16, "h", 12);
+                    else throw new AssertionError("INSTRUMENT: unhandled CDP expression: " + expression);
+                    result = Map.of("result", Map.of("value", value));
+                }
+                case "Page.captureScreenshot", "Page.printToPDF" -> {
+                    captures++;
+                    byte[] bytes = method.equals("Page.printToPDF") ? pdf
+                        : "jpeg".equals(MiniJson.get(sent, "params.format")) ? jpeg : png;
+                    result = Map.of("data", Base64.getEncoder().encodeToString(bytes));
+                }
+                default -> result = Map.of();
+            }
+            listener.onText(this, MiniJson.stringify(Map.of("id", id, "result", result)), true);
+            if (method.equals("Page.navigate")) listener.onText(this,
+                "{\"method\":\"Page.loadEventFired\",\"params\":{\"timestamp\":1}}", true);
+            return CompletableFuture.completedFuture(this);
+        }
+
+        @Override public CompletableFuture<WebSocket> sendClose(int status, String reason) {
+            if (closed) return CompletableFuture.completedFuture(this);
+            closed = true;
+            if (replace) try {
+                if (!Files.isRegularFile(out) || Files.size(out) != expectedProduced.length) {
+                    throw new java.io.IOException("INSTRUMENT: complete expected artifact must precede close");
+                }
+                byte[] replacement = new byte[expectedProduced.length + 19];
+                java.util.Arrays.fill(replacement, (byte) 0x5a);
+                Files.write(out, replacement);
+            } catch (Exception failure) { oracleFailure = failure; }
+            return CompletableFuture.completedFuture(this);
+        }
+        @Override public CompletableFuture<WebSocket> sendBinary(ByteBuffer data, boolean last) { return CompletableFuture.completedFuture(this); }
+        @Override public CompletableFuture<WebSocket> sendPing(ByteBuffer data) { return CompletableFuture.completedFuture(this); }
+        @Override public CompletableFuture<WebSocket> sendPong(ByteBuffer data) { return CompletableFuture.completedFuture(this); }
+        @Override public void request(long n) { }
+        @Override public String getSubprotocol() { return ""; }
+        @Override public boolean isOutputClosed() { return closed; }
+        @Override public boolean isInputClosed() { return false; }
+        @Override public void abort() { closed = true; }
+    }
 
     @Test
     void helpStatesTheExactByteAndImageAllocationContracts() throws Exception {

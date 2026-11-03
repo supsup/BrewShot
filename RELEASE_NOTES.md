@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **Opt-in producer receipts** (plan 0181881e). `--artifact-sha256` requires an
+  explicit `--json PATH` and adds only `outSha256` and `outSha256Provenance`.
+  The stable `capture-time-producer` value means:
+  BrewShot generated exactly these bytes (sha256 X).
+  Consumers must recompute SHA-256 after transport or immediately before use.
+  This is a capture-time producer claim, not a signature, trusted-capture,
+  current-file-state, immutability, transport, or cross-file atomicity proof.
+  Existing `outBytes` uses that same completed snapshot; PNG/JPEG/PDF use the
+  producer array and GIF uses the encoded stream through its trailer, without
+  re-reading the artifact or making an artifact-sized copy. Flag omission keeps
+  both new keys absent and the legacy sidecar bytes unchanged.
+
 - **Session auth from a file, never from argv** (plan 728a0dfd). `--header-file`
   and `--cookie-file` take a PATH, so a bearer token or session cookie is no
   longer visible in `ps` or shell history. The file must be a regular file, not
