@@ -364,7 +364,7 @@ final class GifWriter {
     }
 
     /** Counts/hashes successful sink writes, including the trailer; no encoded-artifact tee. */
-    private static final class CountingDigestSink extends OutputStream {
+    static final class CountingDigestSink extends OutputStream {
         private final OutputStream out;
         private final MessageDigest digest;
         private long count;
@@ -381,15 +381,7 @@ final class GifWriter {
         }
 
         @Override public void write(int value) throws IOException {
-            writable();
-            try {
-                out.write(value);
-                digest.update((byte) value);
-                count = Math.addExact(count, 1L);
-            } catch (IOException | RuntimeException | Error failure) {
-                failed = true;
-                throw failure;
-            }
+            write(new byte[] {(byte) value}, 0, 1);
         }
 
         @Override public void write(byte[] bytes, int offset, int length) throws IOException {

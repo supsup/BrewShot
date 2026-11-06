@@ -139,12 +139,16 @@ public final class Main {
         // Accept both `--out x.png` AND `--out=x.png` (the near-universal
         // convention; agent-generated wrappers lean on it). Split a leading
         // long-flag `--name=value` into two tokens up front so the loop below
-        // needs no `=` awareness. A bare `-` (stdin) and `=` inside a VALUE
-        // token are untouched.
+        // needs no `=` awareness for most flags. A bare `-` (stdin) and `=` inside a VALUE
+        // token are untouched. Capture's receipt flag keeps its attached boolean;
+        // diff/verify and every other flag retain their existing normalization.
+        boolean captureCommand = rawArgs.length == 0
+            || (!rawArgs[0].equals("diff") && !rawArgs[0].equals("verify"));
         java.util.List<String> norm = new java.util.ArrayList<>(rawArgs.length + 4);
         for (String a : rawArgs) {
             int eq = a.indexOf('=');
-            if (a.startsWith("--") && eq > 2) {
+            if (a.startsWith("--") && eq > 2
+                    && !(captureCommand && a.startsWith("--artifact-sha256="))) {
                 norm.add(a.substring(0, eq));
                 norm.add(a.substring(eq + 1));
             } else {
@@ -246,7 +250,8 @@ public final class Main {
                 case "--clip-padding" -> clipPadding = nonNegDouble("--clip-padding", requireValue(args, ++i));
                 case "--fail-js" -> failJs = requireValue(args, ++i);
                 case "--json" -> jsonManifest = Path.of(requireValue(args, ++i));
-                case "--artifact-sha256" -> artifactSha256 = true;
+                case "--artifact-sha256", "--artifact-sha256=true" -> artifactSha256 = true;
+                case "--artifact-sha256=false" -> artifactSha256 = false;
                 case "--page-diagnostics" -> pageDiagnostics = true;
                 case "--fail-page-errors" -> failPageErrors = true;
                 case "--fail-console-errors" -> failConsoleErrors = true;
@@ -304,6 +309,9 @@ public final class Main {
                 case "-h", "--help" -> { usage(); return 0; }
                 case "--version" -> { System.out.println("brewshot " + BrewShot.VERSION); return 0; }
                 default -> {
+                    if (args[i].startsWith("--artifact-sha256=")) {
+                        return err("--artifact-sha256 accepts only attached =true or =false");
+                    }
                     if (args[i].startsWith("-") && !args[i].equals("-")) {
                         return err("unknown flag: " + args[i]);
                     }
@@ -604,7 +612,7 @@ public final class Main {
                 visionDeficiency == null ? null : Boolean.TRUE,
                 viewportSource, witness.settle(),
                 fileAuthManifestField(headerFiles, fileHeaders, cookieFiles, fileCookies),
-                producerReceipt);
+                producerReceipt, artifactSha256);
         }
         System.err.println("brewshot: wrote " + out);
         if (!failJsPassed) {
@@ -1153,6 +1161,27 @@ public final class Main {
             String viewportSource, CleanupOutcome cleanup,
             java.util.Map<String, Object> fileAuth, ArtifactWriter.ProducerReceipt producerReceipt)
             throws java.io.IOException {
+        writeManifestWithProducerReceipt(manifest, input, mode, width, height, settleMs, waitJs,
+            out, evalResult, failJs, failJsPassed, elapsedMs, requestedGifDelayMs, jpegQuality,
+            diagnostics, timezoneRequested, timezoneApplied, dprRequested, dprApplied,
+            visionDeficiencyRequested, visionCommandAccepted, viewportSource, cleanup,
+            fileAuth, producerReceipt, false);
+    }
+
+    /** Capture calls this after close; a missed receipt must not silently publish legacy JSON. */
+    static void writeManifestWithProducerReceipt(Path manifest, String input, String mode,
+            int width, int height, long settleMs, String waitJs, Path out,
+            Object evalResult, String failJs, boolean failJsPassed, long elapsedMs,
+            Integer requestedGifDelayMs, Integer jpegQuality,
+            PageDiagnosticsReceipt diagnostics, String timezoneRequested,
+            String timezoneApplied, Integer dprRequested, Integer dprApplied,
+            String visionDeficiencyRequested, Boolean visionCommandAccepted,
+            String viewportSource, CleanupOutcome cleanup,
+            java.util.Map<String, Object> fileAuth, ArtifactWriter.ProducerReceipt producerReceipt,
+            boolean receiptRequired) throws java.io.IOException {
+        if (receiptRequired && producerReceipt == null) {
+            throw new java.io.IOException("capture completed without the required producer receipt");
+        }
         java.util.Map<String, Object> fields = new java.util.LinkedHashMap<>();
         fields.put("input", input);
         fields.put("mode", mode);
@@ -1725,7 +1754,8 @@ public final class Main {
               --fail-js    JS assertion; false -> exit 4 (output artifact still written)
               --json       write a machine-readable manifest beside the output
               --artifact-sha256  add a capture-time producer digest to --json
-                           (requires explicit --json PATH; consumers recompute before use)
+                                =true enables; =false disables; last occurrence wins
+                           (when enabled, requires explicit --json PATH; consumers recompute before use)
               --page-diagnostics  include bounded console/error text, drop counters,
                            completeness, and gate outcome in --json (requires --json)
               --fail-page-errors  exit 4 after image+JSON on an uncaught page exception

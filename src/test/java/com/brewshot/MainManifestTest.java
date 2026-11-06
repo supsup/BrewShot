@@ -134,7 +134,8 @@ class MainManifestTest {
             m -> Main.writeManifest(m, "page.html", "file", 640, 480, 25,
                 null, out, null, null, true, 12, null, null,
                 null, null, null, null, null, null, null, null, null, null),
-            m -> writeProducerManifest(m, out, null)
+            m -> writeProducerManifest(m, out, null),
+            m -> writeProducerManifest(m, out, null, false)
         );
         for (int i = 0; i < calls.size(); i++) {
             Path manifest = directory.resolve("overload-" + i + ".json");
@@ -143,6 +144,47 @@ class MainManifestTest {
             assertFalse(manifestObject(manifest).containsKey("outSha256"));
             assertFalse(manifestObject(manifest).containsKey("outSha256Provenance"));
         }
+    }
+
+    @Test
+    void requiredMissingReceiptRefusesWithoutChangingArtifactOrPriorSidecar(
+            @TempDir Path directory) throws Exception {
+        for (boolean artifactPresent : new boolean[] {false, true}) {
+            for (boolean priorSidecar : new boolean[] {false, true}) {
+                Path venue = Files.createDirectory(directory.resolve(artifactPresent + "-" + priorSidecar));
+                Path out = venue.resolve("capture.png"), manifest = venue.resolve("capture.json");
+                byte[] completed = {4, 2, 8, 1};
+                if (artifactPresent) Files.write(out, completed);
+                if (priorSidecar) Files.writeString(manifest, "prior-sidecar");
+                java.io.IOException failure = assertThrows(java.io.IOException.class,
+                    () -> writeProducerManifest(manifest, out, null, true));
+                assertEquals("capture completed without the required producer receipt", failure.getMessage(),
+                    "the invariant precedes filesystem metadata lookup and sidecar publication");
+                if (artifactPresent) {
+                    org.junit.jupiter.api.Assertions.assertArrayEquals(completed, Files.readAllBytes(out));
+                } else assertFalse(Files.exists(out));
+                if (priorSidecar) assertEquals("prior-sidecar", Files.readString(manifest));
+                else assertFalse(Files.exists(manifest));
+                try (var files = Files.list(venue)) {
+                    assertEquals((artifactPresent ? 1 : 0) + (priorSidecar ? 1 : 0), files.count());
+                }
+            }
+        }
+    }
+
+    @Test
+    void requiredCompletedReceiptStillPublishesAfterTheOutputPathIsRemoved(
+            @TempDir Path directory) throws Exception {
+        Path out = directory.resolve("capture.png"), manifest = directory.resolve("capture.json");
+        byte[] produced = {7, 2, 9, 3};
+        var receipt = ArtifactWriter.writeBytesWithReceipt(out, produced, true);
+        Files.delete(out);
+        writeProducerManifest(manifest, out, receipt, true);
+        Map<String, Object> root = manifestObject(manifest);
+        assertEquals(4L, ((Number) root.get("outBytes")).longValue());
+        assertEquals(ArtifactWriterTest.receiptHash(produced), root.get("outSha256"));
+        assertEquals("capture-time-producer", root.get("outSha256Provenance"));
+        assertFalse(Files.exists(out), "the guard must not turn a receipt into a current-path claim");
     }
 
     /** Case 7: a producer receipt still speaks truth when the current path no longer exists. */
@@ -217,6 +259,13 @@ class MainManifestTest {
             null, // cleanup
             null, // file auth
             receipt);
+    }
+
+    private static void writeProducerManifest(Path manifest, Path out,
+            ArtifactWriter.ProducerReceipt receipt, boolean required) throws Exception {
+        Main.writeManifestWithProducerReceipt(manifest, "page.html", "file", 640, 480, 25,
+            null, out, null, null, true, 12, null, null,
+            null, null, null, null, null, null, null, null, null, null, receipt, required);
     }
 
     @SuppressWarnings("unchecked")

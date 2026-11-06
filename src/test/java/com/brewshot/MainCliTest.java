@@ -227,6 +227,15 @@ class MainCliTest {
 
     private static ReceiptRun runReceiptCli(ReceiptLane lane, boolean digest, Path out, Path json,
             ReceiptScript script, Path venue, int id) throws Exception {
+        List<String> args = new ArrayList<>(List.of("https://example.invalid/receipt", "--size", "640x480",
+            "--settle", "1", "-o", out.toString(), "--json", json.toString()));
+        args.addAll(lane.options());
+        if (digest) args.add("--artifact-sha256");
+        return runReceiptArgs(args, script, venue, id);
+    }
+
+    private static ReceiptRun runReceiptArgs(List<String> args, ReceiptScript script,
+            Path venue, int id) throws Exception {
         Main.SessionLauncher saved = Main.sessionLauncherForTests;
         var savedProbe = BrewShot.exitedButUnreapedProbeForTests;
         var chrome = new MainCliUnconfirmedCleanupTest.FakeChrome(524300L + id, true);
@@ -236,10 +245,6 @@ class MainCliTest {
             assertEquals(640, width); assertEquals(480, height);
             return script.session(chrome, profile);
         };
-        List<String> args = new ArrayList<>(List.of("https://example.invalid/receipt", "--size", "640x480",
-            "--settle", "1", "-o", out.toString(), "--json", json.toString()));
-        args.addAll(lane.options());
-        if (digest) args.add("--artifact-sha256");
         Integer code = null;
         Exception failure = null;
         try { code = Main.run(args.toArray(String[]::new)); }
@@ -254,6 +259,149 @@ class MainCliTest {
             }
         }
         return new ReceiptRun(code, failure);
+    }
+
+    @Test
+    void attachedReceiptBooleansPreserveInputAndTheLastOccurrenceWins(
+            @TempDir Path directory) throws Exception {
+        List<List<String>> spellings = List.of(
+            List.of("--artifact-sha256"),
+            List.of("--artifact-sha256=true"),
+            List.of("--artifact-sha256=false"),
+            List.of("--artifact-sha256", "--artifact-sha256=false"),
+            List.of("--artifact-sha256=false", "--artifact-sha256=true"),
+            List.of("--artifact-sha256=false", "--artifact-sha256"));
+        int id = 100;
+        for (int i = 0; i < spellings.size(); i++) {
+            for (boolean beforeInput : new boolean[] {false, true}) {
+                Path venue = Files.createDirectory(directory.resolve("spelling-" + i + "-" + beforeInput));
+                Path out = venue.resolve("capture.png"), json = venue.resolve("capture.json");
+                ReceiptScript script = new ReceiptScript(out, false);
+                List<String> args = new ArrayList<>();
+                if (beforeInput) args.addAll(spellings.get(i));
+                args.addAll(List.of("https://example.invalid/receipt", "--size", "640x480",
+                    "--settle", "1", "-o", out.toString(), "--json", json.toString()));
+                if (!beforeInput) args.addAll(spellings.get(i));
+                ReceiptRun run = runReceiptArgs(args, script, venue, id++);
+                assertNull(run.failure(), "flag spelling " + args + ": " + run.failure());
+                assertEquals(Integer.valueOf(0), run.code());
+                assertEquals(1, script.navigations);
+                assertEquals(1, script.captures);
+                assertTrue(script.closed);
+                @SuppressWarnings("unchecked")
+                Map<String, Object> root = (Map<String, Object>) MiniJson.parse(Files.readString(json));
+                assertEquals("https://example.invalid/receipt", root.get("input"));
+                boolean enabled = i != 2 && i != 3;
+                assertEquals(enabled, root.containsKey("outSha256"));
+                assertEquals(enabled, root.containsKey("outSha256Provenance"));
+                if (enabled) assertEquals(ArtifactWriterTest.receiptHash(script.png), root.get("outSha256"));
+                org.junit.jupiter.api.Assertions.assertArrayEquals(script.png, Files.readAllBytes(out));
+            }
+        }
+    }
+
+    @Test
+    void receiptBooleanDoesNotReplaceALocalInputContainingEquals(
+            @TempDir Path directory) throws Exception {
+        Path input = directory.resolve("input=false.html");
+        Files.writeString(input, "<!doctype html><title>receipt input</title>");
+        for (boolean beforeInput : new boolean[] {false, true}) {
+            Path venue = Files.createDirectory(directory.resolve("file-" + beforeInput));
+            Path out = venue.resolve("capture.png"), json = venue.resolve("capture.json");
+            ReceiptScript script = new ReceiptScript(out, false);
+            List<String> args = new ArrayList<>();
+            if (beforeInput) args.add("--artifact-sha256=false");
+            args.addAll(List.of(input.toString(), "--size", "640x480", "--settle", "1",
+                "-o", out.toString(), "--json", json.toString()));
+            if (!beforeInput) args.add("--artifact-sha256=false");
+            ReceiptRun run = runReceiptArgs(args, script, venue, 150);
+            assertNull(run.failure());
+            assertEquals(Integer.valueOf(0), run.code());
+            @SuppressWarnings("unchecked")
+            Map<String, Object> root = (Map<String, Object>) MiniJson.parse(Files.readString(json));
+            assertEquals(input.toString(), root.get("input"));
+            assertEquals("file", root.get("mode"));
+            assertFalse(root.containsKey("outSha256"));
+            assertFalse(root.containsKey("outSha256Provenance"));
+            org.junit.jupiter.api.Assertions.assertArrayEquals(script.png, Files.readAllBytes(out));
+        }
+    }
+
+    @Test
+    void disabledReceiptNeedsNoJsonAndSeparateBooleanWordsRemainPositional(
+            @TempDir Path directory) throws Exception {
+        for (String word : List.of("true", "false")) {
+            // A bare flag must not consume the following word as its boolean value.
+            // The existing last-positional-input rule then chooses the final URL.
+            Path venue = Files.createDirectory(directory.resolve(word));
+            Path out = venue.resolve("capture.png"), json = venue.resolve("capture.json");
+            ReceiptScript script = new ReceiptScript(out, false);
+            ReceiptRun run = runReceiptArgs(new ArrayList<>(List.of("--artifact-sha256", word,
+                "https://example.invalid/receipt", "--size", "640x480", "--settle", "1",
+                "-o", out.toString(), "--json", json.toString())), script, venue, 200);
+            assertNull(run.failure());
+            assertEquals(Integer.valueOf(0), run.code());
+            @SuppressWarnings("unchecked")
+            Map<String, Object> root = (Map<String, Object>) MiniJson.parse(Files.readString(json));
+            assertEquals("https://example.invalid/receipt", root.get("input"));
+            assertEquals(ArtifactWriterTest.receiptHash(script.png), root.get("outSha256"));
+        }
+        Path venue = Files.createDirectory(directory.resolve("no-json"));
+        Path out = venue.resolve("capture.png");
+        ReceiptScript script = new ReceiptScript(out, false);
+        ReceiptRun run = runReceiptArgs(new ArrayList<>(List.of("https://example.invalid/receipt",
+            "--artifact-sha256=true", "--artifact-sha256=false", "--size", "640x480",
+            "--settle", "1", "-o", out.toString())), script, venue, 201);
+        assertNull(run.failure());
+        assertEquals(Integer.valueOf(0), run.code());
+        org.junit.jupiter.api.Assertions.assertArrayEquals(script.png, Files.readAllBytes(out));
+        try (var files = Files.list(venue)) {
+            assertFalse(files.anyMatch(p -> p.getFileName().toString().endsWith(".json")));
+        }
+    }
+
+    @Test
+    void invalidAttachedReceiptValuesRefuseBeforeBrowserWorkAndPreservePriorFiles(
+            @TempDir Path directory) throws Exception {
+        AtomicInteger lookups = new AtomicInteger(), launches = new AtomicInteger();
+        Main.SessionLauncher saved = Main.sessionLauncherForTests;
+        PrintStream savedErr = System.err;
+        ByteArrayOutputStream errors = new ByteArrayOutputStream();
+        Main.sessionLauncherForTests = new Main.SessionLauncher() {
+            @Override public boolean available() { lookups.incrementAndGet(); return true; }
+            @Override public BrewShot launch(int width, int height, Integer dpr) {
+                launches.incrementAndGet();
+                throw new AssertionError("invalid attached value reached launch");
+            }
+        };
+        Path out = directory.resolve("capture.png"), json = directory.resolve("capture.json");
+        byte[] priorArtifact = {8, 3, 1};
+        Files.write(out, priorArtifact);
+        Files.writeString(json, "prior-sidecar");
+        try {
+            System.setErr(new PrintStream(errors, true, java.nio.charset.StandardCharsets.UTF_8));
+            for (String value : List.of("", "TRUE", "False", "0", "yes", "false=extra")) {
+                for (boolean beforeInput : new boolean[] {false, true}) {
+                    List<String> args = new ArrayList<>();
+                    if (beforeInput) args.add("--artifact-sha256=" + value);
+                    args.addAll(List.of("https://example.invalid/receipt", "-o", out.toString(),
+                        "--json", json.toString()));
+                    if (!beforeInput) args.add("--artifact-sha256=" + value);
+                    errors.reset();
+                    assertEquals(2, Main.run(args.toArray(String[]::new)));
+                    assertTrue(errors.toString(java.nio.charset.StandardCharsets.UTF_8)
+                        .contains("accepts only attached =true or =false"));
+                    assertEquals(0, lookups.get());
+                    assertEquals(0, launches.get());
+                    org.junit.jupiter.api.Assertions.assertArrayEquals(priorArtifact, Files.readAllBytes(out));
+                    assertEquals("prior-sidecar", Files.readString(json));
+                }
+            }
+            try (var files = Files.list(directory)) { assertEquals(2, files.count()); }
+        } finally {
+            System.setErr(savedErr);
+            Main.sessionLauncherForTests = saved;
+        }
     }
 
     /** Scripted CDP, real BrewShot client/encoder/write/close/manifest. No browser process. */
