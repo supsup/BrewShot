@@ -44,13 +44,18 @@ before, not a limit on what a reviewer may raise.
 
 build.gradle.kts lane wiring (Chrome-test catalog, no-skip guard, FORBID/REQUIRE),
 ci.yml and the Dockerfile, the docker/ worker (a test source dir, so unitTest runs its
-tests), docker/smoke-test.sh and docker/watch-job-smoke.py (outside every lane),
+tests), docker/smoke-test.sh and docker/watch-job-smoke.py (outside the Gradle test lanes; CI runs
+them in its Docker capture smoke lane),
 ArtifactWriter and output aliasing, teardown/reaper/cgroup proof, resource caps,
 and trust/*.sh exit codes (0 clean, 1 forbidden, 2 VOID). Test-only and build-only
 changes are NOT automatically low risk: the guards live there.
 
 ## Required evidence
 
+Normal CI must be green at the exact tip: browser-free tests on JDK 21 and 25, the pinned
+Chrome container, the native image build plus native --help, and the Docker build with its
+capture and folder-worker smoke. The local commands below are proportionate extras for what
+a change touches, not substitutes for CI.
 A verdict names the exact tip and the commands that ran on it, with test counts
 taken from the JUnit XML: `./gradlew unitTest --no-daemon --stacktrace` (tests
 and skips, where skips must be 0) and `docker build --target chrome-test .`
