@@ -10,7 +10,9 @@
   sidecar. The GIF sink's scalar overload shares its bulk counting/hash path;
   direct scalar, failed-write, close and overflow controls cover that boundary.
   SHA-256 remains an opt-in image-derived equality fingerprint, with no anonymity
-  or redaction guarantee. Other boolean flags and manifest fields are unchanged.
+  or redaction guarantee. A value-taking capture option now consumes a following
+  `--artifact-sha256=...` token whole as its value; generic normalization previously
+  split off the attached suffix. Other boolean flags and manifest fields are unchanged.
 
 - **Bounded predicate waits** (plan 2459e652). `waitFor` now spends one monotonic
   outer budget across WebSocket sends, responses and retry pauses, while keeping

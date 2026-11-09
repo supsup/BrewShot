@@ -188,7 +188,9 @@ class MainCliTest {
             Path out = directory.resolve("capture.png");
             for (String[] args : List.of(
                     new String[] {"https://example.invalid/", "--artifact-sha256", "-o", out.toString()},
-                    new String[] {"https://example.invalid/", "-o", out.toString(), "--artifact-sha256"})) {
+                    new String[] {"https://example.invalid/", "-o", out.toString(), "--artifact-sha256"},
+                    new String[] {"https://example.invalid/", "--artifact-sha256=true", "-o", out.toString()},
+                    new String[] {"https://example.invalid/", "-o", out.toString(), "--artifact-sha256=true"})) {
                 errors.reset();
                 Integer code = null;
                 Exception failure = null;
@@ -220,6 +222,35 @@ class MainCliTest {
             System.setErr(original);
             Main.sessionLauncherForTests = saved;
         }
+    }
+
+    @Test
+    void receiptAttachedValuesKeepTheExistingDiffAndVerifyNormalization() throws Exception {
+        for (String command : List.of("diff", "verify")) {
+            Object[] help = runCapturingStderr(command, "--help");
+            assertEquals(0, help[0], "control: the command dispatches without capture setup");
+            for (String value : List.of("true", "false", "invalid")) {
+                Object[] refusal = runCapturingStderr(command, "--artifact-sha256=" + value);
+                assertEquals(2, refusal[0]);
+                assertEquals("brewshot: unknown " + command + " flag: --artifact-sha256",
+                    ((String) refusal[1]).strip(),
+                    "the non-capture parser must receive the normalized flag, without its value");
+            }
+        }
+    }
+
+    @Test
+    void receiptShapedTokensRemainWholeWhenConsumedAsAnOptionValue() throws Exception {
+        for (String value : List.of("true", "false", "invalid")) {
+            String token = "--artifact-sha256=" + value;
+            Object[] refusal = runCapturingStderr("--settle", token, "https://example.invalid/");
+            assertEquals(2, refusal[0]);
+            assertEquals("brewshot: --settle wants a number (ms), got: " + token,
+                ((String) refusal[1]).strip(),
+                "a value-taking option consumes the entire following receipt-shaped token");
+        }
+        Object[] control = runCapturingStderr("--settle", "1", "--help");
+        assertEquals(0, control[0], "control: an ordinary value parses through to help");
     }
 
     private record ReceiptLane(String name, String extension, List<String> options) { }

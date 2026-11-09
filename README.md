@@ -71,6 +71,12 @@ the last value. A separate word such as `false` remains a positional input,
 not a flag value. Other boolean flags and `diff`/`verify` keep their existing
 argument behavior.
 
+A value-taking capture option consumes its next token whole, even if that token
+starts with `--artifact-sha256=`. For example, `--settle --artifact-sha256=false`
+is an invalid settle value, not a receipt toggle. Previously, generic attached-value
+splitting removed the `=false` suffix from that value. Put the receipt flag outside
+another option's value position to enable or disable it.
+
 The optional fields are `outSha256` and `outSha256Provenance`; existing `outBytes`
 then uses that same producer snapshot. This does not re-open the artifact after
 capture. Recompute the digest after transport or before use to compare the bytes
