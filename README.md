@@ -78,6 +78,11 @@ you actually received. Without the flag, both new keys stay absent and the
 existing sidecar behavior remains. See the producer claim and verification
 contract below for the exact meaning and limits.
 
+If an enabled receipt has no explicit `--json PATH`, capture refuses before
+browser discovery or launch. If an artifact commit fails, the capture does not
+replace a prior JSON sidecar. These guarantees also apply to the receipt-enabled
+capture path.
+
 ### SVG files size their own viewport
 
 `--size WxH` sets the viewport (default `1280x900`). A local `.svg` input with no
