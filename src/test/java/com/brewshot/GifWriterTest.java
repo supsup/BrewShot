@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.awt.image.BufferedImage;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -27,8 +28,115 @@ import org.w3c.dom.Node;
  */
 class GifWriterTest {
 
+    @Test
+    void scalarSinkUsesLowEightBitsAndTheBulkWritePath() throws Exception {
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        int[] writes = {0}, closes = {0};
+        OutputStream target = new OutputStream() {
+            @Override public void write(int value) { throw new AssertionError("scalar bypassed bulk path"); }
+            @Override public void write(byte[] values, int offset, int length) {
+                writes[0]++;
+                bytes.write(values, offset, length);
+            }
+            @Override public void close() { closes[0]++; }
+        };
+        var digest = java.security.MessageDigest.getInstance("SHA-256");
+        var sink = new GifWriter.CountingDigestSink(target, digest);
+        sink.write(-1);
+        sink.write(0x100);
+        sink.write(0x1234);
+        sink.write(new byte[] {8, 9, 10, 11}, 1, 2);
+        sink.flush();
+        assertThrows(IOException.class, sink::completedCount, "open is not completed");
+        sink.close();
+        sink.close();
+        byte[] expected = {(byte) 0xff, 0, 0x34, 9, 10};
+        org.junit.jupiter.api.Assertions.assertArrayEquals(expected, bytes.toByteArray());
+        assertEquals(4, writes[0], "each scalar must reach the same bulk path");
+        assertEquals(1, closes[0], "close remains idempotent");
+        assertEquals(5L, sink.completedCount());
+        assertEquals(ArtifactWriterTest.receiptHash(expected),
+            java.util.HexFormat.of().formatHex(digest.digest()));
+        assertThrows(IOException.class, () -> sink.write(1));
+        assertThrows(IOException.class, () -> sink.write(new byte[] {1}, 0, 1));
+        assertThrows(IOException.class, sink::flush);
+    }
+
+    @Test
+    void failedScalarWriteDoesNotHashUnacceptedBytesAndCannotPublishAReceipt() throws Exception {
+        IOException rejected = new IOException("sink-write-witness");
+        int[] writes = {0}, closes = {0};
+        OutputStream target = new OutputStream() {
+            @Override public void write(int value) { throw new AssertionError("scalar bypass"); }
+            @Override public void write(byte[] values, int offset, int length) throws IOException {
+                writes[0]++;
+                throw rejected;
+            }
+            @Override public void close() { closes[0]++; }
+        };
+        var digest = java.security.MessageDigest.getInstance("SHA-256");
+        var sink = new GifWriter.CountingDigestSink(target, digest);
+        org.junit.jupiter.api.Assertions.assertSame(rejected,
+            assertThrows(IOException.class, () -> sink.write(0x1ff)));
+        assertEquals(ArtifactWriterTest.receiptHash(new byte[0]),
+            java.util.HexFormat.of().formatHex(digest.digest()), "hash only successful writes");
+        assertThrows(IOException.class, () -> sink.write(2));
+        assertThrows(IOException.class, () -> sink.write(new byte[] {2}, 0, 1));
+        assertThrows(IOException.class, sink::flush);
+        assertEquals(1, writes[0], "a failed sink must not retry the target");
+        sink.close();
+        sink.close();
+        assertEquals(1, closes[0], "even a failed sink closes its target once");
+        assertThrows(IOException.class, sink::completedCount);
+    }
+
+    @Test
+    void flushAndCloseFailuresCannotBecomeCompletedSinkReceipts() throws Exception {
+        for (boolean failFlush : new boolean[] {false, true}) {
+            IOException rejected = new IOException(failFlush ? "flush-witness" : "close-witness");
+            int[] closes = {0};
+            OutputStream target = new OutputStream() {
+                @Override public void write(int value) { }
+                @Override public void flush() throws IOException { if (failFlush) throw rejected; }
+                @Override public void close() throws IOException {
+                    closes[0]++;
+                    if (!failFlush) throw rejected;
+                }
+            };
+            var sink = new GifWriter.CountingDigestSink(target,
+                java.security.MessageDigest.getInstance("SHA-256"));
+            sink.write(7);
+            if (failFlush) {
+                org.junit.jupiter.api.Assertions.assertSame(rejected, assertThrows(IOException.class, sink::flush));
+                sink.close();
+            } else {
+                sink.flush();
+                org.junit.jupiter.api.Assertions.assertSame(rejected, assertThrows(IOException.class, sink::close));
+            }
+            sink.close();
+            assertEquals(1, closes[0]);
+            assertThrows(IOException.class, sink::completedCount);
+            assertThrows(IOException.class, () -> sink.write(8));
+        }
+    }
+
+    @Test
+    void scalarSinkCountsRemainLongAndOverflowPoisonsTheReceipt() throws Exception {
+        var sink = new GifWriter.CountingDigestSink(OutputStream.nullOutputStream(),
+            java.security.MessageDigest.getInstance("SHA-256"));
+        // Seed the private counter at the boundary without allocating an enormous artifact.
+        var count = GifWriter.CountingDigestSink.class.getDeclaredField("count");
+        count.setAccessible(true);
+        count.setLong(sink, Long.MAX_VALUE - 1);
+        sink.write(1);
+        assertEquals(Long.MAX_VALUE, count.getLong(sink));
+        assertThrows(ArithmeticException.class, () -> sink.write(2));
+        sink.close();
+        assertThrows(IOException.class, sink::completedCount, "overflow must not wrap into a receipt");
+    }
+
     /**
-     * Case 3, Stage A: this names the proposed real-writer receipt/observer overload.
+     * The real-writer receipt/observer overload exposes encoded-stream progress.
      * The observer sees the production stream after writes and flushes, including before
      * eager discard; it does not supply a replacement encoder or test-local hashing stream.
      */
