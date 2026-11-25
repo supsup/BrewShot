@@ -979,6 +979,11 @@ things not to do: **[SECURITY.md](SECURITY.md)**.
 
 - JDK 21+ (bytecode targets 21; CI executes the browser-free lane on Temurin
   21 and 25)
+- A JDK that carries the fix for [CVE-2026-114938](https://nvd.nist.gov/vuln/detail/CVE-2026-114938):
+  21.0.13.1, 25.0.5.1 or later (17.0.21.1 on the 17 line). It is a flaw in the JVM itself: HotSpot's
+  Base64 decoder on x86-64 processors with AVX-512 VBMI, in JDK 17.0.6 and later (ARM64 is not
+  affected). BrewShot decodes Base64 only from the Chrome it launches (screenshots and screencast
+  frames).
 - A local Chrome or Chromium (auto-discovered; override with `BREWSHOT_CHROME`)
 
 On macOS, the execution context is part of the browser requirement. A normal
